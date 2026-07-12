@@ -1,0 +1,18 @@
+# Release image — assembles the distroless container from the ALREADY-BUILT static musl
+# binaries (the release build matrix produced them natively/cross). No compile here, so the
+# multi-arch buildx is seconds instead of an emulated arm64 cargo+LTO build of the full
+# DataFusion/Arrow tree.
+#
+# The docker job stages `evald-amd64` and `evald-arm64` into the build context; buildx sets
+# TARGETARCH per platform, so each image gets its matching static binary.
+#
+# For a from-source local build use the plain ./Dockerfile instead.
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+LABEL org.opencontainers.image.source="https://github.com/lucheeseng827/evald" \
+      org.opencontainers.image.description="Embedded OTel-native trace + eval store for LLM apps (single binary)" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY evald-${TARGETARCH} /usr/local/bin/evald
+EXPOSE 4318
+ENTRYPOINT ["/usr/local/bin/evald"]
+CMD ["version"]

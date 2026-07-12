@@ -1,0 +1,4 @@
+{"id": "capital-fr", "input": "capital of France?", "output": "Paris", "expected_output": "Paris"}
+{"id": "capital-jp", "input": "capital of Japan?", "output": "Tokyo", "expected_output": "Tokyo"}
+{"id": "math", "input": "2+2?", "output": "4", "expected_output": "four"}
+{"id": "json", "input": "answer as json", "output": "{\"answer\": 4}", "expected_output": "{\"answer\": 4}"}

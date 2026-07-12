@@ -1,0 +1,50 @@
+evald
+Copyright 2026 Nicholas Lu Chee Seng and the evald contributors
+
+This product includes software developed by the evald contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this software except in compliance with the License. You may obtain a copy of the
+License in the LICENSE file or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+-------------------------------------------------------------------------------
+Third-party components:
+
+evald is a single static binary; it links these notable open-source crates. Each
+retains its own license (Apache-2.0 / MIT unless noted); see the crate's source
+for full terms.
+
+* Apache DataFusion, Apache Arrow, and Apache Parquet (Apache-2.0) — the cold-tier
+  query engine and the columnar block format. Pure-Rust (no C++), which is what
+  keeps the static musl build clean.
+* opentelemetry-proto (Apache-2.0) — the OTLP wire types (the single source of
+  truth for the protobuf / OTLP-JSON decode path; never hand-rolled).
+* redb (MIT/Apache-2.0) — the embedded ACID key/value store backing the
+  trace_id->block index, the compaction watermark, and the universal Score store.
+* tokio, axum, tower-http, hyper (MIT) — the async runtime and the OTLP/HTTP +
+  query API server.
+* prost (Apache-2.0) — protobuf decode/encode for the OTLP/HTTP-protobuf body.
+* serde / serde_json / serde_yaml (MIT/Apache-2.0) — the OTLP-JSON path, the JSON
+  API, and the YAML eval config.
+* clap (MIT/Apache-2.0) — the headless-first CLI.
+* rust-embed (MIT) — embeds the frontend SPA into the binary so the UI ships
+  air-gapped, no Node toolchain.
+* regex, chrono, uuid, hex, crc32fast (MIT/Apache-2.0) — the regex evaluator,
+  the UTC time-partition key, score ids, id rendering, and the per-WAL-record
+  checksum.
+* tracing / tracing-subscriber (MIT) — internal structured logs.
+
+-------------------------------------------------------------------------------
+Edition notes:
+
+* The optional Tier-2 semantic backend (HNSW / embedding similarity) is gated
+  behind a cargo feature and is OFF by default; it is deferred and not vendored in
+  this release. Keeping it off by default is what keeps the default build inside
+  the air-gap envelope (no network, no C/C++ dependency).

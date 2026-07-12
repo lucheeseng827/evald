@@ -1,0 +1,11 @@
+# Keep the build context tiny + reproducible (the Dockerfile builds from source).
+target
+.git
+evald-data
+node_modules
+*.tar.gz
+*.zip
+# Never let secrets/local state into the builder layer (also forbidden_paths in .ossync.yaml).
+.env
+secrets
+local

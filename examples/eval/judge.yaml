@@ -1,0 +1,41 @@
+# Demo Tier-3 LLM-as-judge config for `evald eval run`.
+#
+# Judges are BYO-key and OFF by default (the air-gapped core makes no outbound call). To run:
+#   1. Build with the feature:    cargo build --features judge
+#   2. Export your provider key:   export ANTHROPIC_API_KEY=sk-ant-...      (or OPENAI_API_KEY)
+#   3. evald eval run --config examples/eval/judge.yaml --data-dir /tmp/evald
+#
+# Preview the cost first (offline — no key, no call, no feature needed):
+#   evald eval run --config examples/eval/judge.yaml --data-dir /tmp/evald --estimate
+#
+# Every score is cached in <data-dir>/judge_cache.redb keyed by (rail, model, input, output, …),
+# so re-running an unchanged eval costs ZERO tokens. The judge mean flows through the same
+# threshold gate and `eval compare` significance test as the Tier-1 scorers.
+name: demo-judge
+dataset: ./dataset.jsonl # input / output / expected_output per line
+
+judges:
+  # Generic criteria grading (G-Eval style): needs `criteria` + the item's output.
+  - rail: g_eval
+    provider: anthropic
+    model: claude-opus-4-8
+    criteria: "The answer is a single, correct, concise place name."
+    pass_threshold: 0.6 # a per-item score >= 0.6 counts as a pass
+
+  # Reference-based correctness: uses `input` as the question and `expected_output` as ground
+  # truth. (e.g. it should mark output "4" correct against reference "four" — where the
+  # deterministic exact_match fails.)
+  - rail: qa_correctness
+    provider: anthropic
+    model: claude-opus-4-8
+
+# Other built-in rails:
+#   answer_relevancy (input+output, reference-free)
+#   faithfulness / hallucination / context_precision / context_recall  — RAG rails; need a
+#     `context: [...]` array of retrieved passages on each dataset item
+#   toxicity / bias (output only; 1.0 = safe / unbiased — higher is better)
+
+# CI gate: fail the build if a judge's mean drops below its threshold (keyed by the judge name,
+# which defaults to `judge_<rail>`).
+thresholds:
+  judge_g_eval: 0.7

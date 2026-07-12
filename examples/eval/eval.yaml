@@ -1,0 +1,16 @@
+# Demo eval config for `evald eval run --config examples/eval/eval.yaml`.
+# The offline regression loop: deterministic, zero-cost scorers + a CI threshold gate.
+name: demo-eval
+dataset: ./dataset.jsonl # resolved relative to this file
+
+evaluators:
+  - type: exact_match
+  - type: levenshtein
+    threshold: 0.5 # per-item pass when similarity >= 0.5
+  - type: json_valid
+
+# CI gate: the run exits non-zero if an evaluator's mean drops below its threshold.
+# exact_match here is 3/4 = 0.75 (the "4" vs "four" case fails), so 0.70 passes.
+# Tighten to 0.90 to see the gate fail with exit code 1.
+thresholds:
+  exact_match: 0.70

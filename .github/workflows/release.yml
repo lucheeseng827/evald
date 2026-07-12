@@ -1,0 +1,344 @@
+# evald release pipeline — runs on the PUBLIC mirror (lucheeseng827/evald).
+#
+# Synced from the private monorepo to `.github/workflows/release.yml` (see .ossync.yaml). Cuts a
+# release on a `v*` tag:
+#   1. build  — static musl (x86_64 + aarch64) + macOS (x86_64 + arm64) + Windows; archive + sha256
+#   2. release— attach every artifact + a SHA256SUMS file to the GitHub release
+#   3. crates — `cargo publish` the evald crate (real tags only; idempotent)
+#   4. brew   — rewrite Formula/evald.rb with the tag version + the four desktop sha256, commit to main
+#   5. docker — buildx multi-arch (linux/amd64 + linux/arm64) distroless image → Docker Hub
+#               (docker.io/mancube/evald)
+#
+# Covers all four MVP distribution channels: musl static, cargo-binstall (matches the asset
+# names), Homebrew (this repo is its own tap), and a distroless container.
+#
+# Mirror repo secrets required for the docker job: DOCKER_USERNAME (= "mancube") and
+# DOCKER_PASSWORD (a Docker Hub access token with Read/Write on mancube/evald).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+      promote:
+        description: "Promote formula + :latest image (only safe for the newest tag)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # create the release + commit the formula bump
+  # (image push goes to Docker Hub via DOCKER_USERNAME/DOCKER_PASSWORD — no GH packages scope.)
+
+env:
+  BIN: evald
+  IMAGE: docker.io/mancube/evald
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,  cross: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest,  cross: true }
+          # Both macOS targets build on macos-14 (Apple Silicon): arm64 native, x86_64 via an
+          # in-macOS cross-compile (`cargo build --target x86_64-apple-darwin`, no extra linker).
+          # macos-13 (Intel) is being retired and queues for many minutes — avoid it.
+          - { target: x86_64-apple-darwin,         os: macos-14 }
+          - { target: aarch64-apple-darwin,        os: macos-14 }
+          - { target: x86_64-pc-windows-msvc,      os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (linux musl)
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --locked --release --bin "$BIN" --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --locked --release --bin "$BIN" --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="target/${{ matrix.target }}/release"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            asset="${BIN}-${{ matrix.target }}.zip"
+            (
+              cd "$dist"
+              7z a "$GITHUB_WORKSPACE/$asset" "${BIN}.exe" >/dev/null
+            )
+          else
+            asset="${BIN}-${{ matrix.target }}.tar.gz"
+            tar -czf "$asset" -C "$dist" "$BIN"
+          fi
+          # sha256 sidecar (portable across runner OSes)
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: github release
+    needs: build
+    runs-on: ubuntu-latest
+    # Supply-chain hygiene: id-token for cosign keyless + SLSA provenance signing; attestations to
+    # store the provenance; contents to publish the release. Substantiates the "clean supply chain,
+    # no rug-pull" claim (vs the LiteLLM PyPI compromise) with artifacts a consumer can verify.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Aggregate checksums
+        # Block scalar (not a one-liner): the per-asset .sha256 files already hold bare
+        # filenames, so just concatenate them. A plain `run:` with a `#` would be parsed as a
+        # YAML comment and silently truncated.
+        run: |
+          ( cd dist && cat ./*.sha256 > SHA256SUMS && cat SHA256SUMS )
+      - name: Generate SBOM (SPDX)
+        # Syft-based SBOM over the release artifacts, so a consumer can audit exactly what shipped.
+        uses: anchore/sbom-action@v0
+        with:
+          path: dist
+          format: spdx-json
+          output-file: dist/evald.sbom.spdx.json
+          upload-artifact: false
+      - name: Install cosign
+        # Sign SHA256SUMS with cosign's keyless (OIDC → Fulcio/Rekor) flow — no long-lived key.
+        # Verify: cosign verify-blob --certificate SHA256SUMS.pem --signature SHA256SUMS.sig \
+        #   --certificate-identity-regexp '^https://github\.com/lucheeseng827/evald/\.github/workflows/release\.yml@.+' \
+        #   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+        uses: sigstore/cosign-installer@v3
+      - name: Cosign keyless-sign the checksums
+        run: |
+          cosign sign-blob --yes \
+            --output-signature dist/SHA256SUMS.sig \
+            --output-certificate dist/SHA256SUMS.pem \
+            dist/SHA256SUMS
+      - name: Attest SLSA build provenance
+        # GitHub-native, keyless SLSA provenance for the release binaries. Verify with:
+        #   gh attestation verify <artifact> --repo <owner>/evald
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # A tag with a pre-release suffix (vX.Y.Z-rc.N) is marked a GitHub pre-release — the
+          # safe way to exercise the pipeline without presenting an rc as a GA download.
+          prerelease: ${{ contains(env.TAG, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.pem
+            dist/evald.sbom.spdx.json
+
+  cratesio:
+    name: publish to crates.io
+    needs: release
+    # Publish only a real (non pre-release) tag that was pushed or explicitly promoted. crates.io
+    # is append-only (versions can be yanked, never overwritten) — never publish an rc.
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') && (github.event_name == 'push' || inputs.promote) }}
+    # CRATESIO_TOKEN (a crates.io API token with publish scope) lives in the `cicd` environment.
+    environment: cicd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATESIO_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          # Idempotent: a re-run of an already-published version is a no-op, not a failure.
+          if curl -sf "https://crates.io/api/v1/crates/evald/${ver}" >/dev/null 2>&1; then
+            echo "evald ${ver} already on crates.io — skipping"
+          else
+            cargo publish --locked
+          fi
+
+  brew:
+    name: bump homebrew formula
+    needs: release
+    # Promote to `brew install evald` only for a real (non pre-release) tag, and only when pushed
+    # or `promote` was requested — so a `v*-rc.N` smoke test never serves an rc to brew users.
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') && (github.event_name == 'push' || inputs.promote) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Generate Formula/evald.rb
+        shell: bash
+        # Write the formula fresh from the release's checksums rather than editing a file.
+        # The mirror's Formula/evald.rb is owned by THIS job (not synced from the monorepo), so a
+        # sync can never clobber the real shas and a missing file is never a failure. In the
+        # heredoc, bash expands $ver/$mac_* etc; Homebrew's #{version}/#{bin} have no `$` so they
+        # stay literal for Ruby to interpolate.
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          sha() { cut -d' ' -f1 < "dist/${BIN}-$1.tar.gz.sha256"; }
+          mac_arm=$(sha aarch64-apple-darwin)
+          mac_x86=$(sha x86_64-apple-darwin)
+          lin_arm=$(sha aarch64-unknown-linux-musl)
+          lin_x86=$(sha x86_64-unknown-linux-musl)
+          base="https://github.com/lucheeseng827/evald/releases/download/v#{version}"
+          mkdir -p Formula
+          cat > Formula/evald.rb <<EOF
+          # Generated by .github/workflows/release.yml on each v* tag — do not hand-edit.
+          class Evald < Formula
+            desc "Embedded OTel-native trace + eval store for LLM apps (single binary)"
+            homepage "https://github.com/lucheeseng827/evald"
+            version "$ver"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "$base/evald-aarch64-apple-darwin.tar.gz"
+                sha256 "$mac_arm"
+              end
+              on_intel do
+                url "$base/evald-x86_64-apple-darwin.tar.gz"
+                sha256 "$mac_x86"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "$base/evald-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "$lin_arm"
+              end
+              on_intel do
+                url "$base/evald-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "$lin_x86"
+              end
+            end
+
+            def install
+              bin.install "evald"
+            end
+
+            test do
+              assert_match "evald", shell_output("#{bin}/evald version")
+            end
+          end
+          EOF
+          echo "--- generated formula ---"; cat Formula/evald.rb
+      - name: Commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/evald.rb
+          git commit -m "brew: evald ${TAG}" || { echo "no formula change"; exit 0; }
+          git push origin main
+
+  docker:
+    name: distroless image
+    needs: release
+    # The Docker Hub creds (DOCKER_USERNAME/DOCKER_PASSWORD) live in the `cicd` environment;
+    # a job only sees environment-scoped secrets when it declares the environment.
+    environment: cicd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Stage prebuilt binaries into the build context
+        # Reuse the build matrix's static musl binaries (built natively/cross) instead of
+        # recompiling under QEMU. Lay them out as evald-<arch> for Dockerfile.release's COPY.
+        uses: actions/download-artifact@v4
+        with:
+          path: art
+          merge-multiple: true
+      - name: Lay out the context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ctx
+          tar -xzf art/evald-x86_64-unknown-linux-musl.tar.gz  -C ctx && mv ctx/evald ctx/evald-amd64
+          tar -xzf art/evald-aarch64-unknown-linux-musl.tar.gz -C ctx && mv ctx/evald ctx/evald-arm64
+          cp Dockerfile.release ctx/Dockerfile
+      - name: Compute image tags
+        id: imgtags
+        env:
+          # Advance :latest only for a real release that is being promoted (push or promote).
+          PROMOTE: ${{ github.event_name == 'push' || inputs.promote }}
+        shell: bash
+        run: |
+          tags="${IMAGE}:${TAG}"
+          if [[ "$TAG" != *-* && "$PROMOTE" == "true" ]]; then tags="$tags"$'\n'"${IMAGE}:latest"; fi
+          { echo "list<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.imgtags.outputs.list }}
+      - name: Update Docker Hub description
+        # Only on a real (promoted) release — never let an rc rewrite the public overview.
+        if: ${{ !contains(env.TAG, '-') && (github.event_name == 'push' || inputs.promote) }}
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: mancube/evald
+          readme-filepath: ./docs/DOCKERHUB.md

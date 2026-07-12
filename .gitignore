@@ -1,0 +1,6 @@
+# Rust build output — never commit or mirror (the OSS-sync gate builds in-tree).
+/target/
+
+# Default durable-storage dir created by `evald serve` (WAL, and Parquet later).
+/evald-data/
+evald-data/

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>evald — trace + eval store</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- ============ Header bar ============ -->
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-name">evald</span>
+      <span class="brand-sub">embedded OTel-native trace + eval store</span>
+    </div>
+
+    <div class="header-stats" id="header-stats">
+      <span class="stat" id="stat-traces" title="Traces loaded">— traces</span>
+      <span class="stat-sep">·</span>
+      <span class="stat" id="stat-spans" title="Spans loaded">— spans</span>
+    </div>
+
+    <nav class="header-nav" id="header-nav">
+      <button class="nav-btn active" data-view="traces" type="button">Traces</button>
+      <button class="nav-btn" data-view="dashboard" type="button">Dashboard</button>
+      <button class="nav-btn" data-view="sql" type="button">SQL</button>
+    </nav>
+
+    <button class="btn refresh-btn" id="refresh-btn" type="button" title="Reload data">
+      Refresh
+    </button>
+  </header>
+
+  <!-- ============ Non-blocking error / notice banner ============ -->
+  <div class="banner" id="banner" hidden>
+    <span class="banner-msg" id="banner-msg"></span>
+    <button class="banner-close" id="banner-close" type="button" aria-label="Dismiss">×</button>
+  </div>
+
+  <!-- ============ VIEW 1: Traces ============ -->
+  <main class="view view-traces" id="view-traces">
+    <!-- Left pane: trace list -->
+    <section class="pane trace-list-pane">
+      <div class="pane-head">
+        <h2 class="pane-title">Traces</h2>
+        <span class="pane-count" id="trace-list-count"></span>
+      </div>
+      <div class="trace-search">
+        <input
+          type="search"
+          id="trace-search"
+          class="trace-search-input mono"
+          placeholder="Filter traces…  name · model · input/output · attrs"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          aria-label="Filter traces by full-text search"
+        />
+      </div>
+      <div class="trace-list" id="trace-list">
+        <!-- trace cards injected here -->
+      </div>
+    </section>
+
+    <!-- Main pane: span tree + detail -->
+    <section class="pane trace-detail-pane">
+      <div class="pane-head">
+        <h2 class="pane-title" id="trace-detail-title">Select a trace</h2>
+        <span class="pane-count mono" id="trace-detail-id"></span>
+      </div>
+
+      <div class="trace-detail-body">
+        <div class="span-tree-wrap">
+          <div class="span-tree" id="span-tree">
+            <!-- span rows injected here -->
+          </div>
+        </div>
+
+        <div class="span-detail" id="span-detail" hidden>
+          <!-- span detail injected here -->
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ VIEW 2: SQL ============ -->
+  <main class="view view-sql" id="view-sql" hidden>
+    <section class="pane sql-pane">
+      <div class="sql-editor">
+        <div class="sql-toolbar">
+          <button class="btn primary" id="sql-run" type="button">Run</button>
+          <span class="sql-hint">Ctrl/Cmd + Enter to run</span>
+          <span class="sql-examples" id="sql-examples">
+            <!-- example query buttons injected here -->
+          </span>
+        </div>
+        <textarea
+          class="sql-input mono"
+          id="sql-input"
+          spellcheck="false"
+          autocomplete="off"
+          autocapitalize="off"
+        ></textarea>
+      </div>
+
+      <div class="sql-result" id="sql-result">
+        <div class="sql-result-meta" id="sql-result-meta"></div>
+        <div class="sql-result-error" id="sql-result-error" hidden></div>
+        <div class="sql-table-wrap" id="sql-table-wrap"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============ VIEW 3: Dashboard ============ -->
+  <main class="view view-dashboard" id="view-dashboard" hidden>
+    <!-- aggregated tiles + charts injected here -->
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

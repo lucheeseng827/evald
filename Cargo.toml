@@ -1,0 +1,161 @@
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[package]
+name = "evald"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "evald — embedded OTel-native trace + eval store for LLM apps (single binary). PoC: OTLP/HTTP receiver."
+repository = "https://github.com/lucheeseng827/evald"
+publish = true
+
+# Scaffold note: evald is currently a SINGLE crate (a plain package). Per PLAN.md it
+# will graduate to its OWN multi-crate [workspace] (crates/evald-{core,proto,store,eval,api})
+# once it outgrows one package; until then, keep it a plain package. The release profile is
+# inherited from the root workspace in the monorepo and injected into the standalone Cargo.toml
+# by the OSS sync (.ossync.yaml), so the published binary keeps the documented size/speed.
+
+[lib]
+name = "evald"
+path = "src/lib.rs"
+
+[[bin]]
+name = "evald"
+path = "src/main.rs"
+
+# cargo-binstall: fetch the prebuilt `evald` binary from a GitHub release instead of compiling.
+#   cargo binstall evald
+# `{ repo }` resolves from `repository` above (rewritten to the public mirror on sync); asset
+# names match the release workflow's `evald-<target>.<ext>` artifacts. Inert in the monorepo;
+# the OSS sync flips `publish` so the standalone `evald` crate publishes to crates.io.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/evald-{ target }{ archive-suffix }"
+bin-dir = "evald{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+# --- ACTIVE dependencies ---------------------------------------------------------
+# Grows phase by phase per PLAN.md §3. PoC build step 1 (OTLP/HTTP receiver +
+# protobuf decode) wires the ingest front door: an axum server on :4318 that decodes
+# OTLP `ExportTraceServiceRequest` into the canonical opentelemetry-proto wire types.
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }  # CLI: serve / eval / version (+ env-var fallbacks)
+anyhow = "1"                                        # binary error ergonomics
+serde = { version = "1", features = ["derive"] }    # type derives on the (step-2) model
+serde_json = "1"                                    # OTLP-JSON path (step 2)
+
+# Ingest front door (PoC step 1)
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }  # runtime + graceful shutdown
+axum = "0.8"                                         # OTLP/HTTP 4318 receiver (API + SPA fallback later)
+tower-http = { version = "0.7", features = ["decompression-gzip"] }                   # OTLP `Content-Encoding: gzip`
+# OTLP wire types — the SINGLE source of truth (don't hand-roll the protobuf schema).
+# `gen-tonic-messages` emits the prost messages WITHOUT tonic (we decode the HTTP body
+# directly; the gRPC trace service stays out until Beta). `trace` gates the trace/
+# collector-trace proto modules. `with-serde` adds the OTLP-JSON (de)serializers — hex
+# trace/span ids, int64-as-string timestamps, camelCase — so the JSON path (step 2)
+# reuses the same types as the protobuf path.
+# `gen-tonic` (superset of `gen-tonic-messages`) also emits the tonic gRPC *service* stubs —
+# the `TraceServiceServer` we mount on :4317 for OTLP/gRPC ingest — alongside the prost
+# messages the HTTP path decodes directly. `trace` gates the trace/collector-trace modules;
+# `with-serde` adds the OTLP-JSON (de)serializers so the JSON path reuses the same types.
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace", "with-serde"] }
+prost = "0.14"                                       # decode/encode OTLP protobuf bodies (matches otel-proto ^0.14)
+# OTLP/gRPC 4317 receiver: the tonic server that hosts the generated `TraceServiceServer`.
+# `default-features = false` drops the client `channel` and all TLS (a local plaintext h2c
+# receiver, like the :4318 HTTP one) so the static-musl build stays lean and OpenSSL-free.
+tonic = { version = "0.14", default-features = false, features = ["router", "server", "transport", "codegen"] }
+hex = "0.4"                                          # render trace_id/span_id for logs
+tracing = "0.1"                                      # internal structured logs (self-observability)
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Store (PoC step 3): durable WAL (the ACK boundary) + in-memory hot tier
+crc32fast = "1"                                      # per-record WAL checksum (torn/corrupt-tail detection)
+
+# Cold tier (PoC step 4): time-partitioned Parquet + redb index/watermark
+# arrow-array/-schema directly (not the umbrella `arrow` crate) keeps the tree lean;
+# parquet's `arrow` feature pulls the matching 58.x. These pins are deliberately in
+# lockstep with DataFusion (below): datafusion 54 depends on arrow/parquet 58.3, so a
+# single Arrow lives in the tree and the cold-block schema/batches are shared directly
+# with the query engine (no second Arrow major, no cross-version RecordBatch).
+arrow-array = "58"
+arrow-schema = "58"
+arrow-json = "58"                                    # serialize DataFusion result batches → JSON rows (SQL API)
+parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+redb = "4.1"                                         # trace_id -> block index + compaction watermark (ACID txns); also the score store
+chrono = { version = "0.4", default-features = false, features = ["std"] }  # UTC time-partition key (YYYY/MM/DD/HH)
+
+# Scores (PoC step 5)
+uuid = { version = "1", features = ["v4"] }          # score ids when the caller doesn't supply one
+
+# Eval runner (PoC step 6)
+serde_yaml = "0.9"                                   # eval run config (dataset + evaluators + thresholds)
+regex = "1"                                          # the `regex` Tier-1 evaluator
+# `json_schema` Tier-1 evaluator. `default-features=false` drops the HTTP/file `$ref`
+# resolvers (and their reqwest pull-in) — inline, self-contained schemas only, so the
+# validator stays fully offline / air-gapped like the rest of the deterministic set.
+jsonschema = { version = "0.46", default-features = false }
+
+# Cold query engine + embedded UI (PoC step 8): DataFusion SQL over the Parquet blocks,
+# and the SPA bundled into the binary. DataFusion is pure-Rust (no C++) → clean static
+# musl. `default-features=false` trims the unused expression families / compression
+# codecs (Snappy on the blocks is handled by `parquet` above) to keep the build lean.
+datafusion = { version = "54", default-features = false, features = [
+    "sql",                  # the SQL parser + planner (ctx.sql) — the whole point
+    "parquet",              # read the cold blocks as a ListingTable
+    "datetime_expressions", # to_timestamp etc. over the *_unix_nano columns
+    "string_expressions", "unicode_expressions", "regex_expressions", # common analytical fns
+] }
+rust-embed = "8"                                     # embed frontend/ into the binary (SPA, served with fallback)
+
+# Tier-3 LLM-as-judge HTTP backend — OPTIONAL, behind the `judge` feature (off by default), so
+# the default build stays pure-Rust / air-gapped / no-phone-home. rustls-tls (not native OpenSSL)
+# keeps the static-musl build clean; the key is BYO from the environment at call time.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+
+# --- PLANNED dependencies (later phases; intentionally NOT active yet) ------------
+# Activate per PLAN.md §3. Left commented so the scaffold builds fast and the root
+# workspace does not pull the full Arrow/DataFusion tree before any of it is wired.
+#
+# (tonic is now ACTIVE above — OTLP/gRPC 4317 receiver, paired with otel-proto `gen-tonic`.)
+# reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }  # BYO-key Tier-3 judge / embedding calls
+# thiserror          = "1"          # library error types
+# (datafusion / arrow / parquet / redb / rust-embed are now ACTIVE above — steps 4 & 8.)
+#
+# HOT-TIER engine: DEFERRED ON PURPOSE. Per PLAN.md §6 the hot tier is benchmarked
+# (an LSM such as `fjall = "3"` vs a plain segmented-WAL-of-Arrow-batches) before
+# committing — for an append-mostly, query-elsewhere workload an LSM may be
+# unnecessary. Do NOT add a hot-tier dependency until that soak benchmark picks one.
+#
+# [features]
+# semantic = ["dep:usearch"]   # Tier-2 HNSW semantic search; gated (C++ core, musl care); deferred to v0.3
+# # usearch = { version = "...", optional = true }
+
+[features]
+default = []
+# Tier-3 LLM-as-judge over a real provider (Anthropic / OpenAI), BYO-key from the environment.
+# Network-bound, so OFF by default — the air-gapped/CI core never makes an outbound call. The
+# rail prompts, score parsing, and the local judge cache are in the default build (mockable);
+# only the HTTP backend is gated here.
+judge = ["dep:reqwest"]
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }    # ServiceExt::oneshot — drive the router in tests, no socket
+tempfile = "3"                                       # isolated WAL dirs for store/recovery tests
+flate2 = "1"                                         # gzip a body to test the decompressed-size limit
+serde_json = "1"                                     # parse `evald query` JSON output in tests/crash_recovery.rs
+# tests/crash_recovery.rs spawns the real `evald` binary, kill-9s it mid-ingest/compaction,
+# and verifies durability across a true process boundary (PLAN.md §1.3 / §6). It uses only the
+# std lib + serde_json (no HTTP client dep) — a hand-rolled localhost POST drives ingest.
+
+# NOTE: the release profile (opt-level="z", lto=true, codegen-units=1, strip=true) is
+# inherited from the root workspace [profile.release]; a package member must not
+# redeclare it. When evald becomes its own workspace it carries that profile.

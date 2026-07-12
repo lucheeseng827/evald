@@ -1,0 +1,68 @@
+# evald CI — runs on the PUBLIC mirror (lucheeseng827/evald).
+#
+# Synced from the private monorepo to `.github/workflows/ci.yml` (see .ossync.yaml). Guards the
+# Apache core on every push / PR: formatting, lints, the test suite, and a static-musl release
+# build (the exact target the binary ships as). The default build is pure-Rust with no C/network
+# deps, so a single Ubuntu runner covers it.
+
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all
+      # The Tier-3 LLM-as-judge backend is behind the `judge` feature (off by default). Compile
+      # + lint it so it can't silently break; its logic is unit-tested with a mock in the
+      # default build, and it makes no network call here.
+      - name: Clippy (judge feature)
+        run: cargo clippy --all-targets --features judge -- -D warnings
+
+  musl:
+    name: static musl build (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build (static musl)
+        run: cross build --release --bin evald --target x86_64-unknown-linux-musl
+      - name: Smoke-test the binary
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-musl/release/evald
+          "$bin" version
+          # Confirm it is a static binary (no dynamic interpreter).
+          file "$bin"
