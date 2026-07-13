@@ -4,6 +4,30 @@ All notable changes to evald are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project aims to
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-07-13
+
+A redesigned console and a cleaner OSS/EE boundary.
+
+### Added
+- **New console** — the embedded UI is rebuilt as a Vite + React + TypeScript app,
+  data-driven from a view registry: Overview, Traces (trace list → span tree → span
+  detail with `gen_ai.*` attributes + token usage), Evals, Scores, a SQL console, and
+  Cost (token/spend attribution grouped by model / provider / service / user). Still
+  compiled to a static bundle and embedded in the binary — no Node at Rust build time,
+  works air-gapped.
+- **Standalone frontend image** (`mancube/evald-console`) — nginx serving the console
+  with an SPA fallback and a `/v1` reverse proxy (`EVALD_API_URL`), for serving the UI
+  apart from the store. See `docs/DOCKERHUB-CONSOLE.md`.
+- **`docs/INSTRUMENTATION.md`** — how to point an LLM app at evald over OTLP
+  (auto-instrumentation quickstarts, the attributes evald reads, attaching scores).
+- **`GET /v1/meta`** — an edition/version handshake the console reads at boot.
+
+### Changed
+- **OSS/EE console split** — the OSS crate's embedded bundle now contains only the
+  local-node surfaces; the Fleet surfaces live in the private `ee/` tree and are served
+  by the fleet-query node from its own bundle. A build-time test guards the boundary so
+  no Enterprise view can re-enter the OSS bundle.
+
 ## [0.1.0] - 2026-07-13
 
 First public release — an embedded OTel-native trace + eval store as a single static

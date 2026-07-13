@@ -140,7 +140,7 @@ fn parse_score(json: &str) -> io::Result<Score> {
 }
 
 fn sort_newest_first(scores: &mut [Score]) {
-    scores.sort_by(|a, b| b.ts_unix_nano.cmp(&a.ts_unix_nano));
+    scores.sort_by_key(|b| std::cmp::Reverse(b.ts_unix_nano));
 }
 
 #[cfg(test)]

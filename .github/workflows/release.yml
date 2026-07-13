@@ -37,6 +37,7 @@ permissions:
 env:
   BIN: evald
   IMAGE: docker.io/mancube/evald
+  IMAGE_CONSOLE: docker.io/mancube/evald-console
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
@@ -342,3 +343,48 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
           repository: mancube/evald
           readme-filepath: ./docs/DOCKERHUB.md
+
+  docker-console:
+    name: console image
+    # The standalone frontend image (nginx serving the Vite bundle + a /v1 proxy). Built
+    # from source (Node in the Dockerfile — small/fast, no DataFusion), so it needs none of
+    # the release matrix's prebuilt binaries. Gated on `release` only for ordering, so a
+    # failed release doesn't publish a console image.
+    needs: release
+    environment: cicd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Compute image tags
+        id: imgtags
+        env:
+          PROMOTE: ${{ github.event_name == 'push' || inputs.promote }}
+        shell: bash
+        run: |
+          tags="${IMAGE_CONSOLE}:${TAG}"
+          if [[ "$TAG" != *-* && "$PROMOTE" == "true" ]]; then tags="$tags"$'\n'"${IMAGE_CONSOLE}:latest"; fi
+          { echo "list<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.imgtags.outputs.list }}
+      - name: Update Docker Hub description
+        if: ${{ !contains(env.TAG, '-') && (github.event_name == 'push' || inputs.promote) }}
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: mancube/evald-console
+          readme-filepath: ./docs/DOCKERHUB-CONSOLE.md

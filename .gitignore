@@ -4,3 +4,28 @@
 # Default durable-storage dir created by `evald serve` (WAL, and Parquet later).
 /evald-data/
 evald-data/
+
+# Console (Vite + React + TS) — source lives in frontend/src, the BUILT bundle in
+# frontend/dist/ IS committed (rust-embed bakes it into the binary; keeps `cargo
+# build` Node-free). Regenerate dist/ with `npm run build` after any UI edit.
+/frontend/node_modules/
+/frontend/.tsbuild/
+/frontend/*.tsbuildinfo
+
+# The root .gitignore ignores `dist` globally; the console's built bundle is the
+# one exception — it MUST be committed so the binary has a UI. Re-include it.
+!/frontend/dist/
+!/frontend/dist/**
+
+# The root .gitignore ignores `*.png` globally; the console screenshots shown in
+# the README are the exception — re-include them.
+!/docs/assets/*.png
+
+# EE console (private, Elastic-License) — same rule as the OSS frontend: source in
+# ee/frontend/src, built bundle in ee/frontend/dist/ committed + embedded in the
+# fleet binaries. Regenerate with `cd ee/frontend && npm run build`.
+/ee/frontend/node_modules/
+/ee/frontend/.tsbuild/
+/ee/frontend/*.tsbuildinfo
+!/ee/frontend/dist/
+!/ee/frontend/dist/**

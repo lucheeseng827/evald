@@ -40,6 +40,7 @@
 //!   `/v1/runs/{id}/compare`).
 //! - **ui** — an embedded SPA (rust-embed) served with SPA fallback.
 
+pub mod auth;
 pub mod blob;
 pub mod calibrate;
 pub mod cost;
@@ -56,6 +57,7 @@ pub mod store;
 pub mod suite;
 pub mod ui;
 
+pub use auth::{Auth, AuthError};
 pub use blob::BlobStore;
 pub use model::{
     AggStats, DataType, Dialect, NormalizedSpan, Score, ScoreSource, ScoreTarget, Tokens,

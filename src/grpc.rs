@@ -14,9 +14,10 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     trace_service_server::{TraceService, TraceServiceServer},
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
+use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status};
 
-use crate::{normalize, Store, StoreError};
+use crate::{auth::Auth, normalize, Store, StoreError};
 
 /// The gRPC receiver: a thin adapter from the OTLP `TraceService` onto the shared store.
 #[derive(Clone)]
@@ -65,20 +66,43 @@ impl TraceService for TraceReceiver {
 /// rejected before `ingest` ever runs.
 const MAX_DECODE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Serve the OTLP/gRPC `TraceService` on `addr` until `shutdown` resolves.
+/// Serve the OTLP/gRPC `TraceService` on `addr` until `shutdown` resolves, behind the same
+/// bearer-token [`Auth`] gate as the HTTP receiver. A [`disabled`](Auth::disabled) gate
+/// passes every request (the default local posture); an armed gate rejects any request whose
+/// `authorization` metadata is not a valid `Bearer <token>` with `UNAUTHENTICATED`.
 pub async fn serve(
     addr: SocketAddr,
     store: Store,
+    auth: Auth,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let service = TraceServiceServer::new(TraceReceiver::new(store))
+        .max_decoding_message_size(MAX_DECODE_BYTES);
+    // An interceptor runs on the request metadata BEFORE the message is decoded/dispatched —
+    // the gRPC analogue of the HTTP receiver's outermost auth layer. `Auth::check` returns
+    // true when the gate is disabled, so this is a transparent pass-through by default.
+    let intercepted = InterceptedService::new(service, move |req: Request<()>| {
+        authorize_metadata(&auth, req.metadata()).map(|()| req)
+    });
     tonic::transport::Server::builder()
-        .add_service(
-            TraceServiceServer::new(TraceReceiver::new(store))
-                .max_decoding_message_size(MAX_DECODE_BYTES),
-        )
+        .add_service(intercepted)
         .serve_with_shutdown(addr, shutdown)
         .await?;
     Ok(())
+}
+
+/// Authorize one gRPC request against the [`Auth`] gate from its `authorization` metadata:
+/// `Ok(())` when the gate is disabled or the bearer token is valid, `UNAUTHENTICATED`
+/// otherwise. Extracted from the interceptor closure so it is unit-testable without a socket.
+fn authorize_metadata(auth: &Auth, md: &tonic::metadata::MetadataMap) -> Result<(), Status> {
+    let header = md.get("authorization").and_then(|v| v.to_str().ok());
+    if auth.check(header) {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated(
+            "evald: unauthorized — set metadata authorization: Bearer <token>",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +120,38 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn grpc_metadata_gate_enforces_bearer_when_armed() {
+        use tonic::metadata::MetadataMap;
+        let auth = Auth::from_tokens(["grpc-token-0123456789"]).unwrap();
+
+        // No `authorization` metadata → UNAUTHENTICATED.
+        let empty = MetadataMap::new();
+        assert!(authorize_metadata(&auth, &empty).is_err());
+
+        // Valid bearer token → passes.
+        let mut ok = MetadataMap::new();
+        ok.insert(
+            "authorization",
+            "Bearer grpc-token-0123456789".parse().unwrap(),
+        );
+        assert!(authorize_metadata(&auth, &ok).is_ok());
+
+        // Wrong token → UNAUTHENTICATED.
+        let mut bad = MetadataMap::new();
+        bad.insert(
+            "authorization",
+            "Bearer nope-nope-nope-1234567".parse().unwrap(),
+        );
+        assert_eq!(
+            authorize_metadata(&auth, &bad).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+
+        // A disabled gate passes even with no metadata (default local posture).
+        assert!(authorize_metadata(&Auth::disabled(), &empty).is_ok());
     }
 
     fn one_span_request() -> ExportTraceServiceRequest {

@@ -1,0 +1,8 @@
+# Rebuilt inside the image — never copy host artifacts into the build context.
+node_modules
+dist
+.tsbuild
+*.tsbuildinfo
+.git
+Dockerfile
+.dockerignore

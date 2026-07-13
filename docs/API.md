@@ -5,17 +5,31 @@ Every endpoint `evald serve` exposes, on one listener (default
 [`src/ingest.rs`](../src/ingest.rs) (`build_router`); regenerate this file when
 it changes.
 
-**Authentication: none — by design.** The OSS core is unauthenticated and binds
-**loopback** by default; the threat model is a laptop or a locked-down CI runner.
-Before exposing `:4318` beyond localhost, put it behind a reverse proxy that adds
-authn/z and TLS (or use the separately-licensed ee fleet layer). See
+**Authentication: optional, OFF by default.** The OSS core binds **loopback** by
+default and, with no token configured, is unauthenticated — the threat model is a
+laptop or a locked-down CI runner. To expose `:4318`/`:4317` beyond localhost, either
+(a) arm the built-in bearer-token gate with `--auth-token` / `EVALD_AUTH_TOKEN` /
+`--auth-token-file` (see below), or (b) put it behind a reverse proxy that adds
+authn/z and TLS, or (c) use the separately-licensed ee fleet layer. See
 [OPERATIONS.md § Security posture](./OPERATIONS.md#security-posture).
+
+When the gate is armed, **every** request (OTLP ingest, all `/v1/*`, and the SPA)
+must carry `Authorization: Bearer <token>`; a missing or wrong token is `401`. This
+is a shared-secret gate, **not** TLS — terminate TLS at a proxy if the transport is
+untrusted.
+
+```bash
+# a token added to every call — curl, an OTLP exporter, a CI step
+curl -s http://HOST:4318/v1/spans -H "Authorization: Bearer $EVALD_TOKEN"
+# OTLP SDKs: OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $EVALD_TOKEN"
+```
 
 Errors are plain text (`evald: <message>\n`) unless noted. Cross-cutting
 responses:
 
 | Status | When | Body / headers |
 |---|---|---|
+| `401 Unauthorized` | auth gate armed and the request had no / a wrong `Authorization: Bearer <token>` | `WWW-Authenticate: Bearer`, `evald: unauthorized — set Authorization: Bearer <token>` |
 | `429 Too Many Requests` | ingest channel full (overload shed — never a silent drop) | `Retry-After: 1`, `evald: overloaded, retry shortly` |
 | `413 Payload Too Large` | request body over 16 MiB **decompressed** (the cap is applied after gzip inflation) | axum default body |
 | `503 Service Unavailable` | the store writer failed (WAL write/fsync error, shutdown) | `evald: store unavailable` |
@@ -97,6 +111,25 @@ curl -s http://localhost:4318/v1/stats
 | `channel_capacity` | Ingest channel depth (in-flight append commands before a channel-full shed). |
 | `rejections` | Cumulative spans shed because the hot tier was at its bound. |
 | `shedding` | `true` once `hot_spans ≥ max_hot_spans` — ingest is currently shedding (`429 + Retry-After`). |
+
+## GET /v1/meta
+
+Edition/capability handshake, on both the OSS store and the EE `fleet-query` node — same
+shape, different values. Each node embeds its own SPA bundle (the OSS binary's is EE-free;
+`fleet-query`'s adds the Fleet · EE views) — that's the real edition boundary, decided at
+build time. `/v1/meta` isn't a gate; it only drives the console's edition badge.
+
+```bash
+curl -s http://localhost:4318/v1/meta
+# -> {"edition":"oss","fleet":false,"judge":false,"version":"0.1.0"}
+```
+
+| Field | Meaning |
+|---|---|
+| `edition` | `"oss"` or `"ee"` — which binary answered. |
+| `fleet` | `true` on the EE `fleet-query` node; drives the console's edition badge only — the EE views are already present or absent per which binary's bundle is serving. |
+| `judge` | Whether this build has the managed/BYO-key judge path compiled in (`--features judge`). |
+| `version` | `CARGO_PKG_VERSION` of the serving binary. |
 
 ## POST /v1/scores
 

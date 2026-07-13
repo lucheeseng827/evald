@@ -24,8 +24,9 @@ use std::path::PathBuf;
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path as AxPath, Query, State},
+    extract::{DefaultBodyLimit, Path as AxPath, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -39,8 +40,8 @@ use std::net::SocketAddr;
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
-    normalize, DataType, NormalizedSpan, Score, ScoreSource, ScoreTarget, Store, StoreConfig,
-    StoreError, Tokens, UsageMissingReason,
+    auth::Auth, normalize, DataType, NormalizedSpan, Score, ScoreSource, ScoreTarget, Store,
+    StoreConfig, StoreError, Tokens, UsageMissingReason,
 };
 
 /// Cap a single OTLP batch body. OTLP batches are bounded by the SDK's
@@ -64,15 +65,25 @@ const SESSION_SCAN_CAP: usize = 50_000;
 const CT_PROTOBUF: &str = "application/x-protobuf";
 const CT_JSON: &str = "application/json";
 
-/// Build the receiver + query router over a [`Store`]. Separated from [`serve`] so
-/// tests can drive it via `tower::ServiceExt::oneshot` without binding a socket.
+/// Build the receiver + query router over a [`Store`], with **no** authentication (the
+/// default local posture). Separated from [`serve`] so tests can drive it via
+/// `tower::ServiceExt::oneshot` without binding a socket.
 pub fn router(store: Store) -> Router {
-    build_router(store, MAX_BODY_BYTES)
+    build_router(store, MAX_BODY_BYTES, Auth::disabled())
 }
 
-/// Assemble the router with a configurable request-body limit (tests use a small one).
-fn build_router(store: Store, body_limit: usize) -> Router {
-    Router::new()
+/// Like [`router`], but gated by a bearer-token [`Auth`] — when the gate is armed, every
+/// request (OTLP ingest, `/v1/*`, and the SPA) must present a valid `Authorization: Bearer
+/// <token>` or get a `401`. `serve` uses this; a [`disabled`](Auth::disabled) gate makes it
+/// identical to [`router`].
+pub fn router_with_auth(store: Store, auth: Auth) -> Router {
+    build_router(store, MAX_BODY_BYTES, auth)
+}
+
+/// Assemble the router with a configurable request-body limit (tests use a small one) and an
+/// optional bearer-token gate.
+fn build_router(store: Store, body_limit: usize, auth: Auth) -> Router {
+    let router = Router::new()
         .route("/v1/traces", post(export_traces))
         .route("/v1/spans", get(get_spans))
         .route("/v1/traces/{trace_id}", get(get_trace))
@@ -82,6 +93,7 @@ fn build_router(store: Store, body_limit: usize) -> Router {
         .route("/v1/span_annotations", post(post_span_annotations))
         .route("/v1/sql", post(post_sql))
         .route("/v1/stats", get(get_stats))
+        .route("/v1/meta", get(get_meta))
         .route("/v1/blobs/{key}", get(get_blob))
         // Everything not matched above is the embedded SPA (served by rust-embed, with an
         // index.html fallback for client-side routes). Kept as the fallback so it never
@@ -94,18 +106,51 @@ fn build_router(store: Store, body_limit: usize) -> Router {
         .layer(DefaultBodyLimit::max(body_limit))
         // Transparently inflate `Content-Encoding: gzip` request bodies (OTLP exporters
         // gzip by default) before the handler — and before the body limit — sees them.
-        .layer(RequestDecompressionLayer::new())
-        .with_state(store)
+        .layer(RequestDecompressionLayer::new());
+    // The bearer-token gate is the OUTERMOST layer (added last → runs first): an
+    // unauthenticated request is rejected before we spend any work decompressing or decoding
+    // its body, so the gate also blunts a decompression bomb from an anonymous client. The
+    // layer is only added when the gate is armed, so the disabled path is byte-for-byte the
+    // pre-auth router (zero added overhead, and every existing test exercises it unchanged).
+    let router = if auth.is_enabled() {
+        router.layer(axum::middleware::from_fn_with_state(auth, require_bearer))
+    } else {
+        router
+    };
+    router.with_state(store)
+}
+
+/// Auth middleware: when the gate is armed, require a valid `Authorization: Bearer <token>`
+/// on every request, else `401` with a `WWW-Authenticate: Bearer` challenge. Only installed
+/// when [`Auth::is_enabled`], so it never runs (nor allocates) in the default no-auth mode.
+async fn require_bearer(State(auth): State<Auth>, req: Request, next: Next) -> Response {
+    let header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if auth.check(header) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "evald: unauthorized — set Authorization: Bearer <token>\n",
+        )
+            .into_response()
+    }
 }
 
 /// Open the store and serve the OTLP/HTTP receiver + query API — and, when `grpc_addr` is
 /// `Some`, the OTLP/gRPC receiver on that address — until Ctrl-C. Both listeners share one
-/// [`Store`] (so one ingest core, one durability path) and one graceful-shutdown signal.
+/// [`Store`] (so one ingest core, one durability path), one graceful-shutdown signal, and one
+/// bearer-token [`Auth`] gate (a [`disabled`](Auth::disabled) gate leaves both listeners
+/// open, the default local posture).
 pub async fn serve(
     addr: SocketAddr,
     grpc_addr: Option<SocketAddr>,
     data_dir: PathBuf,
     config: StoreConfig,
+    auth: Auth,
 ) -> anyhow::Result<()> {
     let store = Store::open(&data_dir, config)
         .map_err(|e| anyhow::anyhow!("failed to open store at {}: {e}", data_dir.display()))?;
@@ -142,6 +187,9 @@ pub async fn serve(
             "data dir looks EPHEMERAL — spans will NOT survive a restart; mount a persistent volume"
         );
     }
+    // Auth posture — the last piece of the "is this safe to expose?" story. Logs whether the
+    // bearer gate is armed, and shouts if any listener is bound off-loopback with no gate.
+    log_auth_posture(local, grpc_addr, &auth);
 
     // One shutdown signal fans out to every listener: a Ctrl-C flips the watch, and each
     // server's graceful-shutdown future wakes on it and drains.
@@ -154,17 +202,49 @@ pub async fn serve(
         let _ = rx.changed().await;
     };
 
-    let http = axum::serve(listener, router(store.clone()))
+    let http = axum::serve(listener, router_with_auth(store.clone(), auth.clone()))
         .with_graceful_shutdown(on_shutdown(shutdown_rx.clone()));
 
     match grpc_addr {
         Some(gaddr) => {
-            let grpc = crate::grpc::serve(gaddr, store, on_shutdown(shutdown_rx.clone()));
+            let grpc = crate::grpc::serve(gaddr, store, auth, on_shutdown(shutdown_rx.clone()));
             tokio::try_join!(async { http.await.map_err(anyhow::Error::from) }, grpc)?;
         }
         None => http.await?,
     }
     Ok(())
+}
+
+/// Log the authentication posture at startup: whether the bearer gate is armed, and — the
+/// important safety net — a loud warning when a listener is bound off-loopback with no gate,
+/// which is exactly the "exposed evald with no auth" footgun `SECURITY.md` warns about.
+fn log_auth_posture(http: SocketAddr, grpc: Option<SocketAddr>, auth: &Auth) {
+    let off_loopback = |a: SocketAddr| !a.ip().is_loopback();
+    let exposed = off_loopback(http) || grpc.is_some_and(off_loopback);
+    if auth.is_enabled() {
+        tracing::info!(
+            tokens = auth.token_count(),
+            "auth: bearer-token gate ARMED — every request needs Authorization: Bearer <token>"
+        );
+        if exposed {
+            // Bearer over plaintext is only as private as the transport — remind, don't block.
+            tracing::info!(
+                "auth: a listener is bound off-loopback; terminate TLS at a reverse proxy \
+                 (or edgeguard) if the network is untrusted — evald itself does no TLS"
+            );
+        }
+    } else if exposed {
+        tracing::warn!(
+            http = %http,
+            grpc = grpc.map(|g| g.to_string()).unwrap_or_default(),
+            "auth: NO authentication and a listener is bound OFF-LOOPBACK — anyone who can \
+             reach the port can read/write all spans, scores, and run SQL. Set --auth-token / \
+             EVALD_AUTH_TOKEN (or --auth-token-file), or put an authenticating reverse proxy \
+             in front. See SECURITY.md."
+        );
+    } else {
+        tracing::info!("auth: none (loopback-only) — the default local posture");
+    }
 }
 
 /// Heuristic: does `dir` live under a classic ephemeral location (a container tmpfs / scratch),
@@ -467,6 +547,22 @@ async fn get_session(State(store): State<Store>, AxPath(session_id): AxPath<Stri
 /// store approaching its shed threshold before it starts returning 429s.
 async fn get_stats(State(store): State<Store>) -> Response {
     Json(store.ingest_stats()).into_response()
+}
+
+/// `GET /v1/meta` — the edition/capability handshake the embedded console reads once at
+/// boot to decide which surfaces to render. The OSS node is a single local store: no fleet,
+/// no tenants. `judge` reflects whether this build can make an outbound LLM-judge call (the
+/// `judge` cargo feature) so the console can label BYO-key vs offline. The EE `fleet_query`
+/// node serves the SAME console bytes but answers this route with `edition:"ee", fleet:true`,
+/// which is how one embedded SPA lights up the Fleet · EE nav group only where it applies.
+async fn get_meta() -> Response {
+    Json(serde_json::json!({
+        "edition": "oss",
+        "fleet": false,
+        "judge": cfg!(feature = "judge"),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+    .into_response()
 }
 
 /// `GET /v1/blobs/{key}` — fetch an offloaded payload by the key in an `evald-blob:<key>`
@@ -1998,7 +2094,7 @@ mod tests {
         );
 
         let (store, _dir) = test_store();
-        let app = build_router(store, 1024); // 1 KiB decompressed cap
+        let app = build_router(store, 1024, Auth::disabled()); // 1 KiB decompressed cap
         let req = Request::builder()
             .method("POST")
             .uri("/v1/traces")
@@ -2011,5 +2107,99 @@ mod tests {
         // decompression it would cap the tiny compressed body, let the bomb through, and
         // fail later at protobuf decode with 400.)
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // --- bearer-token auth gate ------------------------------------------------------
+
+    const TEST_TOKEN: &str = "test-token-0123456789";
+
+    /// A GET with an optional `Authorization: Bearer <token>` header.
+    fn get_bearer(uri: &str, token: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder().method("GET").uri(uri);
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    fn auth_router(store: Store) -> Router {
+        router_with_auth(store, Auth::from_tokens([TEST_TOKEN]).unwrap())
+    }
+
+    #[tokio::test]
+    async fn auth_gate_rejects_missing_and_wrong_tokens_with_401() {
+        let (store, _dir) = test_store();
+        let app = auth_router(store);
+
+        // No Authorization header → 401 + a Bearer challenge.
+        let resp = app
+            .clone()
+            .oneshot(get_bearer("/v1/spans", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+            "Bearer"
+        );
+
+        // Wrong token → 401.
+        let resp = app
+            .clone()
+            .oneshot(get_bearer("/v1/spans", Some("wrong-token-0123456789")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct token → the request is served (200).
+        let resp = app
+            .oneshot(get_bearer("/v1/spans", Some(TEST_TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_gate_guards_ingest_writes() {
+        let (store, _dir) = test_store();
+        let app = auth_router(store);
+
+        // Unauthenticated ingest is blocked BEFORE the body is decoded — 401, not 200.
+        let resp = app
+            .clone()
+            .oneshot(post_traces(CT_PROTOBUF, sample_request().encode_to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // With a valid token the same ingest succeeds.
+        let mut req = post_traces(CT_PROTOBUF, sample_request().encode_to_vec());
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {TEST_TOKEN}").parse().unwrap(),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_gate_also_guards_the_spa_fallback() {
+        // Nothing is reachable without a token when the gate is armed — including the
+        // embedded SPA served by the router fallback.
+        let (store, _dir) = test_store();
+        let app = auth_router(store);
+        let resp = app.oneshot(get_bearer("/", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn disabled_auth_serves_without_a_token() {
+        // The default (no-auth) router is unchanged: no Authorization header, still 200.
+        let (store, _dir) = test_store();
+        let resp = router(store)
+            .oneshot(get_bearer("/v1/spans", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

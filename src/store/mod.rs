@@ -368,7 +368,7 @@ impl Store {
             }
         }
 
-        out.sort_by(|a, b| b.start_unix_nano.cmp(&a.start_unix_nano));
+        out.sort_by_key(|b| std::cmp::Reverse(b.start_unix_nano));
         out.truncate(limit);
         Ok(out)
     }

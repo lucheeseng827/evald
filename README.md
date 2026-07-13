@@ -6,7 +6,7 @@ JSONL dataset, get scores keyed to the exact span. No database, no Python runtim
 no container required — a single static musl binary that runs on your laptop or
 inside a locked-down CI runner.
 
-> **Status: v0.1.0 — first release.** `evald serve` runs an OTLP/HTTP receiver on
+> **Status: v0.2.0.** `evald serve` runs an OTLP/HTTP receiver on
 > `:4318` that accepts `POST /v1/traces` in **both** protobuf (gzip-aware) and
 > **OTLP-JSON**, **normalizes** each span into one model unifying the OpenInference and
 > `gen_ai.*` conventions, and **durably stores** it through a real two-tier engine: a
@@ -36,6 +36,26 @@ inside a locked-down CI runner.
 > (rust-embed — trace list → trace tree → scores, plus a SQL console; bundled into the binary,
 > works air-gapped) served at `/`. See [`PLAN.md`](./PLAN.md) §4 and the
 > [Architecture](#architecture) diagrams. Last updated 2026-07-13.
+
+## The console
+
+The embedded console (served at `/`, bundled into the binary) — one edition-aware SPA:
+the OSS node shows the **Local node · OSS** surfaces below; an EE fleet node lights up an
+extra **Fleet · EE** group. Screenshots are the OSS build against live data (real
+Anthropic + demo traces).
+
+![evald console — Overview: live spans / traces / scores KPIs, ingest pipeline, eval scores by evaluator](./docs/assets/console-overview.png)
+
+<table>
+<tr>
+<td width="50%"><a href="./docs/assets/console-traces.png"><img src="./docs/assets/console-traces.png" alt="Traces — trace list → span tree → span detail with real gen_ai attributes and token counts"></a><br><b>Traces</b> — trace list → span tree → span detail (real <code>gen_ai.*</code> attributes + token usage).</td>
+<td width="50%"><a href="./docs/assets/console-cost.png"><img src="./docs/assets/console-cost.png" alt="Cost — token + spend attribution grouped by model"></a><br><b>Cost</b> — token + spend attribution, grouped by model / provider / service / user.</td>
+</tr>
+<tr>
+<td width="50%"><a href="./docs/assets/console-sql.png"><img src="./docs/assets/console-sql.png" alt="SQL console — read-only DataFusion over the spans ∪ scores tables"></a><br><b>SQL console</b> — read-only DataFusion over the <code>spans</code> ∪ <code>scores</code> tables.</td>
+<td width="50%"><i>Evals</i>, <i>Scores</i>, and account <i>Settings</i> round out the OSS group; <b>Tenants · Members · Billing · Audit · Fleet · Judge keys</b> appear on an EE fleet node. See <a href="./docs/INSTRUMENTATION.md">docs/INSTRUMENTATION.md</a> to point your own app at it.</td>
+</tr>
+</table>
 
 ## What it is
 
@@ -71,6 +91,8 @@ evald serve                       # ✅ OTLP/HTTP receiver on :4318 + durable st
 # 2. repoint any OpenInference/OTel SDK — one env var
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 #    ... run your LLM app; spans are normalized + durably stored (✅ today) ...
+#    full walkthrough (auto-instrument Anthropic/OpenAI/LangChain, manual spans,
+#    the attributes evald reads) → docs/INSTRUMENTATION.md
 
 # 3. read traces back                               (✅ today)
 curl localhost:4318/v1/spans                 # recent spans (?trace_id=&limit=)
@@ -148,6 +170,49 @@ cargo run --example otlp_demo_payload \
 curl -s http://127.0.0.1:4318/v1/spans                          # -> the normalized span as JSON
 # kill -9 the server, `evald serve --data-dir /tmp/evald` again, GET /v1/spans -> still there.
 ```
+
+## Exposing evald on a network (auth)
+
+By default `evald serve` binds **loopback** (`127.0.0.1:4318`) and runs with **no
+authentication** — it is a local / single-tenant tool, and the threat model is
+untrusted *input* on a *trusted* network (your laptop, a locked-down CI runner). Do
+not put that default on a shared or public network unguarded.
+
+For network exposure, evald ships an **optional bearer-token gate** (off by default).
+Arm it and every request must carry `Authorization: Bearer <token>` — over HTTP
+(OTLP ingest, the whole `/v1/*` API, and the SPA; a missing/wrong token is `401`)
+and over OTLP/gRPC (the `authorization` metadata; a missing/wrong token is gRPC
+`UNAUTHENTICATED`):
+
+```bash
+# Preferred — tokens in a file readable only by the evald user (one per line,
+# `#` comments): keeps the secret out of the process list and shell history.
+printf '%s\n' "$(openssl rand -hex 24)" > /etc/evald/tokens && chmod 600 /etc/evald/tokens
+evald serve --otlp-http 0.0.0.0:4318 --auth-token-file /etc/evald/tokens
+#   rotate:  add a new line, reload clients, then remove the old one.
+#   env:     EVALD_AUTH_TOKEN=tok1,tok2 evald serve …   (comma-separated list)
+#   flag:    evald serve --auth-token "<token>"         (trusted single-user host only —
+#                                                         argv is visible in `ps`)
+
+# clients attach the token as a header:
+curl http://HOST:4318/v1/spans -H "Authorization: Bearer $EVALD_TOKEN"
+export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $EVALD_TOKEN"   # OTLP SDKs
+```
+
+Prefer `--auth-token-file` (or `EVALD_AUTH_TOKEN`) on shared hosts: a token passed
+as `--auth-token` on the command line is visible in the process list (`ps`,
+`/proc/<pid>/cmdline`) to other local users, so the flag form is only appropriate on
+a trusted single-user host. Tokens are ≥16 printable-ASCII chars (rejected at boot
+otherwise), matched by SHA-256 digest, and never logged; multiple tokens support
+rotation and per-client revocation. Binding off-loopback with no token logs a loud
+startup warning.
+
+This is a **shared-secret gate, not TLS and not per-user identity.** If the network
+between clients and evald is untrusted, terminate TLS at a reverse proxy — nginx,
+Caddy, or an mTLS mesh in front of any app, zero code changes — even with the token
+gate on. For per-tenant identity / OIDC, use the separately-licensed `ee`
+fleet layer. Full details: [OPERATIONS.md § Security posture](./docs/OPERATIONS.md#security-posture)
+and [SECURITY.md](./SECURITY.md).
 
 ## Architecture
 
@@ -288,6 +353,9 @@ crate stack, and the data model.
 - [`docs/CONFIG.md`](./docs/CONFIG.md) — every knob: `serve`/`eval`/`query`/`cost` CLI
   flags + `EVALD_*` env fallbacks, the eval YAML (evaluators, judges, thresholds),
   fixed limits, on-disk format/compat notes. *(public)*
+- [`docs/INSTRUMENTATION.md`](./docs/INSTRUMENTATION.md) — connect your LLM app: point
+  any OpenTelemetry / OpenInference exporter at `:4318`, the attributes evald reads
+  (GenAI + OpenInference dialects, tokens, cost), and how to attach scores. *(public)*
 - [`docs/API.md`](./docs/API.md) — every HTTP endpoint with request/response examples
   and error codes (429 shed, 413 cap, the read-only SQL guard). *(public)*
 - [`docs/OPERATIONS.md`](./docs/OPERATIONS.md) — ops runbook: the `--data-dir` state +

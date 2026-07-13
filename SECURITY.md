@@ -40,14 +40,21 @@ evald is a single static binary that ingests **untrusted OTLP spans** and runs
   path.
 - **Network exposure defaults**: `evald serve` binds `127.0.0.1` by default and
   must never listen on a public interface unasked.
+- The **optional bearer-token gate** (`--auth-token` / `EVALD_AUTH_TOKEN` /
+  `--auth-token-file`): when armed, a way to reach any endpoint (HTTP or gRPC)
+  *without* a valid token — a bypass, or a timing oracle that leaks the secret —
+  is in scope. So is a token being written to a log or error.
 
 Out of scope:
 
-- evald has **no built-in authentication** in the OSS core (it is a local /
-  single-tenant tool); running it on a shared or public network without a
-  reverse proxy / network policy in front is a deployment choice, not a
-  vulnerability. For multi-user deployments, put authentication/authorization in a
-  reverse proxy or gateway in front of evald.
+- **Running evald exposed with no protection at all.** The OSS core is a local /
+  single-tenant tool; it now ships an *optional* bearer-token gate (off by
+  default — see above), but running it on a shared or public network with
+  *neither* that gate nor an authenticating reverse proxy / network policy in
+  front is a deployment choice, not a vulnerability. The gate is a shared-secret
+  bearer check, **not** TLS and **not** per-user identity — for TLS termination or
+  per-tenant identity put a reverse proxy / gateway (or the separately-licensed ee
+  fleet layer) in front.
 - The **content of the spans and scores** evald stores is product data, not a
   vulnerability in evald (it is an observability store — it records what your app
   emits, including any secrets your app puts in span attributes; redact at the

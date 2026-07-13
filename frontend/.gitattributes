@@ -1,0 +1,4 @@
+# The built console bundle is a generated artifact — keep it byte-identical across
+# platforms (no CRLF conversion) so what's committed is exactly what rust-embed bakes
+# into the binary. Regenerate with `npm run build`.
+dist/** -text

@@ -58,6 +58,21 @@ enum Cmd {
         /// Parquet / query response. `0` disables offloading (payloads stay inline).
         #[arg(long, default_value_t = 256 * 1024, env = "EVALD_BLOB_OFFLOAD_BYTES")]
         blob_offload_bytes: usize,
+        /// Require an `Authorization: Bearer <token>` on every request (HTTP + gRPC). Each
+        /// occurrence is ONE whole token (commas allowed); repeat the flag for several accepted
+        /// tokens (rotation / per-client revocation). The env var `EVALD_AUTH_TOKEN` is read as
+        /// a comma-separated list and UNIONED with these (and with `--auth-token-file`). Tokens
+        /// must be at least 16 printable-ASCII chars. With nothing configured, authentication is
+        /// OFF — the default local posture (`serve` also binds loopback by default). Turn this
+        /// on before exposing evald on a shared or public network. This is a shared-secret gate,
+        /// not TLS — terminate TLS at a reverse proxy if the network is untrusted.
+        #[arg(long = "auth-token")]
+        auth_token: Vec<String>,
+        /// A file of bearer tokens — one per line; blank lines and `#` comments ignored —
+        /// unioned with any `--auth-token` values. Keeps secrets out of argv/env and lets you
+        /// rotate by editing the file. See `--auth-token`.
+        #[arg(long = "auth-token-file", env = "EVALD_AUTH_TOKEN_FILE")]
+        auth_token_file: Option<PathBuf>,
     },
     /// Eval runner subcommands (offline regression loop).
     Eval {
@@ -271,8 +286,24 @@ async fn main() -> anyhow::Result<()> {
             compact_interval_secs,
             max_hot_spans,
             blob_offload_bytes,
+            auth_token,
+            auth_token_file,
         } => {
             evald::init_tracing();
+            // `EVALD_AUTH_TOKEN` is read HERE, not via a clap `env` fallback, so it UNIONS with
+            // any `--auth-token` flags and `--auth-token-file` (clap would instead let a single
+            // `--auth-token` *replace* the env value, silently dropping it — breaking rotation —
+            // and would turn an empty `EVALD_AUTH_TOKEN=` placeholder into a bogus token). It is
+            // a comma-separated list; unset or empty contributes nothing.
+            let mut auth_tokens = auth_token;
+            if let Ok(env_tokens) = std::env::var("EVALD_AUTH_TOKEN") {
+                auth_tokens.extend(env_tokens.split(',').map(str::to_string));
+            }
+            // Assemble the bearer-token gate before binding: a bad token config (too short,
+            // non-ASCII, an unreadable file, or auth-requested-but-empty) fails here with a clear
+            // message instead of after the listener is up. Nothing configured → auth disabled.
+            let auth = evald::Auth::from_sources(&auth_tokens, auth_token_file.as_deref())
+                .map_err(|e| anyhow::anyhow!("auth configuration error: {e}"))?;
             let addr: SocketAddr = otlp_http
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid --otlp-http address {otlp_http:?}: {e}"))?;
@@ -292,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
                 blob_offload_bytes,
                 ..StoreConfig::default()
             };
-            evald::ingest::serve(addr, grpc_addr, data_dir, config).await?;
+            evald::ingest::serve(addr, grpc_addr, data_dir, config, auth).await?;
         }
         Cmd::Eval { action } => match action {
             EvalCmd::Run {

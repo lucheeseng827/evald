@@ -9,7 +9,7 @@ panic = "unwind"
 
 [package]
 name = "evald"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "evald — embedded OTel-native trace + eval store for LLM apps (single binary). PoC: OTLP/HTTP receiver."
@@ -95,6 +95,10 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }  # UT
 
 # Scores (PoC step 5)
 uuid = { version = "1", features = ["v4"] }          # score ids when the caller doesn't supply one
+
+# Optional bearer-token auth for `evald serve` on a public network (src/auth.rs). Tokens are
+# matched by SHA-256 digest (fixed-length compare, never logged). Pure-Rust → clean static musl.
+sha2 = "0.10"
 
 # Eval runner (PoC step 6)
 serde_yaml = "0.9"                                   # eval run config (dataset + evaluators + thresholds)
