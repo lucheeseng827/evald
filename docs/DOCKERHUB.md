@@ -52,17 +52,19 @@ database, no Python.
 | Tag | Notes |
 |---|---|
 | `latest` | newest stable release |
+| `0.3.0` | derived `cost_usd` from model + token counts (built-in price table), LLM usage on `/metrics` + `evald latency`, quieter default ingest logging, lower `--max-hot-spans` default, bounded SQL/hot-tier reads that stop over-allocating |
+| `0.2.0` | redesigned console (Vite + React + TypeScript), standalone `mancube/evald-console` frontend image, `docs/INSTRUMENTATION.md`, `GET /v1/meta` |
 | `0.1.0` | first release — OTLP ingest + normalization, durable WAL→Parquet store, scores, offline `eval run`/`eval compare` with CI gating, SQL, embedded UI |
 | `*-rc.*` | pre-release smoke builds (not tagged `latest`) — don't use in production |
 
-Pin a version in production: `mancube/evald:0.1.0`.
+Pin a version in production: `mancube/evald:0.3.0`.
 
 ## Quick start
 
 The binary is the entrypoint, so the `docker` args are just `evald` subcommands (`serve` / `eval` / `query` / `version`). Mount a data dir for the durable store; everything stays local.
 
 ```bash
-docker run --rm mancube/evald:0.1.0 version
+docker run --rm mancube/evald:0.3.0 version
 ```
 
 **1. Run the store** — the OTLP/HTTP receiver + query API + embedded UI. Bind `0.0.0.0` inside the container (the default `127.0.0.1` isn't reachable from the host):
@@ -70,7 +72,7 @@ docker run --rm mancube/evald:0.1.0 version
 ```bash
 docker run --rm -p 4318:4318 \
   -v "$PWD/evald-data:/data" \
-  mancube/evald:0.1.0 \
+  mancube/evald:0.3.0 \
   serve --otlp-http 0.0.0.0:4318 --data-dir /data
 # point your app's OTel SDK at http://127.0.0.1:4318, then open http://127.0.0.1:4318/
 ```
@@ -80,10 +82,10 @@ docker run --rm -p 4318:4318 \
 ```bash
 docker run --rm \
   -v "$PWD:/work" -w /work \
-  mancube/evald:0.1.0 \
+  mancube/evald:0.3.0 \
   eval run --config eval.yaml --data-dir /work/evald-data
 # then diff two runs, failing the build only on a statistically significant drop:
-docker run --rm -v "$PWD:/work" -w /work mancube/evald:0.1.0 \
+docker run --rm -v "$PWD:/work" -w /work mancube/evald:0.3.0 \
   eval compare <run_a> <run_b> --data-dir /work/evald-data \
   --fail-on-regression --significance
 ```
@@ -91,7 +93,7 @@ docker run --rm -v "$PWD:/work" -w /work mancube/evald:0.1.0 \
 **3. Query the store with SQL** — DataFusion over the Parquet blocks ∪ scores:
 
 ```bash
-docker run --rm -v "$PWD/evald-data:/data" mancube/evald:0.1.0 \
+docker run --rm -v "$PWD/evald-data:/data" mancube/evald:0.3.0 \
   query "SELECT model, COUNT(*) n, SUM(total_tokens) tok FROM spans GROUP BY model" \
   --data-dir /data
 ```
