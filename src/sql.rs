@@ -34,7 +34,11 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::MemTable;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::object_store::limit::LimitStore;
+use datafusion::object_store::local::LocalFileSystem;
+use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use serde::Serialize;
@@ -61,6 +65,7 @@ pub async fn query(store: &Store, sql: &str, row_limit: usize) -> anyhow::Result
     ensure_read_only(sql)?;
 
     let ctx = SessionContext::new();
+    bound_open_files(&ctx);
     register_spans(&ctx, store).await?;
     register_scores(&ctx, store)?;
 
@@ -73,7 +78,7 @@ pub async fn query(store: &Store, sql: &str, row_limit: usize) -> anyhow::Result
         .map(|f| f.name().clone())
         .collect();
 
-    let batches = df.collect().await?;
+    let batches = bound_rows(df, row_limit)?.collect().await?;
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut truncated = false;
@@ -93,6 +98,29 @@ pub async fn query(store: &Store, sql: &str, row_limit: usize) -> anyhow::Result
         rows,
         truncated,
     })
+}
+
+/// Bound the result at `row_limit` rows *during execution*, rather than after it.
+///
+/// `collect()` materialises every row the plan produces, so truncating afterwards means
+/// `SELECT * FROM spans` with a limit of 1 builds the whole store in Arrow memory to return
+/// one row — the same collect-then-truncate that [`Store::query`] used to do over the hot
+/// tier. A `Limit` in the plan makes the executor stop pulling batches instead.
+///
+/// It fetches `row_limit + 1` because one row past the cap is what makes `truncated`
+/// answerable: it says there was more without paying for the rest. The caller's loop keeps
+/// `row_limit` of them and reports the extra as truncation.
+fn bound_rows(df: DataFrame, row_limit: usize) -> anyhow::Result<DataFrame> {
+    // `EXPLAIN` has to be the root of its own plan — DataFusion rejects a `Limit` above it —
+    // and it emits a handful of plan lines, so there is nothing here worth bounding. The
+    // caller's loop still truncates that output exactly as it did before.
+    if matches!(
+        df.logical_plan(),
+        LogicalPlan::Explain(_) | LogicalPlan::Analyze(_)
+    ) {
+        return Ok(df);
+    }
+    Ok(df.limit(0, Some(row_limit.saturating_add(1)))?)
 }
 
 /// Allow only a single **read** statement. A leading-keyword check is not enough:
@@ -131,42 +159,102 @@ fn statement_is_read_only(stmt: &DfStatement) -> bool {
     }
 }
 
+/// The most cold blocks a query holds open at once, whatever the block count.
+///
+/// Every block is registered as its own listing URL (see [`register_spans`]), and the scan
+/// opens them concurrently, so the open-file working set tracked the block count and a full
+/// scan over a long-lived store died with `EMFILE` (`docs/SOAK.md`, "The ceiling this gate
+/// found — and what fixed it"). A [`LimitStore`] puts a semaphore in front of every object-store operation, so
+/// at most this many are in flight — and therefore at most this many blocks are open —
+/// however many the index names. Measured: without it, a scan of 2,000 blocks peaked over
+/// 1,000 descriptors and failed under `ulimit -n 256`; with it the peak is exactly this
+/// number, and the same scan runs under `ulimit -n 96`.
+///
+/// 64 is chosen to leave a stock `ulimit -n 1024` shell room for the runtime, the stdio and
+/// the redb files, while staying wide enough that the scan is never open-bound in practice.
+/// `tests/fd_ceiling.rs` pins the claim: 800 blocks scanned under a 192-descriptor limit.
+///
+/// Merging (`store::merge`) is what bounds the block *count*; this bounds the *descriptors*
+/// a scan uses even before merging has caught up.
+pub const COLD_SCAN_MAX_OPEN_FILES: usize = 64;
+
+/// Route `file://` reads through a concurrency-limited local store (see
+/// [`COLD_SCAN_MAX_OPEN_FILES`]).
+fn bound_open_files(ctx: &SessionContext) {
+    let limited = LimitStore::new(LocalFileSystem::new(), COLD_SCAN_MAX_OPEN_FILES);
+    ctx.runtime_env().register_object_store(
+        ObjectStoreUrl::local_filesystem().as_ref(),
+        Arc::new(limited),
+    );
+}
+
+/// The listing URLs for `block_paths`, or `None` if one of them has been reclaimed since the
+/// index named it — the caller re-lists and tries again.
+fn cold_urls(block_paths: &[std::path::PathBuf]) -> anyhow::Result<Option<Vec<ListingTableUrl>>> {
+    let mut urls = Vec::with_capacity(block_paths.len());
+    for p in block_paths {
+        // Absolutize so the file:// URL is well-formed regardless of a relative --data-dir.
+        let abs = match std::fs::canonicalize(p) {
+            Ok(abs) => abs,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(path = %p.display(), "cold block vanished before the scan; re-listing");
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let s = abs
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("block path is not valid UTF-8: {}", abs.display()))?;
+        // Windows: canonicalize returns a verbatim path (`\\?\C:\...`), which
+        // `ListingTableUrl::parse` misreads as a relative path. Hand it a
+        // well-formed file:// URL instead.
+        #[cfg(windows)]
+        let s = &format!(
+            "file:///{}",
+            s.trim_start_matches(r"\\?\").replace('\\', "/")
+        );
+        urls.push(ListingTableUrl::parse(s)?);
+    }
+    Ok(Some(urls))
+}
+
 /// Register `cold_spans` (ListingTable over the blocks), `hot_spans` (MemTable), and the
 /// deduped `spans` view over their union.
 async fn register_spans(ctx: &SessionContext, store: &Store) -> anyhow::Result<()> {
     let schema = cold::schema();
 
-    // cold_spans: scan the Parquet blocks directly. With no blocks yet, register an empty
-    // MemTable carrying the same schema so `spans` is always queryable.
     // cold_spans: register the COMMITTED blocks the index knows about, as explicit file URLs.
     // A directory/glob `ListingTable` over blocks/ is unreliable for the time-partitioned tree
     // (blocks/YYYY/MM/DD/HH/*.parquet) — DataFusion's directory listing misses the nested
     // files — and a raw dir scan could also surface an orphan block from a crashed flush. Using
     // the index's committed paths fixes both, and matches the REST read path exactly. With no
     // blocks yet, register an empty MemTable carrying the schema so `spans` is always queryable.
-    let block_paths = store.cold_block_paths()?;
-    if block_paths.is_empty() {
+    //
+    // A merge can take a block out of the index between the listing and the registration
+    // below, and reclaim the file once its grace elapses. The block's rows are in the merged
+    // block, which a re-listing includes — so re-list once rather than fail the query on a
+    // path the index no longer names. This mirrors the same retry in `Store::query`; without
+    // it a long scan that straddles a merge dies on `canonicalize`. A second miss is an
+    // error, not an empty table: returning the hot tier alone and calling it the answer
+    // would be a silently wrong result, which is worse than a query the caller can retry.
+    let urls = match cold_urls(&store.cold_block_paths()?)? {
+        Some(urls) => urls,
+        None => cold_urls(&store.cold_block_paths()?)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "a cold block was reclaimed twice while registering the scan; retry the query"
+            )
+        })?,
+    };
+    if urls.is_empty() {
         let empty = MemTable::try_new(schema.clone(), vec![vec![]])?;
         ctx.register_table("cold_spans", Arc::new(empty))?;
     } else {
-        let mut urls = Vec::with_capacity(block_paths.len());
-        for p in &block_paths {
-            // Absolutize so the file:// URL is well-formed regardless of a relative --data-dir.
-            let abs = std::fs::canonicalize(p)?;
-            let s = abs.to_str().ok_or_else(|| {
-                anyhow::anyhow!("block path is not valid UTF-8: {}", abs.display())
-            })?;
-            // Windows: canonicalize returns a verbatim path (`\\?\C:\...`), which
-            // `ListingTableUrl::parse` misreads as a relative path. Hand it a
-            // well-formed file:// URL instead.
-            #[cfg(windows)]
-            let s = &format!(
-                "file:///{}",
-                s.trim_start_matches(r"\\?\").replace('\\', "/")
-            );
-            urls.push(ListingTableUrl::parse(s)?);
-        }
-        let options = ListingOptions::new(Arc::new(ParquetFormat::default()));
+        // No per-file statistics at planning time: collecting them reads every block's
+        // footer on every query — O(blocks) I/O before a byte of the scan — and nothing
+        // here uses them (the `spans` view is an anti-join, never a stats-only aggregate).
+        // Row-group pruning from a `WHERE` still happens at scan time, per file.
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_collect_stat(false);
         let config = ListingTableConfig::new_with_multi_paths(urls)
             .with_listing_options(options)
             .with_schema(schema.clone());
@@ -513,6 +601,41 @@ mod tests {
         let r = query(&store, "SELECT span_id FROM spans", 3).await.unwrap();
         assert_eq!(r.row_count, 3);
         assert!(r.truncated);
+    }
+
+    /// `row_limit_truncates` above pins the *answer*, and passes either way — a
+    /// collect-then-truncate implementation returns exactly the same rows. What it cannot
+    /// see is whether the whole result was built in memory first. The bound is only worth
+    /// anything if it is in the plan, so that is what this asserts.
+    #[tokio::test]
+    async fn the_row_limit_is_in_the_plan_not_applied_after_collect() {
+        let ctx = SessionContext::new();
+        let df = ctx.sql("SELECT 1 AS n").await.unwrap();
+        let plan = bound_rows(df, 3)
+            .unwrap()
+            .logical_plan()
+            .display_indent()
+            .to_string();
+        assert!(
+            plan.contains("Limit:") && plan.contains("fetch=4"),
+            "the plan should carry a fetch of row_limit + 1; got:\n{plan}"
+        );
+    }
+
+    /// A bounded read must not report truncation when the result fits exactly. The extra row
+    /// the plan fetches is a probe, not part of the answer.
+    #[tokio::test]
+    async fn an_exact_fit_is_not_reported_as_truncated() {
+        let spans: Vec<_> = (0..3)
+            .map(|i| test_span("t", &format!("span{i}"), 1_700_000_000_000_000_000 + i))
+            .collect();
+        let (store, _d) = store_with(spans, vec![]).await;
+        let r = query(&store, "SELECT span_id FROM spans", 3).await.unwrap();
+        assert_eq!(r.row_count, 3);
+        assert!(
+            !r.truncated,
+            "three rows under a limit of three is not truncated"
+        );
     }
 
     #[tokio::test]

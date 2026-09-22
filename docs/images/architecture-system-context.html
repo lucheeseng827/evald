@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>System context — the WAL is the ACK boundary</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f4f2ee;   /* bone */
+      --color-ink:     #1c1f26;   /* graphite */
+      --color-muted:   #4a5361;   /* slate */
+      --color-accent:  #a13d24;   /* oxide */
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · evald</p>
+    <h1>System context — the WAL is the ACK boundary</h1>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="evald-title evald-desc">
+      <title id="evald-title">System context — the WAL is the ACK boundary</title>
+      <desc id="evald-desc">Architecture diagram showing evald receiving OTLP spans on one axum listener, funnelling them through a single writer task into a write-ahead log that is fsynced before the client is acknowledged, then into an in-memory hot tier and a compacted Parquet cold tier indexed by redb, with DataFusion serving SQL over both off the ingest hot path.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4a5361"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#a13d24"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f4f2ee"/>
+
+      <!-- ============ Connectors ============ -->
+
+      <line x1="200" y1="192" x2="272" y2="192" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <line x1="488" y1="192" x2="544" y2="192" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="720" y1="192" x2="776" y2="192" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <line x1="884" y1="256" x2="884" y2="296" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="884" y1="400" x2="884" y2="440" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="992" y1="500" x2="1048" y2="500" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 776,348 H 748 Q 740,348 740,356 V 384 Q 740,392 732,392 H 704"
+            fill="none" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 776,500 H 596 Q 588,500 588,492 V 464"
+            fill="none" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="456" y1="392" x2="392" y2="392" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <!-- redb (Score store) to DataFusion : scoredb → df -->
+      <path d="M 1120,440 V 286 Q 1120,276 1110,276 H 610 Q 600,276 600,286 V 320"
+            fill="none" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- redb (Score store) to Read surfaces : scoredb → api (/v1/scores) -->
+      <path d="M 1160,560 V 576 Q 1160,584 1150,584 H 262 Q 252,584 252,574 V 464"
+            fill="none" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- ============ Arrow labels ============ -->
+
+      <rect x="204" y="172" width="64" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="236" y="181" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">POST TRACES</text>
+
+      <rect x="492" y="172" width="48" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="516" y="181" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SPANS</text>
+
+      <rect x="724" y="172" width="48" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="748" y="181" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">APPEND</text>
+
+      <rect x="894" y="264" width="64" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="926" y="273" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">THEN ACK</text>
+
+      <rect x="894" y="408" width="48" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="918" y="417" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SEAL</text>
+
+      <rect x="996" y="480" width="48" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="1020" y="489" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">INDEX</text>
+
+      <rect x="640" y="476" width="56" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="668" y="485" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PARQUET</text>
+
+      <rect x="396" y="372" width="56" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="424" y="381" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SQL</text>
+
+      <rect x="1092" y="354" width="56" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="1120" y="363" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SCORES</text>
+
+      <rect x="640" y="578" width="56" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="668" y="587" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SCORES</text>
+
+      <!-- ============ Nodes ============ -->
+
+      <!-- LLM app (input) -->
+      <rect x="40" y="140" width="160" height="104" rx="6" fill="#f4f2ee"/>
+      <rect x="40" y="140" width="160" height="104" rx="6" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <rect x="48" y="146" width="24" height="12" rx="2" fill="transparent" stroke="rgba(121,129,143,0.40)" stroke-width="0.8"/>
+      <text x="60" y="155" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SDK</text>
+      <text x="120" y="184" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">LLM app</text>
+      <text x="120" y="204" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">OpenInference / OTel</text>
+      <text x="120" y="220" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">exporter → :4318</text>
+
+      <!-- Receiver -->
+      <rect x="272" y="128" width="216" height="128" rx="6" fill="#f4f2ee"/>
+      <rect x="272" y="128" width="216" height="128" rx="6" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <rect x="280" y="134" width="32" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.40)" stroke-width="0.8"/>
+      <text x="296" y="143" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RECV</text>
+      <text x="380" y="176" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Receiver</text>
+      <text x="380" y="196" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">axum :4318</text>
+      <text x="380" y="212" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">protobuf / JSON / gzip</text>
+      <text x="380" y="228" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">→ NormalizedSpan</text>
+      <text x="380" y="244" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">bounded mpsc → 429/503</text>
+
+      <!-- Single writer -->
+      <rect x="544" y="128" width="176" height="128" rx="6" fill="#f4f2ee"/>
+      <rect x="544" y="128" width="176" height="128" rx="6" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <rect x="552" y="134" width="28" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.40)" stroke-width="0.8"/>
+      <text x="566" y="143" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ONE</text>
+      <text x="632" y="184" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Single writer</text>
+      <text x="632" y="208" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">one task, no locks</text>
+      <text x="632" y="224" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">serializes all ingest</text>
+
+      <!-- WAL (FOCAL 1) -->
+      <rect x="776" y="128" width="216" height="128" rx="6" fill="#f4f2ee"/>
+      <rect x="776" y="128" width="216" height="128" rx="6" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <rect x="784" y="134" width="28" height="12" rx="2" fill="transparent" stroke="rgba(161,61,36,0.50)" stroke-width="0.8"/>
+      <text x="798" y="143" fill="#a13d24" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ACK</text>
+      <text x="884" y="180" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">WAL</text>
+      <text x="884" y="204" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">the ACK boundary</text>
+      <text x="884" y="220" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">append + fsync,</text>
+      <text x="884" y="236" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">then ACK the client</text>
+
+      <!-- Hot tier (store) -->
+      <rect x="776" y="296" width="216" height="104" rx="6" fill="#f4f2ee"/>
+      <rect x="776" y="296" width="216" height="104" rx="6" fill="rgba(28,31,38,0.05)" stroke="#4a5361" stroke-width="1"/>
+      <rect x="784" y="302" width="28" height="12" rx="2" fill="transparent" stroke="rgba(74,83,97,0.50)" stroke-width="0.8"/>
+      <text x="798" y="311" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOT</text>
+      <text x="884" y="340" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Hot tier</text>
+      <text x="884" y="360" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">recent spans</text>
+      <text x="884" y="376" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">in memory</text>
+
+      <!-- Compactor -> cold tier (store) -->
+      <rect x="776" y="440" width="216" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="776" y="440" width="216" height="120" rx="6" fill="rgba(28,31,38,0.05)" stroke="#4a5361" stroke-width="1"/>
+      <rect x="784" y="446" width="32" height="12" rx="2" fill="transparent" stroke="rgba(74,83,97,0.50)" stroke-width="0.8"/>
+      <text x="800" y="455" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">COLD</text>
+      <text x="884" y="488" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Compactor → cold</text>
+      <text x="884" y="512" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">crash-safe commit</text>
+      <text x="884" y="528" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">blocks/YYYY/MM/DD/HH</text>
+      <text x="884" y="544" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">*.parquet (Snappy)</text>
+
+      <!-- redb (store) -->
+      <rect x="1048" y="440" width="192" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="1048" y="440" width="192" height="120" rx="6" fill="rgba(28,31,38,0.05)" stroke="#4a5361" stroke-width="1"/>
+      <rect x="1056" y="446" width="32" height="12" rx="2" fill="transparent" stroke="rgba(74,83,97,0.50)" stroke-width="0.8"/>
+      <text x="1072" y="455" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">REDB</text>
+      <text x="1144" y="488" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">redb</text>
+      <text x="1144" y="512" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">trace_id → block</text>
+      <text x="1144" y="528" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">compaction watermark</text>
+      <text x="1144" y="544" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">universal Score store</text>
+
+      <!-- DataFusion (FOCAL 2) -->
+      <rect x="456" y="320" width="248" height="144" rx="6" fill="#f4f2ee"/>
+      <rect x="456" y="320" width="248" height="144" rx="6" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <rect x="464" y="326" width="24" height="12" rx="2" fill="transparent" stroke="rgba(161,61,36,0.50)" stroke-width="0.8"/>
+      <text x="476" y="335" fill="#a13d24" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SQL</text>
+      <text x="580" y="376" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">DataFusion</text>
+      <text x="580" y="400" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">SQL over Parquet ∪ hot</text>
+      <text x="580" y="416" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">deduped at read time</text>
+      <text x="580" y="432" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">pure Rust — static musl</text>
+      <text x="580" y="448" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">off the ingest hot path</text>
+
+      <!-- Read surfaces (external) -->
+      <rect x="112" y="320" width="280" height="144" rx="6" fill="#f4f2ee"/>
+      <rect x="112" y="320" width="280" height="144" rx="6" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <rect x="120" y="326" width="32" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.22)" stroke-width="0.8"/>
+      <text x="136" y="335" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">READ</text>
+      <text x="252" y="376" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Read surfaces</text>
+      <text x="252" y="400" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">API + SQL · axum</text>
+      <text x="252" y="416" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/v1/traces /v1/spans</text>
+      <text x="252" y="432" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/v1/scores /v1/sql</text>
+      <text x="252" y="448" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">embedded SPA · eval runner</text>
+
+      <!-- ============ Legend ============ -->
+
+      <line x1="40" y1="604" x2="1240" y2="604" stroke="rgba(28,31,38,0.12)" stroke-width="0.8"/>
+      <text x="40" y="620" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <rect x="40" y="640" width="14" height="10" rx="2" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <text x="60" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Focal · the ACK boundary and the reader</text>
+
+      <rect x="420" y="640" width="14" height="10" rx="2" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <text x="440" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Ingest stage</text>
+
+      <rect x="600" y="640" width="14" height="10" rx="2" fill="rgba(28,31,38,0.05)" stroke="#4a5361" stroke-width="1"/>
+      <text x="620" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Storage tier</text>
+
+      <rect x="770" y="640" width="14" height="10" rx="2" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <text x="790" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Producer</text>
+
+      <rect x="920" y="640" width="14" height="10" rx="2" fill="rgba(28,31,38,0.03)" stroke="rgba(28,31,38,0.30)" stroke-width="1"/>
+      <text x="940" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Read surface</text>
+
+      <line x1="1090" y1="645" x2="1118" y2="645" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="1126" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">In-process</text>
+    </svg>
+  </div>
+</body>
+</html>

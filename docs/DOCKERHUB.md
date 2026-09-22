@@ -7,6 +7,46 @@
 - **Build:** the **default** feature set — pure Rust, zero Python/C/C++. DataFusion/Arrow/Parquet, redb, and the axum stack are all pure-Rust, and the embedded SPA is baked in (no Node).
 - **Source / full docs:** [github.com/lucheeseng827/evald](https://github.com/lucheeseng827/evald) · Apache-2.0
 
+## Where it fits
+
+`evald` is the **trace-ingest + eval store** that sits between the apps emitting
+LLM/agent telemetry and the humans (and CI) reading it. Point any OpenInference/OTel
+exporter at `:4318`; it normalizes each span, keeps it in a durable local store, and
+serves the UI, SQL, and eval/CI surfaces off the same data. No collector, no external
+database, no Python.
+
+```
+   SOURCES                     EVALD                    STORE            CONSUMERS
+   (emit OTLP spans)           (this image)             (local, durable) (read + gate)
+
+ ┌──────────────┐
+ │ LLM app      │  OTel SDK ─┐
+ │ (SDK export) │            │
+ └──────────────┘            │
+ ┌──────────────┐            │      ┌─────────────┐    ┌──────────────────┐
+ │ Agent /      │  spans ────┼────▶ │  WAL (redb) │    │ Embedded UI      │
+ │ framework    │  traces    │      │  (durable)  │──▶ │ (trace → tree →  │
+ └──────────────┘            │      └──────┬──────┘    │  scores)         │
+ ┌──────────────┐    ┌───────┴──────┐      │           └──────────────────┘
+ │ OTel         │ ─▶ │    evald     │ ◀────┘    ┌────▶ │ SQL / query API  │
+ │ Collector    │    │ ingest·norm  │      ┌─────────┐ │ (DataFusion)     │
+ └──────────────┘    │ ·store·eval  │─────▶│ Parquet │ └──────────────────┘
+                     └──────┬───────┘      │ blocks  │ ┌──────────────────┐
+   POST /v1/traces          │  scores ────▶│ ∪ scores│─│ eval run/compare │
+   (protobuf · OTLP-JSON)   │              └─────────┘ │ (CI regression   │
+                            └──────────────────────────│  gate, exit ≠ 0) │
+                                                        └──────────────────┘
+```
+
+- **Upstream** — anything that speaks OTLP/OpenInference: an app's OTel SDK, an agent
+  framework's tracer, or an OTel Collector fanning out. `evald` *is* the receiver
+  (`POST /v1/traces`, protobuf or OTLP-JSON) — no separate collector required.
+- **evald** — normalizes each span into one model, writes it durably (WAL → Parquet),
+  attaches scores keyed to the exact span, and answers queries.
+- **Downstream** — the embedded UI (trace list → tree → scores), read-only DataFusion
+  SQL over `spans` ∪ `scores`, and offline `eval run`/`eval compare` that gate CI on a
+  regression.
+
 ## Tags
 
 | Tag | Notes |

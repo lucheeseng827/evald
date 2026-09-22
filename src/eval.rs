@@ -848,6 +848,32 @@ pub(crate) fn finalize_evaluator(
 /// report, and return whether every threshold was met (the caller maps `false` to a
 /// non-zero exit code for CI).
 pub async fn run_command(config_path: &Path, data_dir: &Path) -> anyhow::Result<bool> {
+    run_command_junit(config_path, data_dir, None).await
+}
+
+/// [`run_command`] that also writes a JUnit XML report to `junit` (see [`crate::junit`]). The
+/// report is written whether the gate passes, fails, or the run errors; the returned gate
+/// verdict is exactly what [`run_command`] would have returned.
+pub async fn run_command_junit(
+    config_path: &Path,
+    data_dir: &Path,
+    junit: Option<&Path>,
+) -> anyhow::Result<bool> {
+    let started = std::time::Instant::now();
+    let result = run_report(config_path, data_dir).await;
+    crate::junit::write_after(
+        junit,
+        &result,
+        crate::junit::from_run,
+        "evald eval run",
+        "evald.eval.run",
+        started.elapsed().as_secs_f64(),
+    )?;
+    result.map(|report| report.passed())
+}
+
+/// The body of `eval run`: evaluate, persist, print, and hand back the report.
+async fn run_report(config_path: &Path, data_dir: &Path) -> anyhow::Result<RunReport> {
     let config = load_config(config_path)?;
     let dataset_path = resolve_relative(config_path, &config.dataset);
     let dataset = load_dataset(&dataset_path)?;
@@ -908,7 +934,7 @@ pub async fn run_command(config_path: &Path, data_dir: &Path) -> anyhow::Result<
         .map_err(|e| anyhow::anyhow!("persisting scores: {e}"))?;
 
     print_report(&report, &dataset_path);
-    Ok(report.passed())
+    Ok(report)
 }
 
 /// `evald eval run --estimate` — preview the judge token usage + cost for this config WITHOUT
@@ -1062,7 +1088,7 @@ impl CompareRow {
     /// than `tolerance` (higher-is-better scorers). Evaluators missing on one side are
     /// *not* counted — the evaluator sets can legitimately differ across runs — but they
     /// are still surfaced in the table as `new`/`gone`.
-    fn is_regression(&self, tolerance: f64) -> bool {
+    pub(crate) fn is_regression(&self, tolerance: f64) -> bool {
         matches!(self.delta, Some(d) if d < -tolerance)
     }
 
@@ -1083,7 +1109,7 @@ impl CompareRow {
     /// that we could NOT prove is noise. We forgive a drop only when the test shows it is
     /// within noise; an untestable regression (one side lacks stats) still gates, so a real
     /// regression never slips through just because an old run predates the stats field.
-    fn gates_in_significance_mode(&self, tolerance: f64) -> bool {
+    pub(crate) fn gates_in_significance_mode(&self, tolerance: f64) -> bool {
         self.is_regression(tolerance) && !self.proven_noise()
     }
 }
@@ -1227,6 +1253,68 @@ pub async fn compare_command(
     significance: bool,
     alpha: f64,
 ) -> anyhow::Result<bool> {
+    let opts = CompareOpts {
+        fail_on_regression,
+        tolerance,
+        significance,
+        alpha,
+    };
+    compare_command_junit(run_a, run_b, data_dir, opts, None).await
+}
+
+/// The gate settings of `eval compare`.
+#[derive(Debug, Clone, Copy)]
+pub struct CompareOpts {
+    pub fail_on_regression: bool,
+    pub tolerance: f64,
+    pub significance: bool,
+    pub alpha: f64,
+}
+
+/// [`compare_command`] that also writes a JUnit XML report to `junit` (see [`crate::junit`]),
+/// one test case per evaluator delta, failing exactly when the gate fails. Written whether the
+/// gate passes, fails, or the comparison errors; the verdict is what [`compare_command`] returns.
+pub async fn compare_command_junit(
+    run_a: &str,
+    run_b: &str,
+    data_dir: &Path,
+    opts: CompareOpts,
+    junit: Option<&Path>,
+) -> anyhow::Result<bool> {
+    let started = std::time::Instant::now();
+    let result = compare_report(run_a, run_b, data_dir, opts).await;
+    crate::junit::write_after(
+        junit,
+        &result,
+        |(report, _)| {
+            crate::junit::from_compare(
+                report,
+                opts.tolerance,
+                opts.significance,
+                opts.alpha,
+                opts.fail_on_regression,
+            )
+        },
+        &format!("evald eval compare {run_a} vs {run_b}"),
+        "evald.eval.compare",
+        started.elapsed().as_secs_f64(),
+    )?;
+    result.map(|(_, passed)| passed)
+}
+
+/// The body of `eval compare`: the report and whether the gate passes.
+async fn compare_report(
+    run_a: &str,
+    run_b: &str,
+    data_dir: &Path,
+    opts: CompareOpts,
+) -> anyhow::Result<(CompareReport, bool)> {
+    let CompareOpts {
+        fail_on_regression,
+        tolerance,
+        significance,
+        alpha,
+    } = opts;
     let store_config = StoreConfig {
         compact_interval: None,
         ..StoreConfig::default()
@@ -1245,7 +1333,7 @@ pub async fn compare_command(
     if gate_fails {
         println!("--fail-on-regression set — exiting non-zero.");
     }
-    Ok(!gate_fails)
+    Ok((report, !gate_fails))
 }
 
 /// Print the run-vs-run diff to stdout (the report; logs go to stderr so CI can parse it).
@@ -1843,6 +1931,113 @@ mod tests {
         assert!(run_scores
             .iter()
             .any(|s| s.name == "exact_match" && s.num_value == Some(0.5)));
+    }
+
+    /// The JUnit report is written when the gate FAILS (that is when CI needs it) and the returned
+    /// verdict is exactly what the plain command returns.
+    #[tokio::test]
+    async fn run_command_junit_is_written_on_a_failing_gate_and_the_verdict_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("eval.yaml");
+        std::fs::write(
+            dir.path().join("data.jsonl"),
+            "{\"output\":\"Paris\",\"expected_output\":\"Paris\"}\n\
+             {\"output\":\"wrong\",\"expected_output\":\"Tokyo\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &cfg_path,
+            "name: t\ndataset: data.jsonl\nevaluators:\n  - type: exact_match\nthresholds:\n  exact_match: 0.9\n",
+        )
+        .unwrap();
+        let junit = dir.path().join("reports/eval.xml");
+        let passed = run_command_junit(&cfg_path, &dir.path().join("store"), Some(&junit))
+            .await
+            .unwrap();
+        assert!(!passed, "0.5 < 0.9: the gate still fails");
+        let xml = std::fs::read_to_string(&junit).unwrap();
+        assert!(
+            xml.contains("tests=\"1\" failures=\"1\" errors=\"0\" skipped=\"0\""),
+            "{xml}"
+        );
+        assert!(xml.contains("type=\"ThresholdNotMet\""));
+        assert!(xml.contains("name=\"exact_match\""));
+    }
+
+    #[tokio::test]
+    async fn run_command_junit_reports_a_command_that_could_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let junit = dir.path().join("eval.xml");
+        let err = run_command_junit(
+            &dir.path().join("missing.yaml"),
+            &dir.path().join("s"),
+            Some(&junit),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "the original error still propagates"
+        );
+        let xml = std::fs::read_to_string(&junit).unwrap();
+        assert!(
+            xml.contains("tests=\"1\" failures=\"0\" errors=\"1\" skipped=\"0\""),
+            "{xml}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_command_junit_fails_exactly_when_the_gate_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("store");
+        {
+            let store = test_store(&data_dir);
+            persist_run(
+                &store,
+                vec![EvaluatorSpec::ExactMatch],
+                &[item("a", Some("a")), item("b", Some("b"))],
+                "good",
+            );
+            persist_run(
+                &store,
+                vec![EvaluatorSpec::ExactMatch],
+                &[item("a", Some("a")), item("X", Some("b"))],
+                "bad",
+            );
+        }
+        let opts = |fail_on_regression| CompareOpts {
+            fail_on_regression,
+            tolerance: 0.0,
+            significance: false,
+            alpha: 0.05,
+        };
+        let junit = dir.path().join("cmp.xml");
+        let passed = compare_command_junit("good", "bad", &data_dir, opts(true), Some(&junit))
+            .await
+            .unwrap();
+        assert!(!passed);
+        let xml = std::fs::read_to_string(&junit).unwrap();
+        assert!(
+            xml.contains("failures=\"1\"") && xml.contains("type=\"Regression\""),
+            "{xml}"
+        );
+        // Informational compare: the same regression is reported but nothing fails.
+        let passed = compare_command_junit("good", "bad", &data_dir, opts(false), Some(&junit))
+            .await
+            .unwrap();
+        assert!(passed);
+        assert!(std::fs::read_to_string(&junit)
+            .unwrap()
+            .contains("failures=\"0\""));
+        // An unknown run id is an errored report, and the error still propagates.
+        assert!(
+            compare_command_junit("good", "ghost", &data_dir, opts(true), Some(&junit))
+                .await
+                .is_err()
+        );
+        assert!(std::fs::read_to_string(&junit)
+            .unwrap()
+            .contains("errors=\"1\""));
     }
 
     fn test_store(dir: &std::path::Path) -> Store {

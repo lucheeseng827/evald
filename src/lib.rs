@@ -45,17 +45,26 @@ pub mod blob;
 pub mod calibrate;
 pub mod cost;
 pub mod dataset;
+pub mod disk;
 pub mod eval;
+pub mod evalevent;
 pub mod grpc;
 pub mod ingest;
 pub mod judge;
+pub mod junit;
+pub mod latency;
+pub mod metrics;
 pub mod model;
 pub mod normalize;
+pub mod price;
+pub mod redact;
+pub mod rollup;
 pub mod sql;
 pub mod stats;
 pub mod store;
 pub mod suite;
 pub mod ui;
+pub mod usage;
 
 pub use auth::{Auth, AuthError};
 pub use blob::BlobStore;
@@ -68,6 +77,11 @@ pub use store::{IngestStats, ReclaimReport, Store, StoreConfig, StoreError};
 /// Initialize the tracing subscriber on **stderr** (honors `RUST_LOG`, defaults to
 /// `info`). Logs go to stderr so a command's real output (e.g. `eval run`'s report)
 /// stays on stdout and parseable in CI.
+///
+/// At the default `info`, `evald serve` logs **one line per ingest request**, not one per
+/// span: the per-span detail line lives at `debug` because formatting it cost about a
+/// third of the ingest hot path on a server nobody was reading (see
+/// [`ingest::log_ingest`](crate::ingest)). `RUST_LOG=evald=debug` brings it back.
 ///
 /// Idempotent: a no-op if a subscriber is already installed, so it is safe to call
 /// from the binary and harmless under tests.

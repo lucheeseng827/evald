@@ -9,7 +9,7 @@ panic = "unwind"
 
 [package]
 name = "evald"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "evald — embedded OTel-native trace + eval store for LLM apps (single binary). PoC: OTLP/HTTP receiver."
@@ -96,6 +96,13 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }  # UT
 # Scores (PoC step 5)
 uuid = { version = "1", features = ["v4"] }          # score ids when the caller doesn't supply one
 
+# Free-space probe for the disk guardrail (`statvfs`), used by src/disk.rs. NOT a new crate
+# in the build: DataFusion already pulls libc into the release tree, so this only makes an
+# existing dependency direct. `rustix` would give a safe wrapper but reaches the tree solely
+# through `tempfile` (a dev-dependency), so taking it WOULD add a crate to the shipped
+# binary — hence libc plus one contained `unsafe`. std has no stable free-space API.
+libc = "0.2"
+
 # Optional bearer-token auth for `evald serve` on a public network (src/auth.rs). Tokens are
 # matched by SHA-256 digest (fixed-length compare, never logged). Pure-Rust → clean static musl.
 sha2 = "0.10"
@@ -134,10 +141,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # thiserror          = "1"          # library error types
 # (datafusion / arrow / parquet / redb / rust-embed are now ACTIVE above — steps 4 & 8.)
 #
-# HOT-TIER engine: DEFERRED ON PURPOSE. Per PLAN.md §6 the hot tier is benchmarked
-# (an LSM such as `fjall = "3"` vs a plain segmented-WAL-of-Arrow-batches) before
-# committing — for an append-mostly, query-elsewhere workload an LSM may be
-# unnecessary. Do NOT add a hot-tier dependency until that soak benchmark picks one.
+# HOT-TIER engine: DECIDED 2026-09-16 — there is no dependency here, and that is the
+# decision, not an omission. The hot tier is a capped in-memory read cache over spans the
+# WAL has already made durable; an LSM (`fjall` was the candidate) would add a second
+# on-disk format and put compaction stalls back on the ACK path to remove costs that are
+# negligible at one compaction interval of ingest. Reasoning and measurements:
+# HOT_TIER_DECISION.md. Do NOT add a hot-tier dependency without a trigger from its §5.
 #
 # [features]
 # semantic = ["dep:usearch"]   # Tier-2 HNSW semantic search; gated (C++ core, musl care); deferred to v0.3

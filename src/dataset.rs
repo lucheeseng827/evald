@@ -234,6 +234,14 @@ mod tests {
                 compact_interval: None,
                 max_hot_spans: 0,
                 blob_offload_bytes: 16, // tiny cap so a short string still offloads
+                // Guardrail off: its production default samples the HOST's free space, and
+                // a unit test must not start depending on how full the build machine is.
+                disk_check_interval: None,
+                disk_min_free_bytes: 0,
+                disk_warn_free_bytes: 0,
+                retention: None,
+                redactor: None,
+                ..Default::default()
             },
         )
         .unwrap();

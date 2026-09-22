@@ -85,8 +85,10 @@ export function Sparkline({ data, width = 200, height = 44, tone = "brand" }: { 
   );
 }
 
-export function Avatar({ email, size }: { email?: string; size?: number }) {
-  const letter = (email || "?").trim().charAt(0).toUpperCase();
+// `name` is whatever identifies the principal — a subject, an operator label, an
+// address. Only the first letter is shown, so the caller need not normalise it.
+export function Avatar({ name, size }: { name?: string; size?: number }) {
+  const letter = (name || "?").trim().charAt(0).toUpperCase();
   const style = size ? { width: size, height: size, fontSize: Math.round(size / 2.3) } : undefined;
   return <div className="avatar" style={style}>{letter}</div>;
 }

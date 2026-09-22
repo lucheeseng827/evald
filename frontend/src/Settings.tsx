@@ -12,9 +12,10 @@ const CHANNELS: [string, string, string][] = [
 ];
 
 // Account settings — appearance + notification prefs are client-local (localStorage);
-// identity/edition come from /v1/meta.
-export function SettingsModal({ meta, settings, onChange, onClose }: {
-  meta: Meta; settings: S; onChange: (s: S) => void; onClose: () => void;
+// edition/version come from /v1/meta, and `operator` is the caller's identity label
+// (see OPERATOR in App.tsx) so the chip and this modal never disagree.
+export function SettingsModal({ meta, operator, settings, onChange, onClose }: {
+  meta: Meta; operator: string; settings: S; onChange: (s: S) => void; onClose: () => void;
 }) {
   function update(next: S) { saveSettings(next); onChange(next); }
   useEffect(() => {
@@ -31,9 +32,9 @@ export function SettingsModal({ meta, settings, onChange, onClose }: {
         </div>
         <div className="modal-scroll">
           <div className="row" style={{ padding: "6px 0 14px" }}>
-            <Avatar email="evald" size={40} />
+            <Avatar name={operator} size={40} />
             <div style={{ flex: 1 }}>
-              <div style={{ fontWeight: 600 }}>Operator</div>
+              <div style={{ fontWeight: 600 }}>{operator}</div>
               <div className="mono faint" style={{ fontSize: 12 }}>evald {meta.version} · {meta.edition.toUpperCase()}</div>
             </div>
             <Badge tone={meta.fleet ? "brand" : "default"} dot>{meta.edition.toUpperCase()}</Badge>

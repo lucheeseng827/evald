@@ -25,3 +25,22 @@ export function Icon({ name }: { name: string }) {
     </span>
   );
 }
+
+// The evald mark from docs/images/evald-logo.svg — two trace bars, the child one
+// indented, over a brand-blue baseline. Same geometry as the source file, colour
+// inverted: that file is drawn dark-on-light for the README and a favicon, and its
+// opaque #fcfcfd ground would sit in this dark-only console as a white tile. Fills
+// come from the theme tokens so the mark follows `dim` / `midnight` like everything
+// else. Inline rather than an <img> so it costs no second request inside the
+// rust-embed bundle and can pick up those tokens at all.
+export function BrandMark() {
+  return (
+    <span className="brand-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none">
+        <rect x="3" y="4.5" width="13" height="3.2" fill="var(--eg-fg)" />
+        <rect x="7" y="9.6" width="9" height="3.2" fill="var(--eg-fg)" opacity="0.55" />
+        <rect x="3" y="17" width="18" height="3" fill="var(--eg-brand)" />
+      </svg>
+    </span>
+  );
+}

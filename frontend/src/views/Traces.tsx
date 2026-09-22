@@ -68,7 +68,10 @@ export function Traces() {
   const sel = traceSpans.find((s) => s.span_id === spanId) || null;
 
   return (
-    <div className="grid" style={{ gridTemplateColumns: "360px 1fr", alignItems: "start" }}>
+    // `split-list` (a fixed trace-list rail + a flexible detail pane) is a class rather
+    // than an inline style so the responsive rules can collapse it to one column — an
+    // inline grid-template-columns is unreachable from a media query.
+    <div className="grid split-list" style={{ alignItems: "start" }}>
       <section className="card flush">
         <div className="card-head">
           <span className="card-title">Traces</span>

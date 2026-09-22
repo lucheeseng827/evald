@@ -1,5 +1,9 @@
 # Keep the build context tiny + reproducible (the Dockerfile builds from source).
-target
+# `**/target`, not `target`: a bare pattern matches only a ROOT path element, so it would
+# miss `ee/target`. ee/Dockerfile builds with the MODULE root as context (the ee workspace
+# path-deps on `..`), and a developer with a populated ee/target would otherwise ship tens
+# of gigabytes of build output into the daemon as context.
+**/target
 .git
 evald-data
 node_modules

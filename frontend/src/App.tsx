@@ -1,10 +1,18 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, type Meta } from "./api";
-import { Tag } from "./components";
-import { Icon } from "./icons";
+import { Avatar, Tag } from "./components";
+import { BrandMark, Icon } from "./icons";
 import type { ViewDef } from "./registry";
 import { loadSettings } from "./hooks";
 import { SettingsModal } from "./Settings";
+
+// No route exposes the signed-in principal. The EE gate resolves a subject on every
+// request (ee/src/fleet/query.rs) but never returns it, and the OSS node has no auth
+// to resolve one from — so the console names its user generically. Defined once here
+// because it was previously spelled three different ways: an "e" avatar over the
+// label "operator" in the chip, and an "E" avatar over "Operator" in the settings
+// modal. Swap this for the real subject when a whoami route lands.
+const OPERATOR = "Operator";
 
 const FALLBACK_META: Meta = { edition: "oss", fleet: false, judge: false, version: "" };
 
@@ -53,7 +61,7 @@ export function App({ views, groupLabels, editionBadge }: AppProps) {
     <div className="app">
       <nav className="nav">
         <div className="brand">
-          <div className="brand-glyph">e</div>
+          <BrandMark />
           <div><span className="brand-name">evald</span><span className="brand-sub">trace + eval</span></div>
         </div>
         <div className="nav-groups">
@@ -71,9 +79,9 @@ export function App({ views, groupLabels, editionBadge }: AppProps) {
         </div>
         <div className="nav-footer">
           <button className="account-chip" title="Account settings" onClick={() => setSettingsOpen(true)}>
-            <div className="avatar">e</div>
+            <Avatar name={OPERATOR} />
             <div className="who">
-              <div className="email">operator</div>
+              <div className="email">{OPERATOR}</div>
               <small>evald {meta.version}</small>
             </div>
             <Icon name="settings" />
@@ -95,7 +103,7 @@ export function App({ views, groupLabels, editionBadge }: AppProps) {
         <View key={active.key} />
       </main>
 
-      {settingsOpen && <SettingsModal meta={meta} settings={settings} onChange={setSettings} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsModal meta={meta} operator={OPERATOR} settings={settings} onChange={setSettings} onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }

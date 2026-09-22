@@ -2,6 +2,42 @@
    Dark-only, IBM Plex, blue brand. The Claude Design mockup is the visual guide;
    these are the reusable primitives the TSX components render with. */
 
+/* IBM Plex, self-hosted. The console ships air-gapped inside the binary (rust-embed),
+   so the faces have to travel with it — a fonts.googleapis.com link would leave every
+   offline fleet node rendering the system fallback, which is what the bare
+   `--font-sans` declaration below used to do everywhere.
+
+   Latin subset only, and only the six weights the components actually use (sans
+   400/500/600/700, mono 400/600) — ~128 KiB total, committed alongside dist/. The
+   handful of symbols outside that subset (→ ∪ ∞ ▲ ⌘, and the α in the Evals sample)
+   fall back per glyph, exactly as they would behind Google's own latin subset.
+   Files are upstream @fontsource/ibm-plex-{sans,mono} 5.3.0, unmodified; OFL-1.1
+   terms in ./fonts/OFL.txt. */
+@font-face {
+  font-family: "IBM Plex Sans"; font-style: normal; font-weight: 400; font-display: swap;
+  src: url(./fonts/ibm-plex-sans-latin-400-normal.woff2) format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans"; font-style: normal; font-weight: 500; font-display: swap;
+  src: url(./fonts/ibm-plex-sans-latin-500-normal.woff2) format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans"; font-style: normal; font-weight: 600; font-display: swap;
+  src: url(./fonts/ibm-plex-sans-latin-600-normal.woff2) format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans"; font-style: normal; font-weight: 700; font-display: swap;
+  src: url(./fonts/ibm-plex-sans-latin-700-normal.woff2) format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap;
+  src: url(./fonts/ibm-plex-mono-latin-400-normal.woff2) format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono"; font-style: normal; font-weight: 600; font-display: swap;
+  src: url(./fonts/ibm-plex-mono-latin-600-normal.woff2) format("woff2");
+}
+
 :root {
   --eg-bg: #0b0e14;
   --eg-bg-elev: #11151f;
@@ -38,7 +74,11 @@ button { font-family: inherit; }
 /* nav */
 .nav { background: var(--eg-bg-elev); border-right: 1px solid var(--eg-border); display: flex; flex-direction: column; padding: 18px 14px; min-height: 100vh; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 16px; }
-.brand-glyph { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: linear-gradient(135deg, var(--eg-brand), var(--eg-brand-dim)); color: #fff; font-weight: 700; font-size: 16px; }
+/* Holds the evald mark (see BrandMark in icons.tsx). The ground is the page colour
+   rather than the old brand gradient: the mark carries its own blue baseline bar,
+   which would vanish into a blue tile. */
+.brand-glyph { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; background: var(--eg-bg); border: 1px solid var(--eg-border); }
+.brand-glyph svg { width: 19px; height: 19px; display: block; }
 .brand-name { font-weight: 700; font-size: 17px; letter-spacing: -0.3px; display: block; }
 .brand-sub { display: block; font-size: 9px; letter-spacing: 1.4px; color: var(--eg-faint); text-transform: uppercase; }
 .nav-groups { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; flex: 1; min-height: 0; }
@@ -99,6 +139,7 @@ button { font-family: inherit; }
 .k2 { grid-template-columns: 1fr 1fr; }
 .split { grid-template-columns: 1.3fr 1fr; }
 .split-wide { grid-template-columns: 1.5fr 1fr; }
+.split-list { grid-template-columns: 360px 1fr; }
 .mt14 { margin-top: 14px; }
 .stack { display: flex; flex-direction: column; gap: 14px; }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -175,3 +216,119 @@ button { font-family: inherit; }
 .payload-more { color: var(--eg-brand); font-size: 12px; margin-top: 4px; }
 .blob-ref { color: var(--eg-warn); }
 .sparkline { display: block; }
+
+/* ---------------------------------------------------------------------------
+   Responsive. Everything above this line is the desktop layout and is left
+   untouched, so a wide viewport renders exactly as it always has; all narrowing
+   behaviour lives here.
+
+   Three tiers, chosen from where this console actually breaks rather than from
+   device names: the multi-column card grids run out of room first, the 230px
+   rail stops paying for itself next, and the KPI row needs full width last.
+
+   Tables are the one thing that never reflows. `DataTable` writes its column
+   track list as an inline style (computed per view from each column's `width`),
+   which a media query cannot reach — so instead of fighting it, `.dt` becomes
+   its own horizontal scroller. The page body never scrolls sideways; a wide
+   table scrolls within its card, which also keeps a 6-column audit row readable
+   instead of crushing every cell to three characters.
+   --------------------------------------------------------------------------- */
+
+/* Grid items default to `min-width: auto`, so they refuse to shrink below their own
+   min-content. That floor, not any missing breakpoint, is what pushed the document
+   sideways: a wide table set its `.card`'s min-content, the card held that width, its
+   track grew, and the page scrolled. It applies at both levels — `.nav`/`.main` in
+   `.app`, and `.card` in every `.grid` — and is what lets the table scroller below
+   actually engage instead of the card simply growing. Unconditional because it is a
+   correctness fix rather than a breakpoint: at desktop widths there is slack, so
+   nothing moves. */
+.nav, .main, .card { min-width: 0; }
+
+/* Tier 1 — the two- and three-up card grids stop fitting side by side. */
+@media (max-width: 1080px) {
+  .main { padding: 24px 22px; }
+  .k4 { grid-template-columns: repeat(2, 1fr); }
+  .split, .split-wide, .split-list { grid-template-columns: 1fr; }
+
+  /* From here down every card is full width, so one shared floor keeps the head and
+     body rows on identical tracks. Below it they would each fall back to their own
+     min-content and the columns would drift out of line — `.dt-head` and each
+     `.dt-row` are independent grids that only agree while the fr units have slack.
+     680px clears the widest row in either edition (the audit ledger's 494px of fixed
+     tracks plus gaps and its detail column) and still fits the 806px of content this
+     tier starts with, so the scroller stays dormant until it is needed. */
+  /* `width: 0; min-width: 100%` is deliberate, not a typo. A block's min-content
+     climbs to its ancestors even through `overflow-x: auto`, so the 680px floor below
+     would otherwise set the card's minimum and widen the grid track instead of
+     scrolling — `min-width: 0` on the card does not stop it. Zero width takes the
+     table out of that intrinsic calculation; `min-width: 100%` hands back the used
+     width. `contain: inline-size` also works but is newer, and clipping the card
+     instead would cost every other overflow in it. */
+  .dt { width: 0; min-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .dt-head, .dt-row { min-width: 680px; }
+
+  /* A card header pairs a title with an endpoint badge, and the badge is `nowrap` by
+     design — let the pair wrap to two lines instead of setting the card's floor. */
+  .card-head { flex-wrap: wrap; }
+  /* Same shrink-to-fit story one level down: `.row` children (the audit head-hash
+     pill is the wide one) need permission to shrink so their own ellipsis can run. */
+  .row > * { min-width: 0; }
+}
+
+/* Tier 2 — below this the 230px rail costs more than it returns, so the nav
+   becomes a sticky top bar with horizontally scrolling items. The group labels
+   stay: "Local node · OSS" vs "Fleet · EE" is the edition boundary, not
+   decoration, and collapsing them would merge the two sets into one list. */
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; }
+
+  .nav {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    min-height: 0;
+    padding: 10px 14px;
+    border-right: none;
+    border-bottom: 1px solid var(--eg-border);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+  }
+  .brand { padding: 0; flex: none; }
+  .brand-sub { display: none; }
+  .nav-groups {
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+  }
+  .nav-groups > div { display: flex; align-items: center; gap: 4px; }
+  .nav-group-label { padding: 0 4px; white-space: nowrap; }
+  .nav-item { width: auto; white-space: nowrap; padding: 7px 10px; }
+  /* The active marker moves from a left edge to an underline — a left bar reads
+     as "list item" and means nothing in a row. */
+  .nav-item.active { box-shadow: inset 0 -2px 0 var(--eg-brand); }
+  .nav-footer { padding-top: 0; margin-top: 0; border-top: none; flex: none; }
+  .account-chip { width: auto; }
+  .account-chip .who { display: none; }
+
+  .main { padding: 18px 16px; max-width: none; }
+  .main.compact { padding: 14px 14px; }
+  .k2 { grid-template-columns: 1fr; }
+
+  .modal-scroll { max-height: 56vh; }
+  .banner { max-width: calc(100vw - 28px); }
+}
+
+/* Tier 3 — a 28px KPI figure beside a second column no longer fits. */
+@media (max-width: 460px) {
+  .main { padding: 16px 14px; }
+  .k4 { grid-template-columns: 1fr; }
+  .page-title { font-size: 19px; }
+  .kpi { padding: 14px 16px; }
+  .kpi .value { font-size: 24px; }
+}

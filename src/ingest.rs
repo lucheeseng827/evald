@@ -87,6 +87,7 @@ fn build_router(store: Store, body_limit: usize, auth: Auth) -> Router {
         .route("/v1/traces", post(export_traces))
         .route("/v1/spans", get(get_spans))
         .route("/v1/traces/{trace_id}", get(get_trace))
+        .route("/v1/traces/{trace_id}/scores", get(get_trace_rollup))
         .route("/v1/sessions/{session_id}", get(get_session))
         .route("/v1/scores", post(post_scores).get(get_scores))
         .route("/v1/scores/{id}", get(get_score_by_id))
@@ -95,6 +96,12 @@ fn build_router(store: Store, body_limit: usize, auth: Auth) -> Router {
         .route("/v1/stats", get(get_stats))
         .route("/v1/meta", get(get_meta))
         .route("/v1/blobs/{key}", get(get_blob))
+        // Inside the auth gate on purpose: a scrape exposes ingest rates, backlog depth and
+        // shed counts. In the default posture (loopback, no gate) it is freely readable;
+        // once an operator arms the gate — i.e. exposes this node — the scraper presents a
+        // token like every other client. Prometheus supports that natively
+        // (`authorization:` / `bearer_token_file:` in scrape_configs).
+        .route("/metrics", get(get_metrics))
         // Everything not matched above is the embedded SPA (served by rust-embed, with an
         // index.html fallback for client-side routes). Kept as the fallback so it never
         // shadows a `/v1/*` API route.
@@ -117,7 +124,30 @@ fn build_router(store: Store, body_limit: usize, auth: Auth) -> Router {
     } else {
         router
     };
-    router.with_state(store)
+    // MERGED AFTER the gate, so the probes are never behind it. `Router::layer` wraps only
+    // the routes already present, so anything merged afterwards is unlayered — which is what
+    // a probe needs: a kubelet sends no Authorization header, and a liveness probe that 401s
+    // is a crash loop. Neither endpoint reveals anything a port scan would not (`ok` /
+    // `ready`, or a 503), so there is nothing here to gate.
+    router.merge(probe_routes()).with_state(store)
+}
+
+/// `/healthz` + `/readyz` — the two Kubernetes probe endpoints, split by what an orchestrator
+/// should DO about each.
+///
+/// - **`/healthz` (liveness)** answers "is this process still a working server?" It is
+///   deliberately trivial: if axum routed the request, the runtime is alive and the accept
+///   loop is turning. It must never consult the store — a liveness probe that fails on a
+///   slow disk or a wedged compactor tells the kubelet to kill and restart a process that
+///   still holds a perfectly good WAL, which turns a degradation into an outage and, with
+///   `--data-dir` on a slow volume, into a restart loop.
+/// - **`/readyz` (readiness)** answers "should traffic be sent here?" and consults exactly
+///   one condition — [`Store::writer_is_alive`]. See that method for why shedding is
+///   deliberately NOT a readiness failure.
+fn probe_routes() -> Router<Store> {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
 }
 
 /// Auth middleware: when the gate is armed, require a valid `Authorization: Bearer <token>`
@@ -316,19 +346,62 @@ async fn export_traces(State(store): State<Store>, headers: HeaderMap, body: Byt
     let mut spans = normalize::normalize_request(&request);
     let count = spans.len();
     log_ingest(request.resource_spans.len(), &spans);
+    // `gen_ai.evaluation.result` span events become scores; empty (and free) for the common request.
+    let eval_scores = crate::evalevent::extract(&request);
 
     // Offload oversized input/output payloads to the blob store BEFORE the durable append, so
     // the WAL and Parquet blocks only ever carry a compact `evald-blob:<key>` reference.
-    store.offload_payloads(&mut spans);
+    // Redact, then offload — see `Store::prepare_for_storage` for why the order and the
+    // placement before `append` are load-bearing.
+    //
+    // The disk floor is checked BEFORE that offload as well as inside `append`. The offload
+    // WRITES, so relying on `append`'s guard alone would spend the last of a full volume
+    // writing blob files and then answer 503 — leaving the blobs behind with no span in the
+    // WAL referencing them, and nothing that ever collects them. The second check inside
+    // `append` is not redundant: free space is sampled on a timer, so the floor can be
+    // crossed between the two.
+    let result = match store.reject_if_disk_full(count) {
+        Err(err) => Err(err),
+        Ok(()) => {
+            store.prepare_for_storage(&mut spans);
+            store.append(spans).await
+        }
+    };
 
-    match store.append(spans).await {
-        Ok(()) => success_response(is_json),
+    match result {
+        Ok(()) => {
+            // After the spans are durable. Ids are deterministic, so a retry after a failure
+            // here overwrites instead of duplicating; a real store error is retryable (503).
+            if let Err(err) = store.put_scores(&eval_scores) {
+                tracing::error!(%err, count = eval_scores.len(), "failed to store evaluation events");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "evald: store unavailable\n",
+                )
+                    .into_response();
+            }
+            success_response(is_json)
+        }
         Err(StoreError::Backpressure) => {
             tracing::warn!(count, "shedding: ingest channel full");
             (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, "1")],
                 "evald: overloaded, retry shortly\n",
+            )
+                .into_response()
+        }
+        Err(err @ StoreError::DiskFull { .. }) => {
+            // 503 + Retry-After, not 429: OTLP treats both as retryable, but 429 means
+            // "you are sending too fast" and this is not the client's fault or within its
+            // power to fix. 503 keeps the exporter retrying — so when an operator frees
+            // space or retention runs, the backlog lands instead of having been dropped.
+            // Retry-After is generous: a full disk does not clear in a second.
+            tracing::error!(%err, count, "refusing ingest: disk floor breached");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "30")],
+                "evald: out of disk headroom, retry later\n",
             )
                 .into_response()
         }
@@ -409,13 +482,15 @@ fn views_in_trace(spans: Vec<NormalizedSpan>) -> Vec<SpanView> {
         .collect()
 }
 
-/// Run a blocking `Store` read (`query`/`trace`, either of which can hit `cold::read_block`,
-/// direct Parquet I/O) on the blocking pool instead of inline on the async handler's Tokio
-/// worker, so a cold-tier scan can't monopolize that worker. A panicked blocking task is mapped
-/// to an `io::Error` so callers can still funnel it through the existing `query_error` path.
-async fn query_blocking<F>(f: F) -> std::io::Result<Vec<NormalizedSpan>>
+/// Run a blocking `Store` read (`query`/`trace`/`trace_rollup`, any of which can hit
+/// `cold::read_block`, direct Parquet I/O) on the blocking pool instead of inline on the async
+/// handler's Tokio worker, so a cold-tier scan can't monopolize that worker. A panicked blocking
+/// task is mapped to an `io::Error` so callers can still funnel it through the existing
+/// `query_error` path.
+async fn query_blocking<T, F>(f: F) -> std::io::Result<T>
 where
-    F: FnOnce() -> std::io::Result<Vec<NormalizedSpan>> + Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
 {
     match tokio::task::spawn_blocking(f).await {
         Ok(result) => result,
@@ -549,6 +624,57 @@ async fn get_stats(State(store): State<Store>) -> Response {
     Json(store.ingest_stats()).into_response()
 }
 
+/// `GET /v1/traces/{trace_id}/scores` — the trace's scores, measured or rolled up from its
+/// spans.
+///
+/// This is the answer to "what did this trace score", which for a multi-span agent trace
+/// `GET /v1/scores?trace_id=…` cannot give: that endpoint returns only scores stated about
+/// the trace itself, so a trace whose every span is scored reads as unscored. Each entry
+/// says whether it was `measured` or derived, and a derived one carries the function, the
+/// contributor count and the span ids behind it. A name nothing carries is simply absent —
+/// never a fabricated `0`. See [`crate::rollup`] for the full semantics.
+async fn get_trace_rollup(
+    State(store): State<Store>,
+    AxPath(trace_id): AxPath<String>,
+) -> Response {
+    // On the blocking pool for the same reason `/v1/traces/{id}` is, only more so: this
+    // reads the whole trace — cold Parquet blocks included — AND walks the score table,
+    // then rolls up. Inline on a Tokio worker, one rollup over a trace whose spans have
+    // aged into cold storage stalls every other request that worker is driving.
+    match query_blocking(move || store.trace_rollup(&trace_id)).await {
+        Ok(scores) => Json(scores).into_response(),
+        Err(err) => query_error(err),
+    }
+}
+
+/// `GET /metrics` — the Prometheus scrape surface (text exposition format 0.0.4).
+async fn get_metrics(State(store): State<Store>) -> Response {
+    (
+        [(header::CONTENT_TYPE, crate::metrics::CONTENT_TYPE)],
+        crate::metrics::render(&store),
+    )
+        .into_response()
+}
+
+/// `GET /healthz` — liveness. Always `200` while the process serves requests.
+async fn healthz() -> Response {
+    (StatusCode::OK, "ok\n").into_response()
+}
+
+/// `GET /readyz` — readiness. `200 ready` normally; `503` once the writer task is gone, at
+/// which point no span can be made durable and this node should stop receiving traffic.
+async fn readyz(State(store): State<Store>) -> Response {
+    if store.writer_is_alive() {
+        (StatusCode::OK, "ready\n").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "evald: not ready — the store writer is not running\n",
+        )
+            .into_response()
+    }
+}
+
 /// `GET /v1/meta` — the edition/capability handshake the embedded console reads once at
 /// boot to decide which surfaces to render. The OSS node is a single local store: no fleet,
 /// no tenants. `judge` reflects whether this build can make an outbound LLM-judge call (the
@@ -561,6 +687,9 @@ async fn get_meta() -> Response {
         "fleet": false,
         "judge": cfg!(feature = "judge"),
         "version": env!("CARGO_PKG_VERSION"),
+        // The price table deriving `cost_usd` right now (`--price-table` lays a file over the
+        // built-in baseline). Per span, nothing records it; per block, `evald.price_tables` does.
+        "price_table": crate::price::current().version.clone(),
     }))
     .into_response()
 }
@@ -1183,15 +1312,36 @@ fn success_response(is_json: bool) -> Response {
     }
 }
 
-/// Log a per-request + per-span summary of what was ingested.
+/// Log a per-request summary of what was ingested at `info`, and a per-span line at `debug`.
+///
+/// The request summary is one line per `POST /v1/traces` — cheap at any ingest rate, and
+/// what a default `evald serve` shows.
+///
+/// The per-span line is **`debug`**, so it is OFF under the default filter (`info`, see
+/// [`crate::init_tracing`]). Formatting its ~14 fields and ANSI-colouring them measured
+/// ~38,000 instructions per span — about a third of the whole ingest hot path — which
+/// every default server paid whether or not anyone was reading it. The fields are
+/// unchanged for whoever turns it back on:
+///
+/// ```text
+/// RUST_LOG=evald=debug evald serve
+/// ```
+///
+/// The level is tested ONCE per request, not once per span. `Level::DEBUG <=
+/// LevelFilter::current()` is the `debug!` macro's own first gate, so hoisting it out of
+/// the loop is that same check and nothing more; it is conservative in the right
+/// direction, since no callsite can be enabled at a level the subscriber's max excludes.
 fn log_ingest(resource_spans: usize, spans: &[NormalizedSpan]) {
     tracing::info!(
         resource_spans,
         spans = spans.len(),
         "ingesting OTLP/HTTP traces"
     );
+    if tracing::Level::DEBUG > tracing::level_filters::LevelFilter::current() {
+        return;
+    }
     for sp in spans {
-        tracing::info!(
+        tracing::debug!(
             dialect = ?sp.dialect,
             trace_id = %sp.trace_id,
             span_id = %sp.span_id,
@@ -1318,6 +1468,84 @@ mod tests {
             .expect("collect body")
     }
 
+    /// Below the disk floor, ingest must be refused BEFORE the blob offload writes.
+    ///
+    /// Regression: the handler offloaded oversized payloads and only then called `append`,
+    /// whose guard answered `DiskFull`. So a request arriving on a full volume first wrote
+    /// a blob file to that volume — the last thing it needed — and then refused the span
+    /// that was the blob's only reference, leaving a file nothing points at and nothing
+    /// collects. Under an OTLP exporter's retry loop the guardrail becomes the thing
+    /// filling the disk.
+    ///
+    /// Asserted through the ROUTER, not `Store::reject_if_disk_full` directly: the defect
+    /// was the handler's ORDERING, and a test of the primitive would pass with the two
+    /// calls still the wrong way round.
+    ///
+    /// `disk_min_free_bytes: u64::MAX` puts any real filesystem below the floor, so the
+    /// guardrail is exercised without contriving a full disk.
+    #[tokio::test]
+    async fn disk_blocked_ingest_writes_no_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreConfig {
+                disk_min_free_bytes: u64::MAX,
+                disk_check_interval: Some(std::time::Duration::from_millis(20)),
+                compact_interval: None,
+                // Low enough that the payload below is unambiguously oversized.
+                blob_offload_bytes: 64,
+                ..StoreConfig::default()
+            },
+        )
+        .unwrap();
+
+        for _ in 0..200 {
+            if store.ingest_stats().disk_blocked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.ingest_stats().disk_blocked,
+            "the guardrail never sampled and blocked"
+        );
+
+        let mut req = sample_request();
+        let big = "x".repeat(8192);
+        req.resource_spans[0].scope_spans[0].spans[0]
+            .attributes
+            .push(str_kv("input.value", &big));
+
+        let resp = router(store.clone())
+            .oneshot(post_traces(CT_PROTOBUF, req.encode_to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // The point of the test: nothing was written on the way to that refusal.
+        let blobs = dir.path().join("blobs");
+        let written = std::fs::read_dir(&blobs)
+            .map(|d| d.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(
+            written, 0,
+            "a refused ingest must leave no blob files behind"
+        );
+        assert_eq!(store.ingest_stats().spans_ingested, 0);
+
+        // ...and the payload really was big enough to offload, so the assertion above is
+        // about the ordering rather than about a fixture that never qualified.
+        let mut spans = crate::normalize::normalize_request(&req);
+        store.prepare_for_storage(&mut spans);
+        assert!(
+            spans[0]
+                .input_value
+                .as_deref()
+                .is_some_and(|v| v.starts_with("evald-blob:")),
+            "fixture must exceed blob_offload_bytes, or this test proves nothing"
+        );
+    }
+
     fn post_traces(content_type: &str, body: impl Into<Body>) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -1352,6 +1580,93 @@ mod tests {
         assert_eq!(s.oi_kind.as_deref(), Some("LLM"));
         assert_eq!(s.service_name.as_deref(), Some("demo"));
         assert_eq!(s.scope_name.as_deref(), Some("openinference"));
+    }
+
+    /// Run `f` under a scoped subscriber filtered by `filter` and return everything it
+    /// wrote. Scoped (not global), so it composes with the rest of the suite.
+    fn capture_logs(filter: &str, f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let captured = buf.0.lock().expect("log buffer").clone();
+        String::from_utf8_lossy(&captured).into_owned()
+    }
+
+    /// The default server logs one line per REQUEST, not one per span.
+    ///
+    /// The per-span line is ~14 formatted fields and measured about a third of the ingest
+    /// hot path (~38k instructions/span), so it sits at `debug` where a default
+    /// `evald serve` never pays for it. This pins both halves of that contract: silent at
+    /// `info`, and fully restored — same fields — by the documented `RUST_LOG=evald=debug`.
+    /// A regression here is invisible in throughput tests but shows up in every benchmark.
+    #[test]
+    fn per_span_log_line_is_debug_only() {
+        let spans = normalize::normalize_request(&sample_request());
+        assert_eq!(spans.len(), 1, "sample_request carries exactly one span");
+
+        let at_info = capture_logs("info", || log_ingest(1, &spans));
+        assert!(
+            at_info.contains("ingesting OTLP/HTTP traces"),
+            "the per-request summary must stay at info; got:\n{at_info}"
+        );
+        assert!(
+            !at_info.contains("cost_usd"),
+            "no per-span line may be emitted at the default filter; got:\n{at_info}"
+        );
+        assert_eq!(
+            at_info.lines().count(),
+            1,
+            "a request must cost exactly one line at info; got:\n{at_info}"
+        );
+
+        // The documented opt-in, verbatim from docs/OPERATIONS.md.
+        let at_debug = capture_logs("evald=debug", || log_ingest(1, &spans));
+        assert!(at_debug.contains("ingesting OTLP/HTTP traces"));
+        for field in [
+            "dialect",
+            "trace_id",
+            "span_id",
+            "oi_kind",
+            "model",
+            "provider",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cost_usd",
+            "duration_ns",
+            "attrs",
+        ] {
+            assert!(
+                at_debug.contains(field),
+                "RUST_LOG=evald=debug must restore the `{field}` field; got:\n{at_debug}"
+            );
+        }
     }
 
     #[test]
@@ -1512,6 +1827,167 @@ mod tests {
         // `usage_missing` diagnostic instead of silently reporting 0 tokens.
         let raw: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(raw[0]["usage_missing"], serde_json::json!("no-usage-field"));
+    }
+
+    /// The two 0.3.0 halves together: a cost DERIVED at ingest (price table) must be what the
+    /// `/metrics` cost counter accumulates, and a span nobody can price must show up as "without
+    /// cost" instead of silently adding $0. Neither half's own tests can see this join.
+    #[tokio::test]
+    async fn a_cost_derived_at_ingest_is_what_the_cost_counter_accumulates() {
+        const BODY: &str = r#"{"resourceSpans": [{"scopeSpans": [{"spans": [
+          {"traceId": "0123456789abcdef0123456789abcdef", "spanId": "00000000000000a1", "name": "a",
+           "startTimeUnixNano": "1700000000000000000", "endTimeUnixNano": "1700000000500000000",
+           "attributes": [
+             {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+             {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "1000"}},
+             {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "200"}}]},
+          {"traceId": "0123456789abcdef0123456789abcdef", "spanId": "00000000000000c3", "name": "c",
+           "startTimeUnixNano": "1700000000000000000", "endTimeUnixNano": "1700000000500000000",
+           "attributes": [
+             {"key": "gen_ai.request.model", "value": {"stringValue": "not-a-real-model-9000"}},
+             {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "50"}},
+             {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "5"}}]}
+        ]}]}]}"#;
+        let (store, _dir) = test_store();
+        let resp = router(store.clone())
+            .oneshot(post_traces(CT_JSON, BODY.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let base = crate::price::PriceTable::baseline();
+        let (_, price) = base.lookup("gpt-4o").expect("baseline prices gpt-4o");
+        let tokens = crate::model::Tokens {
+            prompt: Some(1000),
+            completion: Some(200),
+            ..Default::default()
+        };
+        let expect = crate::price::price_tokens(price, &tokens, crate::price::Basis::default());
+        assert!(expect > 0.0);
+
+        let mut out = String::new();
+        store
+            .usage()
+            .expect("usage metrics are on by default")
+            .render(&mut out);
+        let sum = |name: &str| -> f64 {
+            out.lines()
+                .filter(|l| l.starts_with(name) && !l.starts_with('#'))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+                .sum()
+        };
+        assert!(
+            (sum("evald_llm_cost_usd_total") - expect).abs() < 1e-12,
+            "the counter must equal the derived cost {expect}: {out}"
+        );
+        assert_eq!(sum("evald_llm_spans_without_cost_total"), 1.0, "{out}");
+        assert_eq!(sum("evald_llm_requests_total"), 2.0, "{out}");
+    }
+
+    /// The whole path: OTLP-JSON in over HTTP -> normalize -> price -> store -> read back. Three
+    /// spans: one with a model and tokens but no cost (priced at ingest), one whose app reported
+    /// its own cost (kept untouched), and one with a model nobody has a price for (left empty).
+    #[tokio::test]
+    async fn cost_is_derived_at_ingest_only_where_the_span_had_none() {
+        const BODY: &str = r#"{"resourceSpans": [{"scopeSpans": [{"spans": [
+          {"traceId": "0123456789abcdef0123456789abcdef", "spanId": "00000000000000a1", "name": "a",
+           "startTimeUnixNano": "1700000000000000000", "endTimeUnixNano": "1700000000500000000",
+           "attributes": [
+             {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+             {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "123"}},
+             {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "45"}}]},
+          {"traceId": "0123456789abcdef0123456789abcdef", "spanId": "00000000000000b2", "name": "b",
+           "startTimeUnixNano": "1700000000000000000", "endTimeUnixNano": "1700000000500000000",
+           "attributes": [
+             {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
+             {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "123"}},
+             {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "45"}},
+             {"key": "llm.cost.total", "value": {"doubleValue": 0.42}}]},
+          {"traceId": "0123456789abcdef0123456789abcdef", "spanId": "00000000000000c3", "name": "c",
+           "startTimeUnixNano": "1700000000000000000", "endTimeUnixNano": "1700000000500000000",
+           "attributes": [
+             {"key": "gen_ai.request.model", "value": {"stringValue": "not-a-real-model-9000"}},
+             {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "123"}},
+             {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "45"}}]}
+        ]}]}]}"#;
+        let (store, _dir) = test_store();
+        let app = router(store);
+        let resp = app
+            .clone()
+            .oneshot(post_traces(CT_JSON, BODY.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/spans")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let spans: Vec<serde_json::Value> =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let by = |id: &str| spans.iter().find(|s| s["span_id"] == id).expect(id).clone();
+
+        // a: priced from the table, with the derivation stamped.
+        let (a, base) = (by("00000000000000a1"), crate::price::PriceTable::baseline());
+        let (_, price) = base.lookup("gpt-4o").expect("baseline prices gpt-4o");
+        let tokens = crate::model::Tokens {
+            prompt: Some(123),
+            completion: Some(45),
+            ..Default::default()
+        };
+        let expect = crate::price::price_tokens(price, &tokens, crate::price::Basis::default());
+        assert!(expect > 0.0);
+        assert!(
+            (a["cost_usd"].as_f64().unwrap() - expect).abs() < 1e-12,
+            "{a}"
+        );
+        assert!(
+            !a["raw_attributes"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with("evald.")),
+            "nothing is stamped per span; the version is block metadata and /v1/meta: {a}"
+        );
+
+        // b: the app's own cost is kept and nothing is stamped.
+        let b = by("00000000000000b2");
+        assert_eq!(b["cost_usd"].as_f64(), Some(0.42));
+        assert!(
+            b["raw_attributes"].get("evald.cost.source").is_none(),
+            "{b}"
+        );
+
+        // c: an unknown model stays empty (never $0).
+        let c = by("00000000000000c3");
+        assert!(c["cost_usd"].is_null(), "{c}");
+        assert!(
+            c["raw_attributes"].get("evald.cost.source").is_none(),
+            "{c}"
+        );
+    }
+
+    #[tokio::test]
+    async fn meta_names_the_price_table_in_use() {
+        let (store, _dir) = test_store();
+        let resp = router(store)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/meta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(meta["price_table"], crate::price::current().version);
     }
 
     #[tokio::test]
@@ -2126,6 +2602,474 @@ mod tests {
         router_with_auth(store, Auth::from_tokens([TEST_TOKEN]).unwrap())
     }
 
+    // --- observability surface: /metrics, /healthz, /readyz -----------------------
+
+    // --- score rollup --------------------------------------------------------------
+
+    /// The gap this closes: a multi-span agent trace whose spans are scored used to report
+    /// NOTHING at the trace level, because `/v1/scores?trace_id=` only returns scores stated
+    /// about the trace itself. Both are exercised here so the difference is explicit.
+    #[tokio::test]
+    async fn trace_rollup_answers_what_per_target_scores_cannot() {
+        let (store, _dir) = test_store();
+
+        // root → {retrieve, synthesize → {llm1, llm2}} — an ordinary agent shape.
+        let mut spans = Vec::new();
+        for (id, parent) in [
+            ("aa", None),
+            ("bb", Some("aa")),
+            ("cc", Some("aa")),
+            ("dd", Some("cc")),
+        ] {
+            let mut sp = crate::store::test_span("tt", id, 1_700_000_000_000_000_000);
+            sp.parent_span_id = parent.map(str::to_string);
+            spans.push(sp);
+        }
+        store.append(spans).await.unwrap();
+
+        let score = |span_id: &str, v: f64| crate::model::Score {
+            id: format!("s-{span_id}"),
+            target: crate::ScoreTarget::Span(span_id.to_string()),
+            name: "faithfulness".into(),
+            num_value: Some(v),
+            str_value: None,
+            data_type: crate::model::DataType::Numeric,
+            source: crate::model::ScoreSource::Eval,
+            comment: None,
+            config_id: None,
+            agg_stats: None,
+            ts_unix_nano: 1,
+        };
+        store
+            .put_scores(&[score("bb", 0.4), score("dd", 0.6)])
+            .unwrap();
+
+        let app = router(store.clone());
+
+        // The old question: scores stated ABOUT the trace. Still legitimately empty.
+        let resp = app
+            .clone()
+            .oneshot(get_bearer("/v1/scores?trace_id=tt", None))
+            .await
+            .unwrap();
+        assert_eq!(body_bytes(resp).await.as_ref(), b"[]");
+
+        // The new question: what did the trace score?
+        let resp = app
+            .oneshot(get_bearer("/v1/traces/tt/scores", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rolled: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(rolled.as_array().unwrap().len(), 1, "{rolled}");
+        let r = &rolled[0];
+        assert_eq!(r["name"], "faithfulness");
+        assert!((r["value"].as_f64().unwrap() - 0.5).abs() < 1e-9, "{r}");
+        // A derived value must never be mistakable for a measured one.
+        assert_eq!(r["measured"], false);
+        assert_eq!(r["function"], "mean");
+        assert_eq!(r["n"], 2);
+    }
+
+    /// A trace with no scores returns an empty list — not a fabricated zero that would read
+    /// as total failure on a dashboard or fail a gate.
+    #[tokio::test]
+    async fn trace_rollup_of_an_unscored_trace_is_empty_not_zero() {
+        let (store, _dir) = test_store();
+        store
+            .append(vec![crate::store::test_span("tt", "aa", 1)])
+            .await
+            .unwrap();
+        let resp = router(store)
+            .oneshot(get_bearer("/v1/traces/tt/scores", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), b"[]");
+    }
+
+    // --- PII redaction -------------------------------------------------------------
+
+    /// An OTLP span whose prompt, completion and a custom attribute all carry PII.
+    const OTLP_JSON_WITH_PII: &str = r#"{
+      "resourceSpans": [{
+        "scopeSpans": [{
+          "spans": [{
+            "traceId": "0123456789abcdef0123456789abcdef",
+            "spanId": "0123456789abcdef",
+            "name": "chat",
+            "kind": 3,
+            "startTimeUnixNano": "1700000000000000000",
+            "endTimeUnixNano": "1700000000500000000",
+            "attributes": [
+              { "key": "input.value", "value": { "stringValue": "email ada@example.com about card 4242424242424242" } },
+              { "key": "output.value", "value": { "stringValue": "sent to ada@example.com" } },
+              { "key": "custom.note", "value": { "stringValue": "ssn 123-45-6789, order 1234567812345678" } }
+            ]
+          }]
+        }]
+      }]
+    }"#;
+
+    /// Content: what the store ends up holding after a redacting ingest.
+    #[tokio::test]
+    async fn redaction_rewrites_prompts_completions_and_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreConfig {
+                redactor: crate::redact::Redactor::build(&["all".into()], &[], "redact").unwrap(),
+                ..StoreConfig::default()
+            },
+        )
+        .unwrap();
+
+        let resp = router(store.clone())
+            .oneshot(post_traces(CT_JSON, OTLP_JSON_WITH_PII))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rendered = serde_json::to_string(&store.query(None, 10).unwrap()).unwrap();
+        for expected in ["REDACTED:email", "REDACTED:credit_card", "REDACTED:ssn"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+        for secret in ["ada@example.com", "4242424242424242", "123-45-6789"] {
+            assert!(!rendered.contains(secret), "{secret} survived: {rendered}");
+        }
+        // The Luhn gate protects the non-card 16-digit order number sitting right next to
+        // the SSN in the same attribute — the single most important false-positive case.
+        assert!(
+            rendered.contains("1234567812345678"),
+            "a non-Luhn order number must survive: {rendered}"
+        );
+        // And the scrape reports what was rewritten, per rule.
+        //
+        // email is 4, not 2, for one email in the prompt and one in the completion:
+        // `normalize` promotes `input.value`/`output.value` into their own fields AND
+        // preserves them losslessly in `raw_attributes` (the "every attribute is queryable"
+        // guarantee), so both copies exist and BOTH must be scrubbed. Counting occurrences
+        // in the stored representation rather than distinct source values is what makes the
+        // two copies visible — the alternative would be a metric that reads as if one of
+        // them had been missed.
+        let body = crate::metrics::render(&store);
+        assert!(
+            body.contains(r#"evald_redactions_total{rule="email"} 4"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"evald_redactions_total{rule="credit_card"} 2"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"evald_redactions_total{rule="ssn"} 1"#),
+            "{body}"
+        );
+        // A rule that is armed but never fires still publishes its series, so `rate()` has a
+        // zero baseline to work from instead of the series appearing only after a first hit.
+        assert!(
+            body.contains(r#"evald_redactions_total{rule="phone"} 0"#),
+            "{body}"
+        );
+    }
+
+    /// The claim redaction actually has to make: a detected value never reaches disk — not
+    /// the WAL, not a blob, not a Parquet block.
+    ///
+    /// Asserting the read-back API is redacted is necessary but far from sufficient: that
+    /// would also pass if the raw prompt sat in the WAL and were masked on the way out. So
+    /// this walks every byte of the data-dir and asserts the raw values are nowhere in it.
+    /// It is the difference between redaction and a display filter.
+    ///
+    /// `blob_offload_bytes: 8` forces every payload out to the blob tier as well, so the
+    /// walk covers WAL + blobs + Parquet rather than just the first two.
+    #[tokio::test]
+    async fn redacted_values_never_reach_any_on_disk_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreConfig {
+                redactor: crate::redact::Redactor::build(&["all".into()], &[], "redact").unwrap(),
+                blob_offload_bytes: 8,
+                ..StoreConfig::default()
+            },
+        )
+        .unwrap();
+
+        let resp = router(store.clone())
+            .oneshot(post_traces(CT_JSON, OTLP_JSON_WITH_PII))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        store.seal_now().await.unwrap();
+        store.compact_now().await.unwrap();
+
+        let mut scanned = 0usize;
+        let mut stack = vec![dir.path().to_path_buf()];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let bytes = std::fs::read(&p).unwrap();
+                scanned += 1;
+                for secret in ["ada@example.com", "4242424242424242", "123-45-6789"] {
+                    assert!(
+                        !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                        "{secret:?} survived into {}",
+                        p.display()
+                    );
+                }
+            }
+        }
+        assert!(scanned > 0, "the walk must actually have read files");
+    }
+
+    /// With no policy configured, ingest is byte-for-byte what it was — and `/metrics`
+    /// publishes no redaction family at all rather than a row of zeros.
+    #[tokio::test]
+    async fn redaction_off_leaves_payloads_and_metrics_untouched() {
+        let (store, _dir) = test_store();
+        let resp = router(store.clone())
+            .oneshot(post_traces(CT_JSON, OTLP_JSON_WITH_PII))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rendered = serde_json::to_string(&store.query(None, 10).unwrap()).unwrap();
+        assert!(
+            rendered.contains("ada@example.com"),
+            "default must not rewrite"
+        );
+        assert!(!crate::metrics::render(&store).contains("evald_redactions_total"));
+    }
+
+    /// A disk-floor refusal must be distinguishable from a backlog shed, on the wire.
+    ///
+    /// Both are retryable to an OTLP exporter, but they mean different things and need
+    /// different operator responses: `429` says the client is outrunning fsync and should
+    /// slow down; `503` says the node is out of disk headroom, which no amount of client
+    /// backoff fixes. Collapsing them would make the two indistinguishable in an exporter's
+    /// metrics, which is where an operator looks first.
+    ///
+    /// A floor of `u64::MAX` puts any real filesystem below it, so the path is exercised
+    /// without contriving a full disk.
+    #[tokio::test]
+    async fn disk_floor_refuses_ingest_with_503_and_retry_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreConfig {
+                disk_min_free_bytes: u64::MAX,
+                disk_check_interval: Some(std::time::Duration::from_millis(20)),
+                compact_interval: None,
+                ..StoreConfig::default()
+            },
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !store.ingest_stats().disk_blocked {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guardrail never sampled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let resp = router(store.clone())
+            .oneshot(post_traces(CT_JSON, OTLP_JSON))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            "30",
+            "a full disk does not clear in the 1s a backlog shed advertises"
+        );
+        assert_eq!(
+            store.ingest_stats().spans_ingested,
+            0,
+            "a refused batch must not be counted as durable"
+        );
+
+        // And the scrape says which of the two is happening.
+        let body = crate::metrics::render(&store);
+        assert!(body.contains("evald_disk_blocked 1"), "{body}");
+        assert!(body.contains("evald_spans_disk_blocked_total 1"), "{body}");
+    }
+
+    /// With the guardrail disabled, `/metrics` must omit the free-space gauge rather than
+    /// publish `0` — a `0` reads as "disk full" to every alert built over the series, which
+    /// is exactly the false page a guardrail must not cause.
+    #[tokio::test]
+    async fn metrics_omits_disk_free_when_the_guardrail_is_off() {
+        let (store, _dir) = test_store();
+        let body = crate::metrics::render(&store);
+        assert!(
+            !body.contains("evald_disk_free_bytes"),
+            "an unsampled probe must publish no gauge at all:\n{body}"
+        );
+        // The blocked gauge is still published — it is a real, known-false state.
+        assert!(body.contains("evald_disk_blocked 0"), "{body}");
+    }
+
+    /// The load-bearing property of the probe wiring: `/healthz` and `/readyz` are merged
+    /// AFTER the auth layer, so they answer WITHOUT a token even when the gate is armed.
+    ///
+    /// This is the difference between a working deployment and a crash loop — a kubelet
+    /// sends no Authorization header, so a liveness probe behind the gate would 401, and
+    /// Kubernetes would kill a perfectly healthy node on a timer, forever. It rests on
+    /// axum's rule that `Router::layer` wraps only the routes already added, which is
+    /// exactly the kind of framework behaviour that should be pinned by a test rather than
+    /// assumed from a doc comment.
+    #[tokio::test]
+    async fn probes_answer_without_a_token_even_when_the_auth_gate_is_armed() {
+        let (store, _dir) = test_store();
+        let app = auth_router(store);
+
+        for path in ["/healthz", "/readyz"] {
+            let resp = app.clone().oneshot(get_bearer(path, None)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} must be reachable by an unauthenticated probe"
+            );
+        }
+
+        // Control: a normal route on the SAME router still requires the token, so the test
+        // above is proving an exemption rather than a gate that was never armed.
+        let resp = app.oneshot(get_bearer("/v1/spans", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `/metrics`, unlike the probes, IS inside the gate: a scrape exposes ingest rates and
+    /// backlog depth, and Prometheus can present a bearer token.
+    #[tokio::test]
+    async fn metrics_is_behind_the_auth_gate_when_armed() {
+        let (store, _dir) = test_store();
+        let app = auth_router(store);
+
+        let resp = app
+            .clone()
+            .oneshot(get_bearer("/metrics", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = app
+            .oneshot(get_bearer("/metrics", Some(TEST_TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_renders_a_parseable_exposition_body() {
+        let (store, _dir) = test_store();
+        let app = router(store);
+
+        let resp = app.oneshot(get_bearer("/metrics", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The Content-Type is not cosmetic: a scraper content-negotiates on it.
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            crate::metrics::CONTENT_TYPE
+        );
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+
+        // Every series carries its HELP and TYPE, and the version rides build_info.
+        for expected in [
+            "# TYPE evald_spans_ingested_total counter",
+            "# TYPE evald_hot_spans gauge",
+            "# TYPE evald_compaction_failures_total counter",
+            "# TYPE evald_wal_bytes gauge",
+            "evald_build_info{version=\"",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
+        }
+
+        // Structural check: a scraper rejects the whole body over one malformed line, so
+        // assert every non-comment line is `name[{labels}] <value>` with a parseable value.
+        for line in body
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (_, value) = line
+                .rsplit_once(' ')
+                .unwrap_or_else(|| panic!("no value: {line}"));
+            assert!(
+                value.parse::<f64>().is_ok() || matches!(value, "+Inf" | "-Inf" | "NaN"),
+                "unparseable value in line: {line}"
+            );
+        }
+    }
+
+    /// The ingest counter must track the DURABILITY boundary, not requests received — it is
+    /// incremented at the fsync that commits the group, so a scrape reports spans that
+    /// would survive a kill -9.
+    #[tokio::test]
+    async fn spans_ingested_counts_durably_acked_spans() {
+        let (store, _dir) = test_store();
+        assert_eq!(store.ingest_stats().spans_ingested, 0);
+
+        let app = router(store.clone());
+        let resp = app.oneshot(post_traces(CT_JSON, OTLP_JSON)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = store.ingest_stats().spans_ingested;
+        assert!(after > 0, "ingesting a span must move the counter");
+        assert!(
+            crate::metrics::render(&store).contains(&format!("evald_spans_ingested_total {after}")),
+            "the scrape must report the same count the store holds"
+        );
+    }
+
+    /// Readiness reflects the writer, and a healthy node under backpressure stays READY —
+    /// shedding is the documented contract (429 + Retry-After), not a reason to pull the
+    /// node out of rotation exactly when it needs to apply backpressure.
+    #[tokio::test]
+    async fn readyz_is_ok_while_shedding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreConfig {
+                // A bound of 1 span puts the store into shedding almost immediately.
+                max_hot_spans: 1,
+                compact_interval: None,
+                ..StoreConfig::default()
+            },
+        )
+        .unwrap();
+        let app = router(store.clone());
+
+        // Drive it past the bound; some of these are expected to shed (429), which is fine.
+        for _ in 0..4 {
+            let _ = app
+                .clone()
+                .oneshot(post_traces(CT_JSON, OTLP_JSON))
+                .await
+                .unwrap();
+        }
+        assert!(
+            store.ingest_stats().shedding,
+            "precondition: store is shedding"
+        );
+        assert!(store.writer_is_alive());
+
+        let resp = app.oneshot(get_bearer("/readyz", None)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a shedding node is applying backpressure, not failing — it must stay ready"
+        );
+    }
+
     #[tokio::test]
     async fn auth_gate_rejects_missing_and_wrong_tokens_with_401() {
         let (store, _dir) = test_store();
@@ -2201,5 +3145,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- gen_ai.evaluation.result span events become scores (every ingest door) -----------
+
+    /// One span carrying two events: a good `Relevance` evaluation and a malformed one (no
+    /// evaluation name). The malformed one must not fail the request or the span.
+    const EVAL_EVENT_JSON: &str = r#"{ "resourceSpans": [{ "scopeSpans": [{ "spans": [{
+        "traceId": "0123456789abcdef0123456789abcdef", "spanId": "0123456789abcdef",
+        "name": "chat", "kind": 3,
+        "startTimeUnixNano": "1700000000000000000", "endTimeUnixNano": "1700000000500000000",
+        "events": [
+          { "timeUnixNano": "1700000000400000000", "name": "gen_ai.evaluation.result",
+            "attributes": [
+              { "key": "gen_ai.evaluation.name", "value": { "stringValue": "Relevance" } },
+              { "key": "gen_ai.evaluation.score.value", "value": { "doubleValue": 0.75 } },
+              { "key": "gen_ai.evaluation.score.label", "value": { "stringValue": "relevant" } } ] },
+          { "timeUnixNano": "1700000000410000000", "name": "gen_ai.evaluation.result",
+            "attributes": [
+              { "key": "gen_ai.evaluation.score.value", "value": { "doubleValue": 1.0 } } ] }
+        ]
+    }]}]}]}"#;
+
+    fn span_scores(store: &Store, span_hex: &str) -> Vec<crate::model::Score> {
+        store
+            .scores_for_target(&ScoreTarget::Span(span_hex.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn eval_events_over_otlp_json_become_scores_and_a_retry_is_idempotent() {
+        let (store, _dir) = test_store();
+        for _ in 0..2 {
+            // The second POST is an exporter retry of the same batch.
+            let resp = router(store.clone())
+                .oneshot(post_traces(CT_JSON, EVAL_EVENT_JSON))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a malformed event must not fail the span"
+            );
+        }
+        let scores = span_scores(&store, "0123456789abcdef");
+        assert_eq!(
+            scores.len(),
+            1,
+            "retry must overwrite, not duplicate: {scores:?}"
+        );
+        assert_eq!(scores[0].name, "Relevance");
+        assert_eq!(scores[0].num_value, Some(0.75));
+        assert_eq!(scores[0].str_value.as_deref(), Some("relevant"));
+        assert_eq!(scores[0].ts_unix_nano, 1_700_000_000_400_000_000);
+        // The spans themselves were stored both times.
+        assert_eq!(store.ingest_stats().spans_ingested, 2);
+    }
+
+    #[tokio::test]
+    async fn eval_events_over_otlp_protobuf_become_scores() {
+        use opentelemetry_proto::tonic::trace::v1::span::Event;
+        let (store, _dir) = test_store();
+        let mut req = sample_request();
+        req.resource_spans[0].scope_spans[0].spans[0].events = vec![Event {
+            time_unix_nano: 2_000,
+            name: "gen_ai.evaluation.result".into(),
+            attributes: vec![
+                str_kv("gen_ai.evaluation.name", "Faithfulness"),
+                dbl_kv("gen_ai.evaluation.score.value", 0.5),
+            ],
+            ..Default::default()
+        }];
+        let resp = router(store.clone())
+            .oneshot(post_traces(CT_PROTOBUF, req.encode_to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let scores = span_scores(&store, &"22".repeat(8));
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].name, "Faithfulness");
+        assert_eq!(scores[0].num_value, Some(0.5));
+    }
+
+    #[tokio::test]
+    async fn a_request_without_events_stores_no_scores() {
+        let (store, _dir) = test_store();
+        let resp = router(store.clone())
+            .oneshot(post_traces(CT_PROTOBUF, sample_request().encode_to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(store.list_scores(10).unwrap().is_empty());
     }
 }

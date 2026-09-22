@@ -156,7 +156,10 @@ mod tests {
             "/v1/scores",
             "/v1/sql",
         ] {
-            assert!(js.contains(marker), "OSS console bundle must wire `{marker}`");
+            assert!(
+                js.contains(marker),
+                "OSS console bundle must wire `{marker}`"
+            );
         }
     }
 

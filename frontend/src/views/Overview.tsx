@@ -1,16 +1,24 @@
 import { useApi } from "../hooks";
-import { api, fmtNum, type IngestStats, type Score, type Span } from "../api";
+import { api, fmtNum, postSql, type IngestStats, type Score, type Span, type SqlResponse } from "../api";
 import { Badge, Card, DataTable, Kpi, Loading, Meter, Mono, Faint, scoreTone, scoreValue } from "../components";
 import { useEffect, useState } from "react";
 import { EvalSummary } from "./Evals";
+
+// The same grouping the Cost view offers, pinned to model and capped at the few rows
+// that fit here — this card used to hold nothing but a sentence pointing at that view.
+const COST_BY_MODEL =
+  "SELECT model, COUNT(*) spans, SUM(total_tokens) tokens, SUM(cost_usd) cost_usd FROM spans GROUP BY model ORDER BY tokens DESC";
 
 export function Overview() {
   const stats = useApi<IngestStats>("/v1/stats");
   const [spans, setSpans] = useState<Span[]>([]);
   const [scores, setScores] = useState<Score[]>([]);
+  const [cost, setCost] = useState<SqlResponse | null>(null);
+  const [costFailed, setCostFailed] = useState(false);
   useEffect(() => {
     api<Span[]>("/v1/spans").then(setSpans).catch(() => {});
     api<Score[]>("/v1/scores").then(setScores).catch(() => {});
+    postSql(COST_BY_MODEL, 5).then(setCost).catch(() => setCostFailed(true));
   }, []);
 
   const s = stats.data;
@@ -50,8 +58,17 @@ export function Overview() {
       </div>
 
       <div className="grid k2 mt14">
-        <Card title="Cost by model">
-          <p className="prose">Open the <Mono>Cost</Mono> view for live token + spend attribution grouped by model, provider, service, or user.</p>
+        <Card title="Cost by model" flush>
+          {costFailed ? <Loading label="cost unavailable — /v1/sql did not answer" />
+            : cost === null ? <Loading />
+            : cost.rows.length ? (
+              <DataTable rows={cost.rows} rowKey={(_, i) => String(i)}
+                columns={[
+                  { header: "Model", cell: (r) => (r.model == null ? <Faint>(untagged)</Faint> : <Mono>{String(r.model)}</Mono>) },
+                  { header: "Tokens", width: "0.7fr", align: "right", cell: (r) => <Mono>{fmtNum(r.tokens as number)}</Mono> },
+                  { header: "Cost", width: "0.6fr", align: "right", cell: (r) => (r.cost_usd == null ? <Faint>—</Faint> : <Mono>${Number(r.cost_usd).toFixed(2)}</Mono>) },
+                ]} />
+            ) : <Loading label="no spans yet" />}
         </Card>
         <Card title="Recent scores" flush>
           {scores.length ? (

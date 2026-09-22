@@ -23,6 +23,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 
 use crate::model::{Dialect, NormalizedSpan, Tokens};
@@ -33,6 +34,220 @@ pub struct BlockMeta {
     pub rel_path: String,
     pub max_start_unix_nano: u64,
     pub trace_ids: BTreeSet<String>,
+}
+
+// --- block provenance (docs/FORMAT.md §"Block metadata") ------------------------------------
+//
+// Every block written by a format-1 engine carries these Parquet key-value pairs. They make a
+// block self-describing to anything that mirrors the directory — the fleet uploader in
+// particular, which must know which files a merged block replaced — without a sidecar file
+// that could go missing separately. A block without them is a legacy (pre-marker) flush block,
+// and its WAL seqno is recovered from its file name.
+
+/// Key-value key: the on-disk format the writer followed (`"1"`).
+pub const META_FORMAT: &str = "evald.format";
+/// Key-value key: `flush` (one sealed WAL segment's spans for one partition) or `merged`.
+pub const META_BLOCK_KIND: &str = "evald.block_kind";
+/// Key-value key: the lowest WAL seqno whose spans this block holds.
+pub const META_SEQNO_LO: &str = "evald.seqno_lo";
+/// Key-value key: the highest WAL seqno whose spans this block holds.
+pub const META_SEQNO_HI: &str = "evald.seqno_hi";
+/// Key-value key: a JSON array of the data-dir-relative paths a merged block replaced.
+pub const META_MERGED_FROM: &str = "evald.merged_from";
+/// Key-value key: the evald version that wrote the block. Informational.
+pub const META_WRITER: &str = "evald.writer";
+/// Key-value key: a JSON array of the price-table versions whose derived costs the block may
+/// hold — the table in force when a flush wrote it, the union of the inputs' for a merge. Absent
+/// on blocks written before 0.3.0. Informational: the per-span truth is `evald cost --price-table`.
+pub const META_PRICE_TABLES: &str = "evald.price_tables";
+
+/// How a block came to exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// One sealed WAL segment's spans, for one hour partition — what compaction writes.
+    Flush,
+    /// Several blocks' spans, rewritten as one — what cold-to-cold merging writes.
+    Merged,
+}
+
+impl BlockKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockKind::Flush => "flush",
+            BlockKind::Merged => "merged",
+        }
+    }
+}
+
+/// A block's provenance, as written into (or, for a legacy block, inferred about) it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    pub kind: BlockKind,
+    pub seqno_lo: u64,
+    pub seqno_hi: u64,
+    /// Data-dir-relative paths of the blocks a merged block replaced. Empty for a flush.
+    pub merged_from: Vec<String>,
+    /// Price-table versions whose derived costs the block may hold (`META_PRICE_TABLES`);
+    /// empty on a legacy block.
+    pub price_tables: Vec<String>,
+    /// True when read from the file's own metadata; false when inferred from a legacy
+    /// (pre-marker) file name, which carries the seqno and nothing else.
+    pub declared: bool,
+}
+
+impl Provenance {
+    /// A flush block from WAL segment `seqno`.
+    pub fn flush(seqno: u64) -> Self {
+        Provenance {
+            kind: BlockKind::Flush,
+            seqno_lo: seqno,
+            seqno_hi: seqno,
+            merged_from: Vec::new(),
+            price_tables: Vec::new(),
+            declared: true,
+        }
+    }
+
+    /// A merged block covering WAL seqnos `lo..=hi`, replacing `merged_from`.
+    pub fn merged(seqno_lo: u64, seqno_hi: u64, merged_from: Vec<String>) -> Self {
+        Provenance {
+            kind: BlockKind::Merged,
+            seqno_lo,
+            seqno_hi,
+            merged_from,
+            price_tables: Vec::new(),
+            declared: true,
+        }
+    }
+
+    /// The price-table versions to record (a flush: the one in force; a merge: its inputs').
+    pub fn with_price_tables(mut self, versions: Vec<String>) -> Self {
+        self.price_tables = versions;
+        self
+    }
+
+    /// The key-value pairs a block carrying this provenance is written with.
+    pub fn key_value_metadata(&self) -> Vec<KeyValue> {
+        let mut kv = vec![
+            KeyValue::new(
+                META_FORMAT.to_string(),
+                super::format::FORMAT_VERSION.to_string(),
+            ),
+            KeyValue::new(META_BLOCK_KIND.to_string(), self.kind.as_str().to_string()),
+            KeyValue::new(META_SEQNO_LO.to_string(), self.seqno_lo.to_string()),
+            KeyValue::new(META_SEQNO_HI.to_string(), self.seqno_hi.to_string()),
+            KeyValue::new(
+                META_WRITER.to_string(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+        ];
+        if self.kind == BlockKind::Merged {
+            kv.push(KeyValue::new(
+                META_MERGED_FROM.to_string(),
+                serde_json::to_string(&self.merged_from).unwrap_or_else(|_| "[]".into()),
+            ));
+        }
+        if !self.price_tables.is_empty() {
+            kv.push(KeyValue::new(
+                META_PRICE_TABLES.to_string(),
+                serde_json::to_string(&self.price_tables).unwrap_or_else(|_| "[]".into()),
+            ));
+        }
+        kv
+    }
+
+    /// Decode from a file's key-value metadata, falling back to what the file name says for
+    /// a legacy block. `stem` is the file name without `.parquet`.
+    pub fn from_key_values(kv: Option<&Vec<KeyValue>>, stem: &str) -> Provenance {
+        let get = |key: &str| {
+            kv.and_then(|kv| kv.iter().find(|e| e.key == key))
+                .and_then(|e| e.value.as_deref())
+        };
+        let kind = match get(META_BLOCK_KIND) {
+            Some("merged") => Some(BlockKind::Merged),
+            Some("flush") => Some(BlockKind::Flush),
+            _ => None,
+        };
+        let declared = kind
+            .zip(get(META_SEQNO_LO).zip(get(META_SEQNO_HI)))
+            .and_then(|(kind, (lo, hi))| {
+                Some((kind, lo.parse::<u64>().ok()?, hi.parse::<u64>().ok()?))
+            });
+        if let Some((kind, seqno_lo, seqno_hi)) = declared {
+            let merged_from = get(META_MERGED_FROM)
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default();
+            let price_tables = get(META_PRICE_TABLES)
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                .unwrap_or_default();
+            return Provenance {
+                kind,
+                seqno_lo,
+                seqno_hi,
+                merged_from,
+                price_tables,
+                declared: true,
+            };
+        }
+        // Legacy: `<seqno:020>-<idx>` from the flush path, or a merged/day stem written by a
+        // format-1 engine whose metadata could not be read — the seqno range is still in the
+        // name.
+        let (kind, lo, hi) = stem_range(stem);
+        Provenance {
+            kind,
+            seqno_lo: lo,
+            seqno_hi: hi,
+            merged_from: Vec::new(),
+            price_tables: Vec::new(),
+            declared: false,
+        }
+    }
+}
+
+/// What a file name alone says: `<seqno:020>-<idx>` is a flush of that seqno;
+/// `merged-<lo>-<hi>` and `day-<lo>-<hi>` cover a range. Anything else is seqno 0.
+fn stem_range(stem: &str) -> (BlockKind, u64, u64) {
+    let parse = |s: &str| s.parse::<u64>().ok();
+    if let Some(rest) = stem
+        .strip_prefix("merged-")
+        .or_else(|| stem.strip_prefix("day-"))
+    {
+        let mut it = rest.split('-');
+        if let (Some(lo), Some(hi)) = (it.next().and_then(parse), it.next().and_then(parse)) {
+            return (BlockKind::Merged, lo, hi);
+        }
+    }
+    let seqno = stem.split('-').next().and_then(parse).unwrap_or(0);
+    (BlockKind::Flush, seqno, seqno)
+}
+
+/// The provenance and row count of a block, from its footer alone (no row data is read).
+/// Reads only the Parquet footer, so this is cheap enough to call per block on a
+/// maintenance pass (the merge planner and the fleet uploader both do).
+pub fn read_provenance(abs_path: &Path) -> io::Result<(Provenance, u64)> {
+    let stem = abs_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(abs_path)?)
+        .map_err(io::Error::other)?;
+    let file_meta = builder.metadata().file_metadata();
+    let prov = Provenance::from_key_values(file_meta.key_value_metadata(), &stem);
+    Ok((prov, file_meta.num_rows().max(0) as u64))
+}
+
+/// Writer properties every block is written with: Snappy, and the provenance metadata.
+pub fn writer_properties(provenance: &Provenance) -> WriterProperties {
+    writer_properties_builder(provenance).build()
+}
+
+/// The same, unfinished, for a writer that wants to add its own settings (row-group size).
+pub fn writer_properties_builder(
+    provenance: &Provenance,
+) -> parquet::file::properties::WriterPropertiesBuilder {
+    WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(provenance.key_value_metadata()))
 }
 
 /// The flat columnar schema. Column order is load-bearing for [`decode_batch`].
@@ -88,13 +303,15 @@ pub fn partition_of(start_unix_nano: u64) -> String {
 }
 
 /// Write one block (all spans assumed in the same `partition`) durably, returning what
-/// the index needs. `file_stem` must be unique within the partition.
+/// the index needs. `file_stem` must be unique within the partition; `provenance` is
+/// written into the file's key-value metadata (docs/FORMAT.md).
 pub fn write_block(
     data_dir: &Path,
     blocks_subdir: &str,
     partition: &str,
     file_stem: &str,
     spans: &[NormalizedSpan],
+    provenance: &Provenance,
 ) -> io::Result<BlockMeta> {
     let rel_dir = format!("{blocks_subdir}/{partition}");
     let abs_dir = data_dir.join(&rel_dir);
@@ -107,9 +324,7 @@ pub fn write_block(
     let batch = build_batch(spans)?;
     {
         let file = File::create(&tmp_path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
+        let props = writer_properties(provenance);
         let mut writer =
             ArrowWriter::try_new(file, schema(), Some(props)).map_err(io::Error::other)?;
         writer.write(&batch).map_err(io::Error::other)?;
@@ -144,12 +359,12 @@ pub fn read_block(abs_path: &Path) -> io::Result<Vec<NormalizedSpan>> {
 // Windows: `File::open(dir)` fails with os error 5 (needs FILE_FLAG_BACKUP_SEMANTICS);
 // NTFS journals metadata itself, so skip the directory fsync there (see store/wal.rs).
 #[cfg(unix)]
-fn fsync_dir(dir: &Path) -> io::Result<()> {
+pub(super) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> io::Result<()> {
+pub(super) fn fsync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -410,6 +625,7 @@ mod tests {
             "2023/11/14/22",
             "0000-0",
             &[a.clone(), b.clone()],
+            &Provenance::flush(7),
         )
         .unwrap();
         assert_eq!(meta.rel_path, "blocks/2023/11/14/22/0000-0.parquet");

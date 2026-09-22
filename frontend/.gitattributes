@@ -2,3 +2,17 @@
 # platforms (no CRLF conversion) so what's committed is exactly what rust-embed bakes
 # into the binary. Regenerate with `npm run build`.
 dist/** -text
+
+# Self-hosted IBM Plex woff2 (src/fonts/) — binary, and baked into both dist bundles.
+# `* text=auto` at the repo root already detects these as binary; pinning it makes the
+# guarantee explicit rather than dependent on content sniffing.
+src/fonts/*.woff2 -text
+
+# The Vite entry template. `* text=auto` at the repo root hands a Windows checkout
+# CRLF, `npm run build` copies those bytes into dist/index.html, and `dist/** -text`
+# above stores them verbatim — so the committed bundle flip-flops between CRLF and LF
+# depending on which platform last rebuilt it. Pinning the source to LF makes the
+# generated file deterministic instead. Leading slash on purpose: an unanchored
+# `index.html` also matches dist/index.html and would re-enable text conversion on a
+# file the rule above deliberately stores byte-for-byte.
+/index.html text eol=lf

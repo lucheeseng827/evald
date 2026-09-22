@@ -1,3 +1,5 @@
+<img src="docs/images/evald-logo.svg" alt="" width="72">
+
 # evald
 
 **evald — an OTel-native trace + eval store in one static binary.** Point your
@@ -103,6 +105,8 @@ open  http://localhost:4318/                 # ✅ the embedded UI — trace lis
 curl localhost:4318/v1/scores -d '{"span_id":"<id>","name":"exact_match","value":1}'
 curl 'localhost:4318/v1/scores?span_id=<id>'           # scores on a span
 #   Phoenix clients can POST to /v1/span_annotations ({"data":[...]}) instead.
+#   An OTel GenAI evaluator can also emit a `gen_ai.evaluation.result` span event: evald stores it as
+#   a score (docs/INSTRUMENTATION.md), and `evald scores export --format gen_ai-event` reads them back.
 
 # 5. run an offline eval and gate CI on it                            (✅ today)
 evald eval run --config eval.yaml       # ✅ exit-nonzero if a threshold regresses
@@ -112,6 +116,9 @@ evald eval compare run_a run_b --fail-on-regression --tolerance 0.02
 evald eval compare run_a run_b --fail-on-regression --significance --alpha 0.05
 #   ✅ statistically honest gate: a drop fails CI only when Welch's t shows it's beyond
 #      sampling noise (the 95% CI on the delta excludes 0) — small-dataset noise won't flag.
+evald eval run --config eval.yaml --junit report.xml
+#   ✅ --junit (also on `eval compare` and `suite run`) writes a JUnit XML report that CI test tabs
+#      render — written even when the gate fails; the exit code is unchanged (docs/CONFIG.md).
 
 # 5b. (optional) Tier-3 LLM-as-judge — BYO-key, OFF by default, results cached.
 cargo build --features judge          # the network backend is feature-gated
@@ -138,8 +145,15 @@ evald query "SELECT s.model, AVG(sc.num_value) FROM spans s \
 
 # 7. attribute token spend                                                    (✅ today)
 evald cost --by model        # spans · tokens · cost_usd per model (also: user|session|service|provider)
-#   untagged spans are surfaced as (untagged) so partial tagging is visible; cost_usd
-#   shows when a span carried `llm.cost.*`, token totals are always available.
+#   untagged spans are surfaced as (untagged) so partial tagging is visible. cost_usd is the
+#   span's own `llm.cost.*` if it had one, else evald prices it from the model + token counts
+#   (a built-in price table; `--price-table` adds/overrides models). A model with no price shows
+#   as (no price), never $0. `evald cost --price-table t.json` re-prices from stored tokens.
+
+# 8. latency, exactly                                                         (✅ today)
+evald latency --by model     # nearest-rank p50/p95/p99 + time-to-first-token where spans carry it
+#   and the same usage — cost, tokens, latency histogram, rolling eval scores — is on /metrics
+#   (labelled by provider, model, service only), ready for the Prometheus you already run.
 ```
 
 **Run an eval now** — there's a ready-made dataset + config under
@@ -229,6 +243,15 @@ C++ → clean static musl) runs SQL over the cold Parquet blocks unioned with th
 tier; the **axum** API, the embedded **SPA**, and the offline **eval runner** sit on top.
 The eval runner and analytical queries run **off the ingest hot path**, so a scan never
 contends with the OTLP firehose.
+
+[![evald system context](docs/images/architecture-system-context.png)](docs/images/architecture-system-context.png)
+
+<sub>Redrawn from the Mermaid source below. The drawing folds the bounded mpsc into the
+receiver that applies its backpressure, merges the compactor with the cold tier it
+produces, merges the two redb tables into one store, and merges the API, SPA and eval
+runner into one read-surface node. Source:
+[`docs/images/architecture-system-context.html`](docs/images/architecture-system-context.html).
+The same topology as Mermaid, for diffing and for editing the drawing from:</sub>
 
 ```mermaid
 flowchart TD

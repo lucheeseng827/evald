@@ -35,8 +35,18 @@ impl TraceReceiver {
     async fn ingest(&self, request: ExportTraceServiceRequest) -> Result<usize, StoreError> {
         let mut spans = normalize::normalize_request(&request);
         let count = spans.len();
-        self.store.offload_payloads(&mut spans);
-        self.store.append(spans).await.map(|()| count)
+        let eval_scores = crate::evalevent::extract(&request);
+        // Same single pre-storage step the HTTP door uses, so the two cannot diverge.
+        // Before the offload, for the reason spelled out in `ingest.rs`: the offload writes,
+        // so `append`'s guard alone would leave orphaned blobs on a full volume.
+        self.store.reject_if_disk_full(count)?;
+        self.store.prepare_for_storage(&mut spans);
+        self.store.append(spans).await?;
+        // Same step as the HTTP door: evaluation events become scores once the spans are durable.
+        self.store
+            .put_scores(&eval_scores)
+            .map_err(StoreError::Io)?;
+        Ok(count)
     }
 }
 
@@ -193,6 +203,38 @@ mod tests {
         // append is awaited inside export, so the span is durable by the time we return.
         assert_eq!(store.span_count().unwrap(), 1);
         assert_eq!(store.trace(&"77".repeat(16)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn grpc_export_turns_evaluation_events_into_scores() {
+        use opentelemetry_proto::tonic::trace::v1::span::Event;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), StoreConfig::default()).unwrap();
+        let receiver = TraceReceiver::new(store.clone());
+
+        let mut req = one_span_request();
+        req.resource_spans[0].scope_spans[0].spans[0].events = vec![Event {
+            time_unix_nano: 1_500,
+            name: "gen_ai.evaluation.result".into(),
+            attributes: vec![
+                str_kv("gen_ai.evaluation.name", "Relevance"),
+                str_kv("gen_ai.evaluation.score.label", "relevant"),
+            ],
+            ..Default::default()
+        }];
+        // Send it twice: an exporter retry must not duplicate the score.
+        for _ in 0..2 {
+            receiver
+                .export(Request::new(req.clone()))
+                .await
+                .expect("export");
+        }
+        let scores = store
+            .scores_for_target(&crate::model::ScoreTarget::Span("88".repeat(8)))
+            .unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].name, "Relevance");
+        assert_eq!(scores[0].str_value.as_deref(), Some("relevant"));
     }
 
     #[tokio::test]

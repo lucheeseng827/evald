@@ -7,12 +7,13 @@
 //! Parquet files are committed, so an orphan block from a crashed flush (written but
 //! never committed) is simply never read.
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
 use redb::{
     Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
-    TableDefinition,
+    ReadableTableMetadata, TableDefinition,
 };
 
 use super::cold::BlockMeta;
@@ -84,6 +85,54 @@ impl Index {
         }
         txn.commit().map_err(io::Error::other)?;
         Ok(())
+    }
+
+    /// The merge commit: record `output` (+ its trace mappings) and remove every input block
+    /// with exactly the `trace_id → input` mappings it held, in one atomic transaction. The
+    /// watermark is untouched — a merge moves spans between cold files, it flushes nothing.
+    ///
+    /// `inputs` carries each input's own trace set, collected while its rows were read for
+    /// the merge, so the removal is `O(rows moved)` rather than a scan of every trace the
+    /// store has ever seen (which is what [`Index::drop_blocks`] must do, knowing nothing).
+    /// After this returns the inputs are unreferenced: readers no longer open them, and the
+    /// aged orphan sweep may unlink them.
+    pub fn commit_merge(
+        &self,
+        output: &BlockMeta,
+        inputs: &[(String, BTreeSet<String>)],
+    ) -> io::Result<()> {
+        let txn = self.db.begin_write().map_err(io::Error::other)?;
+        {
+            let mut block_tbl = txn.open_table(BLOCKS).map_err(io::Error::other)?;
+            let mut trace_tbl = txn
+                .open_multimap_table(TRACE_BLOCKS)
+                .map_err(io::Error::other)?;
+            for (rel, traces) in inputs {
+                block_tbl.remove(rel.as_str()).map_err(io::Error::other)?;
+                for trace_id in traces {
+                    trace_tbl
+                        .remove(trace_id.as_str(), rel.as_str())
+                        .map_err(io::Error::other)?;
+                }
+            }
+            block_tbl
+                .insert(output.rel_path.as_str(), output.max_start_unix_nano)
+                .map_err(io::Error::other)?;
+            for trace_id in &output.trace_ids {
+                trace_tbl
+                    .insert(trace_id.as_str(), output.rel_path.as_str())
+                    .map_err(io::Error::other)?;
+            }
+        }
+        txn.commit().map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    /// How many blocks the index holds — the number the cold tier's read path opens.
+    pub fn block_count(&self) -> io::Result<u64> {
+        let txn = self.db.begin_read().map_err(io::Error::other)?;
+        let table = txn.open_table(BLOCKS).map_err(io::Error::other)?;
+        table.len().map_err(io::Error::other)
     }
 
     /// Every committed block path (the orphan-sweep allowlist and the no-filter scan set).
@@ -251,6 +300,65 @@ mod tests {
         assert_eq!(index.watermark().unwrap(), 2);
         index.drop_blocks(&[]).unwrap();
         assert_eq!(index.all_block_paths().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn commit_merge_swaps_inputs_for_the_output_and_leaves_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = Index::open(&dir.path().join("index.redb")).unwrap();
+        idx.commit_flush(
+            2,
+            &[
+                block("blocks/2026/01/01/00/a.parquet", 10, &["t1", "t2"]),
+                block("blocks/2026/01/01/00/b.parquet", 20, &["t2", "t3"]),
+            ],
+        )
+        .unwrap();
+        idx.commit_flush(3, &[block("blocks/2026/01/01/01/c.parquet", 30, &["t4"])])
+            .unwrap();
+
+        let merged = block(
+            "blocks/2026/01/01/00/merged-1-2.parquet",
+            20,
+            &["t1", "t2", "t3"],
+        );
+        let inputs = vec![
+            (
+                "blocks/2026/01/01/00/a.parquet".to_string(),
+                ["t1", "t2"].iter().map(|s| s.to_string()).collect(),
+            ),
+            (
+                "blocks/2026/01/01/00/b.parquet".to_string(),
+                ["t2", "t3"].iter().map(|s| s.to_string()).collect(),
+            ),
+        ];
+        idx.commit_merge(&merged, &inputs).unwrap();
+
+        let mut paths = idx.all_block_paths().unwrap();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "blocks/2026/01/01/00/merged-1-2.parquet",
+                "blocks/2026/01/01/01/c.parquet"
+            ]
+        );
+        assert_eq!(idx.block_count().unwrap(), 2);
+        assert_eq!(
+            idx.watermark().unwrap(),
+            3,
+            "a merge never moves the watermark"
+        );
+        // t2 was in both inputs: exactly one mapping now, to the merged block.
+        assert_eq!(
+            idx.block_paths_for_trace("t2").unwrap(),
+            vec!["blocks/2026/01/01/00/merged-1-2.parquet"]
+        );
+        assert_eq!(
+            idx.block_paths_for_trace("t4").unwrap(),
+            vec!["blocks/2026/01/01/01/c.parquet"]
+        );
+        assert!(idx.block_paths_for_trace("t1").unwrap().len() == 1);
     }
 
     #[test]

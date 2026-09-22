@@ -19,6 +19,9 @@ use crate::model::{Dialect, NormalizedSpan, Tokens};
 /// spans, threading resource (`service.name`) and scope (name/version) context down.
 pub fn normalize_request(req: &ExportTraceServiceRequest) -> Vec<NormalizedSpan> {
     let mut out = Vec::new();
+    // One table per request (an `Arc` clone), not per span: `crate::price` fills `cost_usd`
+    // below for spans that carry a model and token counts but no cost of their own.
+    let prices = crate::price::current();
     for resource_spans in &req.resource_spans {
         let service_name = resource_spans
             .resource
@@ -50,6 +53,7 @@ pub fn normalize_request(req: &ExportTraceServiceRequest) -> Vec<NormalizedSpan>
                         .entry("otel.schema_url".to_string())
                         .or_insert_with(|| Json::String(su.clone()));
                 }
+                crate::price::apply(&prices, &mut normalized);
                 out.push(normalized);
             }
         }
@@ -98,6 +102,8 @@ pub fn normalize_span(
             &[
                 "llm.token_count.prompt_details.cache_write",
                 "gen_ai.usage.cache_creation.input_tokens",
+                // The current OTel GenAI spelling of the same count.
+                "gen_ai.usage.cache_write.input_tokens",
             ],
         ),
         reasoning: first_u64(
@@ -105,6 +111,8 @@ pub fn normalize_span(
             &[
                 "llm.token_count.completion_details.reasoning",
                 "gen_ai.usage.reasoning_tokens",
+                // The current OTel GenAI spelling of the same count.
+                "gen_ai.usage.reasoning.output_tokens",
             ],
         ),
     };
@@ -153,11 +161,17 @@ pub fn normalize_span(
             ],
         ),
         tokens,
-        cost_usd: first_f64(a, &["llm.cost.total", "gen_ai.usage.cost"]),
+        cost_usd: first_f64(a, &crate::price::COST_ATTRIBUTES),
+        // The non-indexed keys win; only when none is present do we reconstruct from the
+        // DEPRECATED indexed `gen_ai.prompt.{i}.*` / `gen_ai.completion.{i}.*` shape that
+        // widely deployed SDKs (Traceloop OpenLLMetry) still emit — otherwise those spans'
+        // input/output would survive only as scattered `raw_attributes`. See
+        // [`indexed_messages`].
         input_value: first_str(
             a,
             &["input.value", "gen_ai.input.messages", "gen_ai.prompt"],
-        ),
+        )
+        .or_else(|| indexed_messages(a, "prompt")),
         output_value: first_str(
             a,
             &[
@@ -165,7 +179,8 @@ pub fn normalize_span(
                 "gen_ai.output.messages",
                 "gen_ai.completion",
             ],
-        ),
+        )
+        .or_else(|| indexed_messages(a, "completion")),
         session_id: first_str(a, &["session.id", "gen_ai.conversation.id"]),
         user_id: first_str(a, &["user.id"]),
         service_name,
@@ -281,18 +296,24 @@ fn attr<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a AnyValue> {
         .and_then(|kv| kv.value.as_ref())
 }
 
-fn attr_str(attrs: &[KeyValue], key: &str) -> Option<String> {
-    match attr(attrs, key)?.value.as_ref()? {
+/// Coerce an `AnyValue` to a scalar string: a string as-is; int/double/bool stringified.
+///
+/// Tolerant ingest — a producer that sends a normally-string field as a scalar (loose typing /
+/// semconv drift, e.g. a stringly-typed model id, or `gen_ai.request.seed` arriving as an int on
+/// one SDK version and a string on the next) still resolves rather than being silently dropped.
+/// Arrays / kvlists / bytes have no sensible scalar form, so they don't coerce (`None`).
+fn scalar_string(v: &AnyValue) -> Option<String> {
+    match v.value.as_ref()? {
         AnyVal::StringValue(s) => Some(s.clone()),
-        // Tolerant ingest: a producer that sends a normally-string field as a scalar (loose typing /
-        // semconv drift — e.g. a stringly-typed model id, or `gen_ai.request.seed` arriving as an int
-        // on one SDK version and a string on the next) still resolves rather than being silently
-        // dropped. Arrays/kvlists/bytes have no sensible scalar form, so they don't coerce.
         AnyVal::IntValue(i) => Some(i.to_string()),
         AnyVal::DoubleValue(d) => Some(d.to_string()),
         AnyVal::BoolValue(b) => Some(b.to_string()),
         _ => None,
     }
+}
+
+pub(crate) fn attr_str(attrs: &[KeyValue], key: &str) -> Option<String> {
+    attr(attrs, key).and_then(scalar_string)
 }
 
 /// Read an attribute as a non-negative integer. Accepts int, integral double, or a
@@ -306,7 +327,7 @@ fn attr_u64(attrs: &[KeyValue], key: &str) -> Option<u64> {
     }
 }
 
-fn attr_f64(attrs: &[KeyValue], key: &str) -> Option<f64> {
+pub(crate) fn attr_f64(attrs: &[KeyValue], key: &str) -> Option<f64> {
     match attr(attrs, key)?.value.as_ref()? {
         AnyVal::DoubleValue(d) => Some(*d),
         AnyVal::IntValue(i) => Some(*i as f64),
@@ -333,6 +354,86 @@ fn non_empty(s: &str) -> Option<String> {
     } else {
         Some(s.to_string())
     }
+}
+
+/// Cap on the messages [`indexed_messages`] will reconstruct from one span. The receiver
+/// ingests untrusted OTLP, and these per-message attributes come off the wire, so bound the
+/// scan — far above any real chat history.
+const MAX_INDEXED_MESSAGES: usize = 4096;
+
+/// Reconstruct a messages array from the **deprecated indexed** `gen_ai` shape —
+/// `gen_ai.<kind>.{i}.role` / `gen_ai.<kind>.{i}.content` (`kind` = `"prompt"` for input,
+/// `"completion"` for output) — into a JSON array `[{"role":…,"content":…}, …]`.
+///
+/// This flat message shape is the same one the bare `gen_ai.prompt` / `gen_ai.completion`
+/// string and the structured `gen_ai.{input,output}.messages` attributes carry, so a span
+/// instrumented with the legacy indexed shape lands the *same* normalized input/output as a
+/// modern one. The indexed shape was deprecated in the OTel GenAI semconv (v1.38.0) but is
+/// still emitted by widely deployed instrumentation (Traceloop OpenLLMetry), so deployed SDKs
+/// will produce it for a long time; without this those prompts/completions would appear only
+/// as scattered `raw_attributes`, invisible to the read/UI/cost/eval-curation surfaces that
+/// read `input_value` / `output_value`.
+///
+/// Fallback-only (the caller tries the non-indexed keys first). Collects this `kind`'s indexed
+/// attributes in ONE pass over `attrs` (not a per-index rescan), keyed by message index, then
+/// emits contiguous indices from `0`, stopping at the first **absent** index — how SDKs emit
+/// them — bounded by [`MAX_INDEXED_MESSAGES`]. A message may be role-only or content-only.
+///
+/// Crucially, an index counts as *present* when any of its sub-keys exists, independent of
+/// whether the value coerces to a scalar: a slot whose `…content` is a non-scalar (a structured
+/// tool-call value) yields no scalar message field but does **not** terminate the scan, so later
+/// messages are never silently dropped. Non-scalar values remain in `raw_attributes` (copied
+/// there wholesale); they simply aren't flattened into a message here.
+fn indexed_messages(attrs: &[KeyValue], kind: &str) -> Option<String> {
+    // One pass: bucket `gen_ai.<kind>.<i>.{role,content}` into per-index scalar parts. The map
+    // key is the index, so iteration order below is ascending; inserting an entry (even for an
+    // unhandled sub-key like `…tool_calls.*`) marks that index present.
+    let prefix = format!("gen_ai.{kind}.");
+    let mut by_index: BTreeMap<usize, (Option<String>, Option<String>)> = BTreeMap::new();
+    for kv in attrs {
+        let Some(rest) = kv.key.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((idx_str, field)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(idx) = idx_str.parse::<usize>() else {
+            continue;
+        };
+        if idx >= MAX_INDEXED_MESSAGES {
+            continue;
+        }
+        let entry = by_index.entry(idx).or_default();
+        match field {
+            "role" => entry.0 = kv.value.as_ref().and_then(scalar_string),
+            "content" => entry.1 = kv.value.as_ref().and_then(scalar_string),
+            _ => {} // other sub-keys only mark the index present (kept in raw_attributes)
+        }
+    }
+
+    let mut messages: Vec<Json> = Vec::new();
+    let mut i = 0usize;
+    // Contiguous from 0; a gap (fully-absent index) ends the message list. A present slot with
+    // no scalar role/content is skipped but does not stop the scan.
+    while let Some((role, content)) = by_index.get(&i) {
+        i += 1;
+        if role.is_none() && content.is_none() {
+            continue;
+        }
+        let mut msg = serde_json::Map::new();
+        if let Some(r) = role {
+            msg.insert("role".to_string(), Json::String(r.clone()));
+        }
+        if let Some(c) = content {
+            msg.insert("content".to_string(), Json::String(c.clone()));
+        }
+        messages.push(Json::Object(msg));
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    // Serializing owned JSON never fails; fall back to None rather than panic.
+    serde_json::to_string(&Json::Array(messages)).ok()
 }
 
 #[cfg(test)]
@@ -508,6 +609,122 @@ mod tests {
     fn deprecated_gen_ai_system_is_used_as_provider() {
         let n = norm(vec![s("gen_ai.system", "anthropic")]);
         assert_eq!(n.provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn indexed_gen_ai_messages_are_reconstructed() {
+        // The deprecated indexed shape OpenLLMetry still emits — evald reconstructs the same
+        // messages array the modern shapes carry, instead of dropping the prompt/completion.
+        let n = norm(vec![
+            s("gen_ai.request.model", "gpt-4o"),
+            s("gen_ai.prompt.0.role", "system"),
+            s("gen_ai.prompt.0.content", "You are helpful."),
+            s("gen_ai.prompt.1.role", "user"),
+            s("gen_ai.prompt.1.content", "Hi"),
+            s("gen_ai.completion.0.role", "assistant"),
+            s("gen_ai.completion.0.content", "Hello!"),
+        ]);
+        let input: Json = serde_json::from_str(n.input_value.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!([
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hi"},
+            ])
+        );
+        let output: Json = serde_json::from_str(n.output_value.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!([{"role": "assistant", "content": "Hello!"}])
+        );
+        // The raw indexed attributes are still preserved losslessly alongside.
+        assert_eq!(
+            n.raw_attributes
+                .get("gen_ai.prompt.0.content")
+                .and_then(|v| v.as_str()),
+            Some("You are helpful.")
+        );
+    }
+
+    #[test]
+    fn non_indexed_shapes_win_over_indexed() {
+        // A bare `gen_ai.prompt` string takes precedence over indexed parts (existing behavior
+        // preserved; the fallback only fills a gap, it never double-sources).
+        let n = norm(vec![
+            s("gen_ai.prompt", "bare prompt"),
+            s("gen_ai.prompt.0.content", "indexed prompt"),
+        ]);
+        assert_eq!(n.input_value.as_deref(), Some("bare prompt"));
+
+        // Structured `gen_ai.output.messages` likewise wins over indexed completion parts.
+        let n = norm(vec![
+            s(
+                "gen_ai.output.messages",
+                r#"[{"role":"assistant","content":"structured"}]"#,
+            ),
+            s("gen_ai.completion.0.content", "indexed"),
+        ]);
+        assert_eq!(
+            n.output_value.as_deref(),
+            Some(r#"[{"role":"assistant","content":"structured"}]"#)
+        );
+    }
+
+    #[test]
+    fn indexed_messages_handle_partial_and_absent() {
+        // A content-only message (no role) is still captured.
+        let n = norm(vec![s("gen_ai.prompt.0.content", "just content")]);
+        let input: Json = serde_json::from_str(n.input_value.as_deref().unwrap()).unwrap();
+        assert_eq!(input, serde_json::json!([{"content": "just content"}]));
+
+        // Non-contiguous indices stop at the first fully-absent slot: index 0 present, index 1
+        // absent, index 2 present → only message 0 is reconstructed (matches how SDKs emit).
+        let n = norm(vec![
+            s("gen_ai.prompt.0.content", "first"),
+            s("gen_ai.prompt.2.content", "third"),
+        ]);
+        let input: Json = serde_json::from_str(n.input_value.as_deref().unwrap()).unwrap();
+        assert_eq!(input, serde_json::json!([{"content": "first"}]));
+
+        // A span with no message attributes reconstructs nothing.
+        let n = norm(vec![s("gen_ai.request.model", "gpt-4o")]);
+        assert_eq!(n.input_value, None);
+        assert_eq!(n.output_value, None);
+    }
+
+    #[test]
+    fn indexed_non_scalar_content_does_not_truncate_later_messages() {
+        use opentelemetry_proto::tonic::common::v1::ArrayValue;
+        // index 0: structured (array) content, no role → neither field coerces to a scalar, but
+        // the key IS present. This must NOT stop the contiguous scan; index 1 (scalar) is still
+        // emitted. A presence-blind `break` (the pre-fix behavior) would have lost it entirely.
+        let structured = KeyValue {
+            key: "gen_ai.prompt.0.content".to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyVal::ArrayValue(ArrayValue {
+                    values: vec![AnyValue {
+                        value: Some(AnyVal::StringValue("part".to_string())),
+                    }],
+                })),
+            }),
+            ..Default::default()
+        };
+        let n = norm(vec![
+            structured,
+            s("gen_ai.prompt.1.role", "user"),
+            s("gen_ai.prompt.1.content", "hello"),
+        ]);
+        let input: Json = serde_json::from_str(n.input_value.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!([{"role": "user", "content": "hello"}])
+        );
+        // …and the non-scalar value is still preserved losslessly in raw_attributes.
+        assert!(n
+            .raw_attributes
+            .get("gen_ai.prompt.0.content")
+            .unwrap()
+            .is_array());
     }
 
     #[test]

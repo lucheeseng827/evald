@@ -163,12 +163,49 @@ evaluator_set[], git_sha/label, created_at }`; `RunItem { run_id, dataset_item_i
 trace_id, span_id }`; `RunAggregate { run_id, metric_name, mean, pass_rate, count }`.
 Run comparison diffs `RunAggregate` by `metric_name` across two `run_id`s.
 
-**Open model gap (must resolve before Beta):** `RunItem` assumes 1:1 item↔trace, but
-an agentic task emits a multi-span trace with **no single canonical root span** to
-attach the Score to. **Score rollup / aggregation-up-the-trace-tree semantics for
-non-root spans, agent trajectories, and tool sub-spans are undefined** and WILL bite
-run-compare and online eval the moment a trace is more than root+children. Define
-before Beta; tie the RunItem attach point to this decision.
+### 2.4 Score rollup — what a *trace* scores when its spans are scored (RESOLVED)
+
+This was an open model gap: a Score attaches to a span, but an agentic task emits a
+multi-span trace with no single canonical span to hang the answer on, so "the trace's
+faithfulness" was **undefined** — and `scores_for_target(Trace(id))` returned nothing
+at all for a trace whose every span was scored. Resolved as follows; implemented in
+`src/rollup.rs`, served by `GET /v1/traces/{trace_id}/scores`.
+
+1. **Writing is unchanged, and the question is asked at read time.** A score on a span
+   means that span; a score on a trace means the trace. Nothing is promoted on write,
+   so no stored score changes meaning and there is nothing to migrate. The rollup runs
+   over whatever is stored at the moment it is asked — so a score attached later is
+   picked up with no rebuild.
+2. **Measured beats derived.** A score attached directly to the trace IS the answer; a
+   derived value never overrides what a human or an evaluator stated about the trace.
+3. **A derived value says so, and carries its `n`.** It comes back with
+   `measured: false`, the function that produced it, the contributor count and the
+   contributing span ids. A rolled-up number is an inference, not a measurement; given
+   that evald ships Welch's-t gating and judge calibration precisely to avoid
+   overstating numbers, rendering a derived score identically to a measured one would
+   undercut the whole posture.
+4. **Absent stays absent.** A name nothing carries yields *no score* — never `0`, never
+   a fabricated pass. Same rule as a Tier-1 evaluator SKIPping a missing field.
+5. **A scored span is authoritative for its subtree.** For
+   `root → {retrieve, synthesize → {llm_1, llm_2}}`, if `synthesize` is scored *and* its
+   children are, averaging all three double-counts: the score on `synthesize` is *about*
+   what its children did. The walk therefore takes the **shallowest** carrier of each
+   name per branch and does not descend past it — per name, so one trace can roll
+   `faithfulness` from one depth and `toxicity` from another.
+6. **The combining function is per score name and declared, never inferred** (`--rollup
+   name=fn`): `mean | min | max | sum | all | any`. One global function cannot be right
+   for every metric — cost wants `sum`, a pass/fail wants `all`, a quality gate usually
+   wants `min` because one hallucinating step in a ten-step agent should fail the trace
+   and a mean dilutes it. Defaults: `mean` for numeric, `all` for boolean. Categorical
+   and free-text scores are skipped — there is no defensible mean of two category
+   labels.
+
+**RunItem attach point, per the above:** `RunItem` keeps `trace_id` as the durable
+link and `span_id` only where the task produced an unambiguous single span. A run's
+per-item score attaches to the **trace**, which makes it measured and therefore
+authoritative; the rollup is what answers for traces scored only at the span level.
+The 1:1 item↔trace assumption is thereby fine — it is item↔*trace*, never
+item↔*span*.
 
 ## 3. Crate stack
 
@@ -181,7 +218,7 @@ before Beta; tie the RunItem attach point to this decision.
 | `opentelemetry-proto` | 0.32.0 | prost wire types | single source of truth; don't hand-roll |
 | `prost` | 0.13.x | decode OTLP/HTTP-protobuf | same decode path |
 | `serde`/`serde_json` | 1.x | OTLP-JSON + JSON API | custom hex-id/int-enum/int64-string |
-| **hot tier** | benchmarked (§6) | WAL + recent-span index | **engine choice gated on a soak test — fjall LSM vs a plain segmented-WAL-of-Arrow-batches; for an append-mostly, query-elsewhere workload an LSM may be unnecessary** |
+| **hot tier** | none — in-process | WAL + recent-span index | **decided 2026-09-16: no LSM** (`HOT_TIER_DECISION.md`). The tier is a read cache over data the WAL has already made durable, sized by one compaction interval and capped by `--max-hot-spans`; an LSM's spill/recovery/indexing buys nothing at that window and costs a second on-disk format |
 | `datafusion`+`arrow`+`parquet` | df 54 / arrow+parquet 58 (df 54 depends on arrow/parquet 58.3 → one Arrow in the tree) | **cold query engine** | fastest single-node Parquet; **pure-Rust, no C++ → clean static musl** |
 | `redb` | 4.1.x | trace_id→partition index + watermark | pure-Rust COW B+tree, crash-safe txns; **not a drop-in LSM firehose buffer** |
 | `usearch` | latest | optional HNSW (Tier-2 semantic) | **behind a cargo feature; deferred; C++ core needs musl care** |
@@ -332,16 +369,46 @@ free**; judge-result caching keyed by (input,output,judge_version); CLI cost-est
 **judge calibration vs the user's own human labels** (`eval calibrate`: bias/MAE/RMSE/Pearson,
 paired-t CI on the bias, affine bias-correction, divergence "recalibrate" gate — offline, OSS);
 **online/sampled** eval off the ingest stream; Tier-2 `similar` + usearch behind a
-feature flag; ScoreConfig enforcement; **resolved score-rollup-up-the-tree semantics**
-(blocker from §2.3); richer SPA (run-compare diff, annotation queue). RAGAS-style
+feature flag; ScoreConfig enforcement; ✅ **score-rollup-up-the-tree semantics resolved
+and implemented** (§2.4); richer SPA (run-compare diff, annotation queue). RAGAS-style
 rail templates are version-sensitive — pin which versions' semantics we mirror.
 
+User-signal additions (from a 2026-07 sweep of public issue trackers and
+practitioner threads):
+
+- **CI-native gate output:** `eval run` / `eval compare` / `suite run` gain
+  `--output junit[:path]` (JUnit XML, so gate results render in the native
+  test-report views of GitHub/GitLab/Azure/Bitbucket CI) and a stable
+  machine-readable JSON report. Exit codes stay the source of truth.
+- **Judge scores are advisory by default:** LLM-judge results inform, but only
+  deterministic Tier-1 evaluators hard-fail a build unless the config opts a judge
+  into gating (`gate: true`) — a non-deterministic score should not flake CI.
+- **Legacy GenAI attribute normalization:** accept the deprecated indexed
+  `gen_ai.prompt.{i}.*` / `gen_ai.completion.{i}.*` span-attribute shape (still
+  emitted by widely deployed instrumentation such as OpenLLMetry) and normalize it
+  into the same `NormalizedSpan` messages as the structured
+  `gen_ai.input.messages` / `gen_ai.output.messages` shape; the pinned semconv
+  mapping carries both for as long as deployed SDKs emit them.
+- **OTLP/HTTP conformance tests:** lock in spec behavior the receiver already has
+  — the response `Content-Type` mirrors the request's (protobuf in → protobuf
+  out), correct OTLP error shapes, `Retry-After` on shed — as an explicit test
+  suite, so ingest keeps working with every language's stock exporter.
+- **Queryability guarantee, tested + documented:** every span attribute —
+  including ones evald doesn't map to a column — is queryable through `/v1/sql`
+  via `raw_attributes`, with no renaming or vendor prefix required; plus a docs
+  recipe for building a custom domain-specific viewer over the open Parquet
+  blocks (DuckDB / pandas / notebook).
+
 ### GA — v1.0.0
-**OSS core:** frozen on-disk Parquet/WAL format + migration tooling; retention by
+**OSS core:** frozen on-disk Parquet/WAL format + migration tooling ✅ **2026-09-16**
+(`docs/FORMAT.md`, `evald migrate`, and a committed format-1 data-dir the test suite reads
+every run); cold-to-cold compaction so the block count — and the open files a scan needs —
+stays bounded ✅ **2026-09-16** (`evald compact`, `tests/fd_ceiling.rs`); retention by
 partition-drop (local, free, **no artificial local cap**); stable HTTP/CLI API;
 semconv-version-pinned mapping with forward-compat tests. **GA gated behind a
 sustained-ingest + kill-9-crash-recovery + compaction-under-load soak test with
-fsync-correctness verification** (the single biggest storage risk — §6).
+fsync-correctness verification** ✅ **2026-09-14** (`tests/soak.rs`, `docs/SOAK.md` — the
+single biggest storage risk, §6).
 
 ## 6. Storage risks the design owns (not the libs')
 
@@ -354,11 +421,18 @@ fsync-correctness verification** (the single biggest storage risk — §6).
   **measured** ingest budget, with a **load-shed metric + SLO** because shedding will
   happen.
 - **Hot-tier maturity is High, not Med.** A 6-month-old new-on-disk-format LSM on the
-  crash-durable hot path is the single biggest storage risk. **Benchmark the LSM vs a
-  plain segmented-WAL-of-Arrow-batches before committing** — for an append-mostly,
-  query-elsewhere workload we may not need an LSM at all (a raw WAL + periodic Parquet
-  flush has bounded, predictable write amplification). `redb` is **not** a free swap
-  (B+tree, different write-amp under high small-write ingest).
+  crash-durable hot path is the single biggest storage risk. ✅ **Resolved 2026-09-16 by
+  not taking it** — `HOT_TIER_DECISION.md`. The shipped segmented WAL plus in-memory index
+  stays: the hot tier is a read cache over spans the WAL has already made durable, its size
+  is one compaction interval of ingest, and `--max-hot-spans` caps it by shedding rather
+  than growing. Measured at that bound — 1.9 KiB resident per 1 KiB span, 4.5 s to replay
+  1M spans, 40 ms for a trace lookup across them — every cost an LSM would remove is
+  negligible at a realistic window, while an LSM would add a second on-disk format and put
+  compaction stalls back on the ACK path. `redb` was never a free swap either (B+tree,
+  different write-amp under high small-write ingest). The one real consequence is a sizing
+  one, now in `docs/CONFIG.md`: the old 1M default implied ~1.8 GiB resident, so the
+  default bound is now 300,000 — ~852 MiB peak for the whole process, against the 1 GiB
+  limit the manifests set.
 - **Compaction atomicity is High, not Med** — see the explicit commit protocol §1.3.
 - **"Never drops under load" is false and removed.** The honest claim is
   durability-of-accepted-spans + explicit backpressure-and-shed (429/503), never

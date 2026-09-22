@@ -43,6 +43,62 @@ jobs:
       - name: Clippy (judge feature)
         run: cargo clippy --all-targets --features judge -- -D warnings
 
+  # A backup nobody has restored is a cron job producing files. This runs the documented
+  # recovery end to end on every push and asserts the property that matters: a restore
+  # loses NOTHING that was ACK'd before the backup point. Loss bounded by backup age is an
+  # RPO window; loss inside the backup point is a bug, and this is what would catch it.
+  #
+  # Verified to fail, not just to pass: omitting the WAL from the backup — the exact
+  # mistake docs/OPERATIONS.md warns against — drops spans that were ACK'd before the
+  # backup, and the drill exits non-zero.
+  restore-drill:
+    name: backup / restore drill
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the binary the drill drives
+        run: cargo build --bin evald
+      - name: Restore drill
+        run: ops/restore-drill.sh target/debug/evald
+
+  # PLAN.md §6's GA gate, and the project's own stated single biggest storage risk: sustained
+  # ingest + repeated kill -9 + compaction under load, with fsync-correctness verification.
+  # tests/crash_recovery.rs covers ONE crash; this covers the failures that only appear after
+  # several — a recovery that loses a little each time, a compaction that stops committing once
+  # it has been interrupted, a dedup that double-counts only after both tiers have been rebuilt.
+  #
+  # The run here is deliberately short so it gates every push. The GA gate is the same test at
+  # the duration in docs/SOAK.md; the assertions do not change with the clock.
+  #
+  # Verified to fail, not just to pass — all four properties were induced and caught
+  # (docs/SOAK.md "Proving the gate can refuse").
+  soak:
+    name: soak — sustained ingest + kill -9 + compaction
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Soak
+        env:
+          EVALD_SOAK_SECS: "45"
+          EVALD_SOAK_CYCLES: "3"
+          EVALD_SOAK_WORKERS: "4"
+          # NOT the test's own default of 20. At 20 a 45s run commits ~3,200 blocks, and the
+          # cold-tier read path opens one file per block, so on a runner with the common
+          # `ulimit -n 1024` the recovery query dies with EMFILE — the C13a ceiling this gate
+          # found, not a durability failure, but a red job either way. 500 keeps the run to
+          # ~150 blocks while still committing tens of them per cycle, so property 4 has
+          # plenty to assert on. See docs/SOAK.md.
+          EVALD_SOAK_SEAL: "500"
+        run: |
+          echo "fd limit on this runner: $(ulimit -n)"
+          cargo test --test soak -- --ignored --nocapture
+
   musl:
     name: static musl build (x86_64)
     runs-on: ubuntu-latest

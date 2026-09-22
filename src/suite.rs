@@ -67,6 +67,9 @@ pub struct SuiteOutcome {
     pub cases: Vec<CaseResult>,
     /// Fraction of cases that passed.
     pub pass_rate: f64,
+    /// The suite gate this outcome was judged against (`min_pass_rate`), so a report can say
+    /// what the pass rate was compared with.
+    pub min_pass_rate: f64,
     pub passed: bool,
 }
 
@@ -84,6 +87,7 @@ pub fn aggregate(cases: Vec<CaseResult>, min_pass_rate: f64) -> SuiteOutcome {
     SuiteOutcome {
         cases,
         pass_rate,
+        min_pass_rate,
         passed,
     }
 }
