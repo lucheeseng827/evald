@@ -1,0 +1,111 @@
+# evald console image — runs on the PUBLIC mirror (lucheeseng827/evald).
+#
+# Synced from the private monorepo to `.github/workflows/console-image.yml` (see .ossync.yaml).
+# Builds the standalone console (nginx serving the Vite bundle + a /v1 proxy) for linux/amd64 +
+# linux/arm64, pushes it to docker.io/mancube/evald-console and keyless-signs it.
+#
+#   • Called by release.yml on a `v*` tag, after the GitHub release.
+#   • Run by hand to (re)publish the console image for an existing tag without re-running the
+#     whole release: the binaries, crates.io and the formula are untouched.
+#
+# The frontend SOURCE is the tag's; the Dockerfile is this workflow's own ref's (github.sha: the
+# tag itself on a tag push, the branch head on a manual run). That is what lets a fixed
+# Dockerfile publish an already-cut tag: v0.4.0's arm64 build died under QEMU (`npm ci`, SIGILL)
+# and hung to the 6-hour limit, and its Dockerfile lives in the tag.
+
+name: console image
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      promote:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.4.0"
+        required: true
+      promote:
+        description: "Also tag :latest and update the Docker Hub overview (only safe for the newest tag)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_CONSOLE: docker.io/mancube/evald-console
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  docker-console:
+    name: console image
+    environment: cicd
+    runs-on: ubuntu-latest
+    # The build is a minute or two natively; a hang under emulation must not hold a runner
+    # for six hours again.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: The tag is a release tag
+        shell: bash
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$TAG' is not a release tag (vX.Y.Z or vX.Y.Z-pre)"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Checkout this workflow's Dockerfile
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .workflow-ref
+          sparse-checkout: frontend/Dockerfile
+          sparse-checkout-cone-mode: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Compute image tags
+        id: imgtags
+        env:
+          PROMOTE: ${{ inputs.promote }}
+        shell: bash
+        run: |
+          tags="${IMAGE_CONSOLE}:${TAG}"$'\n'"${IMAGE_CONSOLE}:${TAG#v}"
+          if [[ "$TAG" != *-* && "$PROMOTE" == "true" ]]; then tags="$tags"$'\n'"${IMAGE_CONSOLE}:latest"; fi
+          { echo "list<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build + push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: .workflow-ref/frontend/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.imgtags.outputs.list }}
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Cosign keyless-sign the image
+        env:
+          REF: ${{ env.IMAGE_CONSOLE }}@${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$REF"
+      - name: Update Docker Hub description
+        if: ${{ !contains(env.TAG, '-') && inputs.promote }}
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: mancube/evald-console
+          readme-filepath: ./docs/DOCKERHUB-CONSOLE.md

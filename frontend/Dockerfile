@@ -13,7 +13,10 @@
 #   docker run -p 8080:8080 -e EVALD_API_URL=http://my-evald:4318 mancube/evald-console
 
 # ---- build ----------------------------------------------------------------
-FROM node:22-alpine AS build
+# The bundle is static JS/CSS/fonts, the same on every platform, so this stage runs on the
+# builder's own platform. Under QEMU, arm64 `npm ci` crashed (SIGILL) and hung the v0.4.0
+# release build to the 6-hour limit; only the nginx stage below needs the target platform.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 WORKDIR /app
 # Install deps against the lockfile first for layer caching.
 COPY package.json package-lock.json ./
