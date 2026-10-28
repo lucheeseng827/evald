@@ -57,35 +57,51 @@ database, no Python.
 | `0.1.0` | first release — OTLP ingest + normalization, durable WAL→Parquet store, scores, offline `eval run`/`eval compare` with CI gating, SQL, embedded UI |
 | `*-rc.*` | pre-release smoke builds (not tagged `latest`) — don't use in production |
 
-Pin a version in production: `mancube/evald:0.3.0`.
+Pin a version in production: `mancube/evald:<version>`. From 0.4.0 every release is pushed as
+both `0.4.0` and `v0.4.0`, and the image is cosign-signed with its SBOM attested
+(`docs/OPERATIONS.md` § Verify what you pulled).
 
 ## Quick start
 
 The binary is the entrypoint, so the `docker` args are just `evald` subcommands (`serve` / `eval` / `query` / `version`). Mount a data dir for the durable store; everything stays local.
 
-```bash
-docker run --rm mancube/evald:0.3.0 version
-```
-
-**1. Run the store** — the OTLP/HTTP receiver + query API + embedded UI. Bind `0.0.0.0` inside the container (the default `127.0.0.1` isn't reachable from the host):
+**Create the data dir first, and run as its owner** (`--user`). The image runs as uid `65532`, which owns nothing on your machine or a CI runner, so it cannot create its store in a directory you mount: `serve` and `eval run` stop with `Permission denied (os error 13)`. And a bind-mounted directory that does not exist yet is created by Docker, as root, which `--user` alone does not fix — hence the `mkdir`.
 
 ```bash
-docker run --rm -p 4318:4318 \
-  -v "$PWD/evald-data:/data" \
-  mancube/evald:0.3.0 \
-  serve --otlp-http 0.0.0.0:4318 --data-dir /data
-# point your app's OTel SDK at http://127.0.0.1:4318, then open http://127.0.0.1:4318/
+docker run --rm mancube/evald version
 ```
+
+**1. Run the store** — OTLP/HTTP (and the UI) on 4318, OTLP/gRPC on 4317. From 0.4.0 that is what
+the image does with no command: it serves on both ports, inside the container on every interface,
+into the `/data` volume. A named volume needs no `--user`: `/data` belongs to the image's user.
+
+```bash
+docker run -d --name evald -p 127.0.0.1:4318:4318 -p 127.0.0.1:4317:4317 \
+  -v evald-data:/data mancube/evald
+# point your app's OTel SDK at http://127.0.0.1:4318 (or `evald connect otel-app`),
+# then open http://127.0.0.1:4318/. `docker stop evald` drains cleanly.
+```
+
+With a directory of your own instead, create it and run as its owner:
+
+```bash
+mkdir -p evald-data
+docker run -d -p 127.0.0.1:4318:4318 --user "$(id -u):$(id -g)" \
+  -v "$PWD/evald-data:/data" mancube/evald
+```
+
+Up to 0.3.x the image printed its version by default; there, pass
+`serve --otlp-http 0.0.0.0:4318 --data-dir /data` explicitly.
 
 **2. Gate CI on an offline eval** — score a JSONL dataset and exit non-zero on a regression:
 
 ```bash
-docker run --rm \
+docker run --rm --user "$(id -u):$(id -g)" \
   -v "$PWD:/work" -w /work \
-  mancube/evald:0.3.0 \
+  mancube/evald \
   eval run --config eval.yaml --data-dir /work/evald-data
 # then diff two runs, failing the build only on a statistically significant drop:
-docker run --rm -v "$PWD:/work" -w /work mancube/evald:0.3.0 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work mancube/evald \
   eval compare <run_a> <run_b> --data-dir /work/evald-data \
   --fail-on-regression --significance
 ```
@@ -93,18 +109,20 @@ docker run --rm -v "$PWD:/work" -w /work mancube/evald:0.3.0 \
 **3. Query the store with SQL** — DataFusion over the Parquet blocks ∪ scores:
 
 ```bash
-docker run --rm -v "$PWD/evald-data:/data" mancube/evald:0.3.0 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/evald-data:/data" mancube/evald \
   query "SELECT model, COUNT(*) n, SUM(total_tokens) tok FROM spans GROUP BY model" \
   --data-dir /data
 ```
 
-> **Permissions:** the image runs as nonroot (uid `65532`), so the mounted `/data` dir must be writable by that uid — e.g. `mkdir -p evald-data && chmod 777 evald-data` (or `chown 65532:65532 evald-data`) before the first run.
+> **Permissions:** the image runs as nonroot (uid `65532`), so the mounted `/data` dir must be writable by the user it runs as. The commands above use `--user "$(id -u):$(id -g)"` on a directory you created; on a host where it must stay uid 65532 (a shared volume, say), `chown 65532:65532 evald-data` instead. Avoid `chmod 777`: it makes the trace store world-writable.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `serve --otlp-http 0.0.0.0:4318 --data-dir <dir>` | OTLP/HTTP receiver + durable store + query/SQL API + embedded UI |
+| *(no command)* / `serve` | OTLP/HTTP + OTLP/gRPC receiver, durable store, query/SQL API, embedded UI (`/data`, both ports) |
+| `connect <tool>` | print the configuration that points `claude-code`, `codex`, `gemini-cli`, an `otel-app` or a `collector` at this evald |
+| `sessions --data-dir <dir>` | agent sessions: calls, tool calls, failures, cost |
 | `eval run --config <eval.yaml> --data-dir <dir>` | score a JSONL dataset; exit non-zero on a threshold regression (CI gate) |
 | `eval compare <runA> <runB> [--fail-on-regression] [--significance]` | diff two runs by evaluator; gate on a (statistically significant) regression |
 | `query "<SQL>" --data-dir <dir>` | read-only DataFusion SQL over `spans` ∪ `scores` |

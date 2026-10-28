@@ -170,6 +170,10 @@ impl UsageMissingReason {
     }
 }
 
+/// Span kinds that are never a model call, though they may name a model (see
+/// [`NormalizedSpan::is_llm_span`]; `crate::latency`'s SQL predicate mirrors it).
+pub const NOT_MODEL_CALLS: [&str; 3] = ["AGENT", "CHAIN", "TOOL"];
+
 impl NormalizedSpan {
     /// Span wall-clock duration in nanoseconds (saturating).
     pub fn duration_ns(&self) -> u64 {
@@ -180,9 +184,16 @@ impl NormalizedSpan {
     /// token usage is worth flagging. Retriever/tool/chain/embedding-less spans that
     /// legitimately have no tokens are excluded, so the diagnostic does not cry wolf.
     pub fn is_llm_span(&self) -> bool {
-        // OpenInference marks the kind explicitly.
-        if matches!(self.oi_kind.as_deref(), Some(k) if k.eq_ignore_ascii_case("LLM")) {
-            return true;
+        if let Some(k) = self.oi_kind.as_deref() {
+            // OpenInference marks the kind explicitly.
+            if k.eq_ignore_ascii_case("LLM") {
+                return true;
+            }
+            // An agent, a chain or a tool is not a model call, whatever model it names (an
+            // agent span names its model; its usage is its model calls', `crate::agent`).
+            if NOT_MODEL_CALLS.iter().any(|n| k.eq_ignore_ascii_case(n)) {
+                return false;
+            }
         }
         // A resolved model name is a strong LLM-call signal for gen_ai/OTel spans that
         // don't carry an OpenInference kind.

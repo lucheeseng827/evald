@@ -1,0 +1,39 @@
+# evald and its console, the store on a named volume.
+#
+#   docker compose up -d
+#
+# Then point your apps at it (`evald connect otel-app` prints the variables, or
+# `evald connect claude-code` for Claude Code): OTLP/HTTP on http://localhost:4318, OTLP/gRPC on
+# localhost:4317. The built-in UI is http://localhost:4318/, the console http://localhost:8080/.
+#
+# The ports are published on 127.0.0.1 only, like evald's own default. To expose them on the
+# network, set EVALD_AUTH_TOKEN first (16+ printable characters) and change the bindings.
+# Pin a release with EVALD_VERSION=0.4.0 (the default follows `latest`).
+services:
+  evald:
+    image: docker.io/mancube/evald:${EVALD_VERSION:-latest}
+    # The image serves by default (0.4.0+): both ports, the store in /data.
+    ports:
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:4317:4317"
+    volumes:
+      - evald-data:/data
+    environment:
+      EVALD_AUTH_TOKEN: ${EVALD_AUTH_TOKEN:-}
+      EVALD_RETENTION: ${EVALD_RETENTION:-}
+    restart: unless-stopped
+    # evald drains on SIGTERM; give in-flight requests time to finish.
+    stop_grace_period: 30s
+
+  console:
+    image: docker.io/mancube/evald-console:${EVALD_VERSION:-latest}
+    environment:
+      EVALD_API_URL: http://evald:4318
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - evald
+    restart: unless-stopped
+
+volumes:
+  evald-data: {}

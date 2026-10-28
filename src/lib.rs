@@ -40,25 +40,36 @@
 //!   `/v1/runs/{id}/compare`).
 //! - **ui** — an embedded SPA (rust-embed) served with SPA fallback.
 
+pub mod agent;
 pub mod auth;
 pub mod blob;
 pub mod calibrate;
+pub mod calls;
+pub mod claude_code;
+pub mod codex;
+pub mod connect;
 pub mod cost;
 pub mod dataset;
+pub mod demo;
 pub mod disk;
+pub mod doctor;
 pub mod eval;
 pub mod evalevent;
+pub mod gemini_cli;
 pub mod grpc;
 pub mod ingest;
 pub mod judge;
 pub mod junit;
 pub mod latency;
+pub mod logs;
+pub mod mcp;
 pub mod metrics;
 pub mod model;
 pub mod normalize;
 pub mod price;
 pub mod redact;
 pub mod rollup;
+pub mod sessions;
 pub mod sql;
 pub mod stats;
 pub mod store;

@@ -43,22 +43,41 @@ pub const TTFT_ATTRS: [(&str, f64); 4] = [
 /// The time to first token of a span in seconds, if it carries a usable one. A non-numeric,
 /// negative or non-finite value counts as absent.
 pub fn ttft_seconds(attrs: &BTreeMap<String, serde_json::Value>) -> Option<f64> {
-    TTFT_ATTRS.iter().find_map(|(key, to_seconds)| {
-        let raw = attrs.get(*key)?;
-        let v = raw
+    // One pass over the attributes rather than a lookup per name. This is called for every LLM
+    // span the writer commits, and the common span carries none of these names: four
+    // `BTreeMap::get`s then cost four tree descents, each comparing whole strings, where one pass
+    // compares each attribute against four names and an unequal length settles almost all of it.
+    // The name earliest in `TTFT_ATTRS` still wins, so a span carrying two is read the same way.
+    let mut best: Option<(usize, f64)> = None;
+    for (key, raw) in attrs {
+        let Some(i) = TTFT_ATTRS.iter().position(|(name, _)| *name == key) else {
+            continue;
+        };
+        if best.is_some_and(|(seen, _)| seen <= i) {
+            continue;
+        }
+        let Some(v) = raw
             .as_f64()
-            .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
-        (v.is_finite() && v >= 0.0).then_some(v * to_seconds)
-    })
+            .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        else {
+            continue;
+        };
+        if v.is_finite() && v >= 0.0 {
+            best = Some((i, v * TTFT_ATTRS[i].1));
+        }
+    }
+    best.map(|(_, v)| v)
 }
 
 /// SQL predicate for "this span is an LLM span"; mirrors [`crate::NormalizedSpan::is_llm_span`]
 /// (a test holds the two together). `strpos` rather than `LIKE`, because `_` is a `LIKE`
 /// wildcard and these keys are full of them.
-const LLM_PREDICATE: &str = "(upper(oi_kind) = 'LLM' OR model IS NOT NULL \
-     OR strpos(raw_attributes_json, '\"gen_ai.request.') > 0 \
-     OR strpos(raw_attributes_json, '\"gen_ai.response.') > 0 \
-     OR strpos(raw_attributes_json, '\"gen_ai.usage.') > 0)";
+const LLM_PREDICATE: &str = "(upper(oi_kind) = 'LLM' \
+     OR ((oi_kind IS NULL OR upper(oi_kind) NOT IN ('AGENT', 'CHAIN', 'TOOL')) \
+         AND (model IS NOT NULL \
+              OR strpos(raw_attributes_json, '\"gen_ai.request.') > 0 \
+              OR strpos(raw_attributes_json, '\"gen_ai.response.') > 0 \
+              OR strpos(raw_attributes_json, '\"gen_ai.usage.') > 0)))";
 
 /// Most spans carrying one TTFT attribute the report will hold in memory (each row is a few
 /// short strings). Past it the report errors instead of silently computing percentiles over
@@ -103,7 +122,7 @@ impl Dimension {
 }
 
 /// One group's row of the report. Durations are milliseconds.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct LatencyRow {
     pub attribution: String,
     pub spans: u64,

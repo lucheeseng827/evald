@@ -1,0 +1,98 @@
+# evald as a GitHub Action: install a pinned evald, run an eval or a suite, gate the job on it.
+#
+#   - uses: lucheeseng827/evald@v0.4.0
+#     with:
+#       config: evals/eval.yaml
+#
+# The job fails exactly when evald's gate does (exit 1), or when evald could not run (exit 2).
+# The JUnit report renders in test-report tooling; the run's output lands in the job summary.
+# Linux and macOS runners (the installer has no Windows path). Nothing here calls out beyond
+# downloading the release, and the archive is checksum-verified (and signature-verified when
+# cosign is on the runner) before it is installed.
+name: evald eval gate
+description: Install evald, run an offline eval or suite, and gate the job on it.
+author: evald
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  config:
+    description: The eval YAML (`evald eval run --config`) or suite YAML (`evald suite run --config`).
+    required: true
+  command:
+    description: "`eval` (evald eval run) or `suite` (evald suite run)."
+    default: eval
+  version:
+    description: The evald release to install, e.g. v0.4.0. `latest` follows the newest release; pin it for a reproducible gate.
+    default: latest
+  data-dir:
+    description: Where `eval run` keeps the run's scores (ignored by `suite`).
+    default: .evald-data
+  junit:
+    description: Path for the JUnit XML report.
+    default: evald-junit.xml
+  args:
+    description: Extra arguments for the command, split on whitespace (e.g. `--estimate`).
+    default: ""
+
+outputs:
+  exit-code:
+    description: evald's exit code (0 passed, 1 the gate failed, 2 evald could not run).
+    value: ${{ steps.run.outputs.exit-code }}
+  junit:
+    description: Path of the JUnit XML report.
+    value: ${{ inputs.junit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install evald
+      shell: bash
+      env:
+        EVALD_VERSION: ${{ inputs.version }}
+        EVALD_INSTALL_DIR: ${{ runner.temp }}/evald-bin
+        INSTALLER: ${{ github.action_path }}/install.sh
+      run: |
+        set -euo pipefail
+        sh "$INSTALLER"
+        echo "$EVALD_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Run the gate
+      id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        CONFIG: ${{ inputs.config }}
+        DATA_DIR: ${{ inputs.data-dir }}
+        JUNIT: ${{ inputs.junit }}
+        ARGS: ${{ inputs.args }}
+      run: |
+        set -uo pipefail
+        case "$COMMAND" in
+          eval) cmd=(evald eval run --config "$CONFIG" --data-dir "$DATA_DIR" --junit "$JUNIT") ;;
+          suite) cmd=(evald suite run --config "$CONFIG" --junit "$JUNIT") ;;
+          *) echo "::error::command must be eval or suite, not '$COMMAND'"; echo "exit-code=2" >> "$GITHUB_OUTPUT"; exit 2 ;;
+        esac
+        # Extra arguments split on whitespace, deliberately (no eval, no globbing).
+        set -f
+        # shellcheck disable=SC2206
+        extra=($ARGS)
+        set +f
+        out="$RUNNER_TEMP/evald-output.txt"
+        # `${extra[@]+...}`: Bash 3.2 (macOS runners) calls an empty array unbound under set -u.
+        "${cmd[@]}" ${extra[@]+"${extra[@]}"} 2>&1 | tee "$out"
+        code=${PIPESTATUS[0]}
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        {
+          case "$code" in
+            0) echo "### evald: passed" ;;
+            1) echo "### evald: the gate failed" ;;
+            *) echo "### evald: could not run (exit $code)" ;;
+          esac
+          echo
+          echo '```text'
+          tail -n 200 "$out"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit "$code"

@@ -15,9 +15,16 @@
 //!   the WAL but not yet flushed to a block).
 //! - `scores` — an in-memory `MemTable` of the redb score store.
 //!
-//! `spans` is then a **view** over `hot_spans ∪ cold_spans`, deduped by
-//! `(trace_id, span_id)` (hot wins) — the same hot/cold dedup the read API does, so a
-//! query never double-counts or misses a span across an in-flight compaction.
+//! `spans` is then a **view** over `hot_spans ∪ cold_spans` with one row per
+//! `(trace_id, span_id)` within the hot tier, within a block, and across the two (hot
+//! wins), so a span sent twice counts once and a query never misses one across an
+//! in-flight compaction. The hot table holds one copy of each span
+//! ([`Store::hot_spans`]); a flush writes one copy per WAL segment and a merge one per
+//! chunk, so a block holds one; and a hot span suppresses its cold copies. Copies in two
+//! blocks, flushed from two segments, count twice until a merge puts them in one block:
+//! deduping across blocks here would hold every cold key in memory and keep a filter on
+//! `start_unix_nano` from reaching the scan, where the anti-join below streams the cold
+//! tier against the hot keys alone.
 //!
 //! Only read statements are accepted — a `Query` (`SELECT` / `WITH`) or a plain `EXPLAIN`
 //! (not `EXPLAIN ANALYZE`, which executes). The check is on the parsed statement type, not
@@ -272,7 +279,8 @@ async fn register_spans(ctx: &SessionContext, store: &Store) -> anyhow::Result<(
     let hot_table = MemTable::try_new(schema, vec![hot_batches])?;
     ctx.register_table("hot_spans", Arc::new(hot_table))?;
 
-    // spans = hot ∪ cold, deduped by (trace_id, span_id) — hot wins, matching the read API.
+    // spans = hot ∪ cold. `hot_spans` holds one copy of each span and a block holds one, so
+    // only a cold copy of a hot span is left to drop: hot wins, as on the read API.
     ctx.sql(
         "CREATE VIEW spans AS \
          SELECT * FROM hot_spans \
@@ -655,5 +663,91 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r.rows[0]["n"], 1);
+    }
+
+    /// The rows `spans` holds for `span_id`, the spans `evald cost` counts (every span in
+    /// the store), and the rows of the cold tier itself.
+    async fn counted(store: &Store, span_id: &str) -> (u64, u64, u64) {
+        let n = |sql: String| async move {
+            query(store, &sql, 10).await.unwrap().rows[0]["n"]
+                .as_u64()
+                .unwrap()
+        };
+        let in_view = n(format!(
+            "SELECT COUNT(*) AS n FROM spans WHERE span_id = '{span_id}'"
+        ))
+        .await;
+        let in_cold = n("SELECT COUNT(*) AS n FROM cold_spans".to_string()).await;
+        let cost = crate::cost::cost_rows(store, crate::cost::Dimension::Model, 100)
+            .await
+            .unwrap();
+        let costed = cost.iter().map(|r| r["spans"].as_u64().unwrap()).sum();
+        (in_view, costed, in_cold)
+    }
+
+    /// A span sent twice, by its client or by an exporter retrying a request evald had
+    /// already taken, is one row while both copies are hot, and one row once they are
+    /// flushed together: the block holds one copy.
+    #[tokio::test]
+    async fn a_span_sent_twice_is_one_row_hot_and_in_its_block() {
+        let s = test_span("t", "twice", 1_700_000_000_000_000_000);
+        let (store, _d) = store_with(vec![s.clone()], vec![]).await;
+        store.append(vec![s]).await.unwrap();
+        assert_eq!(counted(&store, "twice").await, (1, 1, 0), "both copies hot");
+
+        store.seal_now().await.unwrap();
+        store.compact_now().await.unwrap();
+        assert_eq!(
+            counted(&store, "twice").await,
+            (1, 1, 1),
+            "flushed together: one row in the block"
+        );
+        assert_eq!(
+            store.query(None, 10).unwrap().len(),
+            1,
+            "the REST read agrees"
+        );
+    }
+
+    /// Copies flushed from two WAL segments land in two blocks, and become one row when a
+    /// merge puts them in one block. Until then the view counts both: deduping across blocks
+    /// at query time would hold every cold key in memory and stop a time filter reaching
+    /// the scan, so docs/API.md says this is when copies are counted twice.
+    #[tokio::test]
+    async fn copies_in_two_blocks_become_one_row_when_merged() {
+        let s = test_span("t", "again", 1_700_000_000_000_000_000);
+        let (store, _d) = store_with(vec![s.clone()], vec![]).await;
+        store.seal_now().await.unwrap();
+        store.compact_now().await.unwrap();
+        store.append(vec![s]).await.unwrap();
+        assert_eq!(
+            counted(&store, "again").await,
+            (1, 1, 1),
+            "hot suppresses its cold copy"
+        );
+        store.seal_now().await.unwrap();
+        store.compact_now().await.unwrap();
+        assert_eq!(store.cold_block_count().unwrap(), 2);
+        assert_eq!(
+            counted(&store, "again").await,
+            (2, 2, 2),
+            "two blocks, one copy each, until they merge"
+        );
+
+        store
+            .merge_now(crate::store::MergeScope::Full, false)
+            .await
+            .unwrap();
+        assert_eq!(store.cold_block_count().unwrap(), 1);
+        assert_eq!(
+            counted(&store, "again").await,
+            (1, 1, 1),
+            "merged: one row in one block"
+        );
+        assert_eq!(
+            store.query(None, 10).unwrap().len(),
+            1,
+            "the REST read agrees"
+        );
     }
 }

@@ -4,6 +4,10 @@
 # path-deps on `..`), and a developer with a populated ee/target would otherwise ship tens
 # of gigabytes of build output into the daemon as context.
 **/target
+# Terraform provider binaries from `terraform init`: hundreds of MB per module, re-fetched by
+# init, and never part of an image. A build after a local `terraform test` would otherwise
+# copy them into the daemon as context.
+**/.terraform
 .git
 evald-data
 node_modules

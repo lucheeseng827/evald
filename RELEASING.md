@@ -4,14 +4,26 @@ Releases are cut by tag. `.github/workflows/release.yml` does the rest.
 
 ## Cut a release
 
-1. Bump `version` in `Cargo.toml`, move the `CHANGELOG` `[Unreleased]` entries under the new
+1. Refresh the built-in price table (`src/price_baseline.json`, a trimmed copy of LiteLLM's), so
+   the release prices the models that shipped since the last one:
+   ```bash
+   python scripts/gen_price_baseline.py        # the latest upstream commit, via the gh CLI
+   # or, without the GitHub API, from a clone (a blob-less shallow one is enough):
+   git clone --filter=blob:none --no-checkout --depth 50 https://github.com/BerriAI/litellm /tmp/litellm
+   python scripts/gen_price_baseline.py --clone /tmp/litellm
+   cargo test
+   ```
+   It prints how many models were added, dropped upstream and repriced. Say so in the
+   `CHANGELOG`: a model upstream dropped is no longer priced, unless an operator's
+   `--price-table` names it.
+2. Bump `version` in `Cargo.toml`, move the `CHANGELOG` `[Unreleased]` entries under the new
    version, land on `main`.
-2. Tag and push:
+3. Tag and push:
    ```bash
    git tag v0.1.0
    git push origin v0.1.0
    ```
-3. The `release` workflow then, on that tag:
+4. The `release` workflow then, on that tag:
    - **builds** static-musl (`x86_64`/`aarch64`), macOS (`x86_64`/`arm64`), and Windows
      (`x86_64`) binaries — each archived as `evald-<target>.{tar.gz,zip}` with a `.sha256`;
    - **publishes** the GitHub release with every artifact + an aggregated `SHA256SUMS`;

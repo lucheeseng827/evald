@@ -1,0 +1,5 @@
+crewai==1.15.28
+openinference-instrumentation-crewai==1.1.21
+openinference-instrumentation-openai==0.1.65
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1

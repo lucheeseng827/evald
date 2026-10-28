@@ -6,6 +6,297 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-28
+
+"Plugs in": evald receives what the AI tools a developer already runs emit (Claude Code, Codex,
+Gemini CLI, the agent frameworks) with no code change. Cut from its own commit (#1594, plus the
+price-table refresh and S4.1 from #1644); 0.5.0 follows from `main`.
+
+### Added
+- **A clean machine to a coding agent's first session, checked in CI.**
+  `scripts/clean-machine.py` runs the README's quick start line by line, as written, on a bare
+  `ubuntu:24.04` with no Rust and no clone, only curl and CA certificates. `install.sh` installs a
+  static build through its checksum check, then `evald serve` and `evald connect claude-code`
+  run, then a real Claude Code whose model calls go to the recipes' stub provider. The check
+  requires the session that run records: a model call, its model, tokens and cost. It refuses a
+  quick start that takes more than three commands before the agent. The mirror's CI runs it after
+  its static musl build, on every change; the run in the container takes about 10 s.
+- **Codex CLI and Gemini CLI, mapped** (`ROADMAP-0.4-0.6.md` 4.2; Claude Code's came first).
+  Each tool's events become the sessions Claude Code's do: one LLM span per model call (model,
+  tokens, priced), one TOOL span per tool call (an error status when it failed or was refused),
+  a trace per turn under a `*.user_prompt` marker, and MCP tools named `mcp__<server>__<tool>`
+  whichever tool called them. Written against what Codex 0.163.0 and Gemini CLI 0.65.0 send:
+  a real session of each, captured against the recipes' stub provider and a stub MCP server
+  (`scripts/capture-coding-agent.sh`, no key, no network), committed under
+  `tests/fixtures/{codex,gemini-cli}/`. Then checked live: each CLI configured from
+  `evald connect`, into a real `evald serve`, over gRPC and HTTP. What each tool sends that
+  matters:
+  - **Codex**: its usage arrives on the stream's `response.completed` record, outside any span
+    and usually in a later export than its request; evald remembers each conversation's last
+    request (bounded, per node) to give the call its start. Its tokens are OpenAI's (cached
+    tokens inside the input). A command that exits non-zero is `success = true` to Codex;
+    evald says `exit code N` when the output preview shows it. Every `tool_result` carries the
+    call's arguments in full and up to 2 KiB of its output by default.
+  - **Gemini CLI**: every call is a trace of its own, so evald places by turn. The thinking
+    tokens come on top of the output and are priced once. `logPrompts` defaults to true, and
+    every record carries the command line (`gemini -p "..."`'s prompt) as a resource attribute,
+    which evald does not keep. Its spans are always sent, with its 31 KB system prompt each.
+  - Both tools' own spans are kept but never counted, and stay out of the session rollup: a
+    call and a turn count once with every signal on.
+- **`evald connect codex`** (an `[otel]` table for `~/.codex/config.toml`: events over gRPC or
+  HTTP, `log_user_prompt = false`, `tool_result = { max_bytes = 0 }` to keep tool output out:
+  privacy first, at the cost of a failed command's exit code, which is in that output;
+  `ROADMAP-0.4-0.6.md` D11)
+  and **`evald connect gemini-cli`** (variables or a `settings.json` block: `logPrompts` off,
+  and `OTEL_TRACES_SAMPLER=always_off`, since its spans repeat the events at 48 KB a call).
+- **`scripts/capture-coding-agent.sh codex|gemini-cli <dir>`**: the capture, repeatable for a
+  new version. `scripts/otlp-fixture.py` learned the tools' ids, chunked and gzip bodies, and
+  `--path`, `--keep-spans` and `--max-string`.
+- **OTLP logs in: `POST /v1/logs` and the gRPC `LogsService`.** Logs are how coding agents send
+  their per-request facts, and the transport the GenAI conventions give
+  `gen_ai.evaluation.result`. evald is not a log store: a recognised record becomes an
+  ordinary span or score (format 1 is unchanged), and every other record is acknowledged,
+  counted and dropped. `--logs all` keeps those too, as zero-duration spans; `--logs off`
+  keeps nothing. `evald_log_records_total{outcome}` accounts for every record.
+  - `gen_ai.evaluation.result` log records become scores, mapped as the span event is, on
+    the span (or trace) the record's trace context names.
+  - The traces and logs doors, HTTP and gRPC, now share one ingest core
+    (`Store::ingest_batch`), so the four paths cannot drift apart.
+- **Claude Code, mapped from what it actually sends.** Its events become spans:
+  `api_request` an LLM span with model, tokens, Claude Code's own cost, duration and time to
+  first token; `tool_result` and rejected `tool_decision` TOOL spans; `user_prompt` a turn
+  marker. Each turn is one trace. The mapping is tested against telemetry captured from
+  Claude Code 2.1.306 (`tests/fixtures/claude-code/`), and checked live: real Claude Code
+  sending events over gRPC and spans over HTTP/protobuf into `evald serve`.
+  - **Its spans now carry tokens.** Claude Code names them `input_tokens`,
+    `output_tokens`, `cache_read_tokens` and `cache_creation_tokens`, not
+    `gen_ai.usage.*`, so a `claude_code.llm_request` span previously arrived with no
+    tokens and no cost.
+  - **A traced tool's execution span no longer reads as a second tool call.** It carries
+    the call's `gen_ai.tool.call.id`, which made evald classify it TOOL.
+  - **One call, one span, with both signals on.** The event and the span describing one API
+    call get the same span id, derived from Claude Code's `request_id`, and the second to
+    arrive is dropped at ingest. Cost, tokens and `/metrics` count each call once
+    (`evald_duplicate_calls_dropped_total`). A tool call can still appear twice when its
+    event arrives before its span (a tool span has children, so it is never dropped);
+    `docs/INSTRUMENTATION.md` says how to tell the copies apart.
+- **`evald sessions`, and a richer `GET /v1/sessions/{id}`.** A session now reads as what
+  an agent did: LLM calls and their errors, distinct tool calls and their failures (a tool
+  reported on two signals counts once), cost, tokens, wall time, and the models and tools it
+  used. The existing fields are unchanged.
+- **`evald connect <tool>`.** It prints the exact configuration that points `claude-code`, any
+  OpenTelemetry `otel-app` or an OTel `collector` fan-out at this evald, for gRPC or HTTP, with
+  or without traces, as shell exports or a Claude Code `settings.json` block. It never prints
+  a token.
+- **A GitHub Action.** `uses: lucheeseng827/evald@<tag>` installs a pinned evald with the verified
+  installer, runs `eval run` or `suite run` with a JUnit report, puts the output in the job
+  summary, and fails the job exactly when evald's gate does (outputs: `exit-code`, `junit`).
+  Inputs reach the shell only through `env`, never interpolated into the script.
+- **`evald demo` and `evald doctor`.**
+  - `demo` writes a fresh store to look at before any app sends anything: a Claude Code
+    session, a small RAG app's traces with one failed call, and eval scores, all from the last
+    half hour. Seeing a trace no longer needs a git clone and a Rust toolchain
+    (`cargo run --example`). It refuses a directory that already holds data.
+  - `doctor` checks what `serve` would start with and prints a fix for each problem: the data
+    dir, persistence, free disk, the ports, a listener exposed without auth, the price
+    table's age, outbound calls. It connects nowhere and opens no store, and exits `1` when a
+    check fails.
+- **`install.sh`.** `curl -fsSL …/install.sh | sh` downloads the release archive for the
+  machine. It refuses to install unless the archive's checksum is listed in the release's
+  `SHA256SUMS`, and, when `cosign` is installed, unless that file was signed by evald's release
+  workflow. Then it installs to `~/.local/bin` without root. `--version` pins a release,
+  `--dir` picks the location, and `EVALD_DOWNLOAD_BASE` points it at an internal mirror or a
+  local directory for air-gapped hosts. Checked against the real v0.3.0 release, signature
+  included, and against a tampered archive, an unlisted one, a missing `SHA256SUMS` and a
+  signature for another file: each is refused with nothing installed.
+- **An install section in the README, and `GET /v1/sessions`.** The README had no install
+  section. It now covers the script, Homebrew, cargo-binstall, crates.io, Docker, Windows and
+  mirrors, then the three commands from nothing to a coding agent's sessions. Those sessions
+  are read from a running server with `GET /v1/sessions`, the list `evald sessions --json`
+  prints; the CLI cannot open a store a server holds.
+- **CI checks every relative link in the published docs.** `scripts/check-doc-links.py` runs
+  over the staged mirror cut (`evald-ee-guard.yml`) and in the mirror's CI. It found five links
+  to a document the mirror does not publish.
+- **`compose.yaml` and `ops/evald.service`.** Compose runs evald and the console with the
+  store on a named volume and the ports on `127.0.0.1`. The systemd unit runs under its own
+  dynamic user with nothing writable but `/var/lib/evald`, and takes settings and the token
+  from `/etc/evald/evald.env`.
+- **Signed images.** The evald and console images are cosign-signed by digest (keyless, the
+  workflow's identity) and the evald image carries an attested SPDX SBOM, as the archives
+  already did. Every release is tagged both `0.4.0` and `v0.4.0`.
+- **`scripts/otlp-fixture.py`.** A minimal OTLP/HTTP sink that saves what a tool sends, and a
+  scrubber that replaces every account, person, machine, session and request identifier with
+  a stable placeholder before a capture becomes a fixture. This is how the Claude Code
+  fixtures were made, and how the next dialect's will be.
+- **CI checks that the default build cannot make an outbound call.**
+  `scripts/check-no-network.sh` fails if the resolved dependency graph of the default
+  feature set gains an HTTP-client library or a TLS stack, or if `src/` constructs an
+  outbound connection (std/tokio sockets, a tonic `Channel`, a hyper client). Its
+  `--selftest` runs the same check on the opt-in `judge` build and requires it to be
+  flagged, so the check is known to fail when it should. One thing is present and stated
+  rather than hidden: tonic's plaintext gRPC client code is compiled in (opentelemetry-proto
+  turns it on), and nothing in evald constructs it.
+
+- **Tested recipes for seven agent frameworks** (`examples/recipes/`): LangGraph, the
+  OpenAI Agents SDK, Pydantic AI, CrewAI, the LiteLLM proxy, the Vercel AI SDK 7 and the
+  Claude Agent SDK. Each is a small agent with one tool and the few lines that send its
+  telemetry to evald. CI runs every one against a stub OpenAI- and Anthropic-compatible
+  provider (no key, no network) and checks evald's reading of what arrived: model, tokens and
+  cost on the model calls, the tool call under `gen_ai.tool.name`, and no usage on any other
+  span. Writing them found three of the fixes below, and a LiteLLM release pulled from PyPI
+  the hour it was pinned.
+- **Agent, tool and MCP attributes, read one way.** A tool or agent span that names its
+  tool, call or agent only by an alias (OpenInference's `tool.name` / `tool_call.id` /
+  `agent.name`, the Vercel AI SDK's `ai.toolCall.*`, Claude Code's `tool_name`) also gets the
+  `gen_ai.*` key at ingest; the alias stays. An MCP `tools/call` span (`mcp.method.name`) is a
+  tool call. `src/agent.rs` has the spellings.
+- **Trajectory metrics, judge-free.** The session rollup (`GET /v1/sessions/{id}`,
+  `evald sessions`) adds `agents`, `steps_per_trace` (model calls per trace),
+  `tool_error_rate`, and repeat detection: `repeated_tool_calls`, `longest_repeat_run` and
+  `loop_suspected` (three identical tool calls in a row, same tool and arguments, in one
+  trace). Only calls that carry their arguments can repeat, so a tool that reports none never
+  raises a false alarm. A call traced at two layers (a framework's tool span and the MCP span
+  inside it) counts once. `evald sessions` prints `steps` and `loop` columns.
+  `/metrics` adds `evald_tool_calls_total` and `evald_tool_call_errors_total` by tool and
+  service (64 tool names, 512 pairs, then `other`). Whether a session *succeeded* stays
+  yours to define; join it to the session id in SQL.
+- **evald is an MCP server.** `POST /mcp` on `evald serve` (Streamable HTTP, JSON responses)
+  and `evald mcp --data-dir` on stdio answer a coding agent's questions about your own store:
+  `sql`, `get_trace`, `list_sessions`, `get_session`, `cost_report`, `latency_report`,
+  `compare_runs`, `failing_items`. Read-only unless `serve --mcp-allow-writes` /
+  `mcp --allow-writes`, which adds `add_score`. `/mcp` sits behind the bearer gate and refuses
+  a browser `Origin` from another site. Long strings are cut at 2,000 characters so one trace
+  cannot fill the agent's context. Checked with the official MCP Python SDK over both
+  transports and with Claude Code (`claude mcp add --transport http evald
+  http://127.0.0.1:4318/mcp` connects). The server is the obvious place for it: the store's
+  lock is exclusive, so a stdio server could not read the store a running `serve` holds.
+- **The load generator sends logs.** `bench/loadgen --signal logs` posts Claude Code
+  `api_request` events to `/v1/logs`, one model call per record, and `bench/ab.sh` takes
+  `SIGNAL=logs`.
+
+### Changed
+- **The built-in price table is LiteLLM's of 2026-10-21** (`159b5b2f`; it was `2b7fe878` of
+  2026-09-21). It adds 384 models, among them Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5
+  (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, and their Bedrock, Vertex and
+  Azure names), and reprices 75: Claude Sonnet 4.5 no longer has an above-200k-tokens tier, and
+  Bedrock's Mistral Large 2402 is half price. It drops 687 models LiteLLM retired, such as Claude
+  3 Haiku and Sonnet on Bedrock, and o1-preview and GPT-3.5 Turbo 0125 on Azure. A dropped model's
+  spans are no longer priced unless they carry their own cost or `--price-table` names the model;
+  costs already stored are unchanged. `scripts/gen_price_baseline.py --clone <dir>` refreshes the
+  table from a git clone when the GitHub API is out of reach, and `RELEASING.md` now has the
+  refresh as a release step.
+- **A log record's event name is its `event.name` attribute first**, then the OTLP `event_name`
+  field. Rust's `opentelemetry-appender-tracing` puts a `tracing` callsite in the field (Codex
+  sends `event otel/src/events/session_telemetry.rs:1132`); an emitter that sets both to a
+  real name sets them alike.
+- **Ingest throughput is unchanged from 0.3.0** (the 0.4.0 bar: within 5 %). Interleaved A/B,
+  8 rounds, release builds with the shipped profile from one lockfile, 4 vCPU, data on disk
+  (`bench/ab.sh`, `docs/BENCH-AB-GUIDE.md`): traces at 32 connections × 10 spans/request
+  46,149 → 46,628 spans/s (+1.0 %, B ≥ A in 4/8 rounds); at 32 × 100, 24,206 → 23,451 spans/s
+  (−3.1 %, 3/8; that cell ranged 17k–31k on both binaries, fsync-bound on that disk). Logs,
+  new in this release, measured the same way (one Claude Code `api_request` event per record,
+  each becoming one model-call span): 23,800 records/s at 32 × 10 (22.7k–26.0k) and
+  30,500 at 32 × 100 (28.4k–32.5k), no request refused.
+- **`docker run mancube/evald` serves.** With no command the image now runs `serve` on both
+  ports (4318 HTTP and UI, 4317 gRPC, both exposed) into a `/data` volume owned by the image's
+  user, so a fresh named volume works without `--user`. The defaults are `EVALD_*` variables,
+  not flags, so `version`, `eval run …` and an explicit `serve …` work as before. It used to
+  print the version and exit. Smoke-tested in the release job: it serves, `docker stop`
+  drains to exit 0, and a restart on the same volume keeps the data.
+- **Exit code `2` when evald cannot run.** An invalid flag, a missing or malformed config or
+  dataset, or a store that will not open now exits `2`, and a failed gate still exits `1`.
+  Both used to be `1`, so CI could not tell a regression from a typo. Scripts that test for a
+  non-zero exit are unaffected. The contract is tested through the binary
+  (`tests/cli_contract.rs`) and listed in `docs/CONFIG.md` § Exit codes.
+
+- **`gen_ai.operation.name` decides more kinds.** `invoke_workflow`, `plan`, the Vercel AI
+  SDK's `agent_step` and the memory operations are chains, and `retrieval` and
+  `search_memory` retrievers; any other operation is a model call only when it carries model
+  call attributes (`gen_ai.request.*`, `.response.*`, `.usage.*`). Every operation evald did
+  not list used to be typed LLM, so each AI SDK step counted as a model call with no model.
+- **An agent, chain or tool span is never an LLM span**, whatever model it names. The usage
+  series on `/metrics` and `evald latency` counted an agent span that named its model as a
+  model call, with the whole run's wall time.
+
+### Fixed
+- **A judge base URL ending in `/v1` became `/v1/v1`.** `OPENAI_BASE_URL=http://host:8000/v1`
+  (the OpenAI SDKs' own convention) was sent to `http://host:8000/v1/v1/chat/completions`. A
+  trailing `/v1` or `/` on `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` is now dropped.
+- **The README's quick start stopped at its second command on a clean machine.** The installer
+  puts evald in `~/.local/bin`, which a fresh Ubuntu or macOS does not have on PATH, so
+  `evald serve` was `command not found`; the installer said so, which meant a fourth command to
+  type. The install line now puts `~/.local/bin` on the PATH of the shell it runs in. Found by
+  the clean-machine check above.
+- **gzip-compressed OTLP/gRPC was refused.** Node's OTLP/gRPC exporters compress every
+  message, and the gRPC door answered each `UNIMPLEMENTED: Content is compressed with gzip`:
+  Gemini CLI, on its default protocol, delivered nothing. Both gRPC services accept gzip now
+  (the decode cap applies to the inflated message); a test drives the real server over HTTP/2
+  as such an exporter does.
+- **An empty attribute value refused an OTLP/JSON export whole.** Node's OTLP/HTTP-JSON
+  exporters send `"value": {}` for an attribute left undefined, which the generated decoder
+  rejects; Gemini CLI does it on most records. An empty value now reads as no value, as it
+  does in protobuf.
+- **An in-process agent's total was counted as spend, twice.** The GenAI conventions let an
+  `invoke_agent` span report the usage of the whole invocation; the Vercel AI SDK 7 does, and
+  evald priced it, so `evald cost`, the session cost and `evald_llm_cost_usd_total` counted
+  every such run twice. An AGENT or CHAIN span that is not a `CLIENT` span now keeps that
+  usage only in its raw attributes (`evald.usage = "aggregate"`); its model calls are priced
+  as before. A `CLIENT` agent span, a call to a remote agent whose model calls leave no spans
+  here, keeps its usage and is priced. Spans stored by an earlier release keep the cost they
+  were given.
+- **A request the console could not answer got the console.** Any `POST`, and any path under
+  `/v1/` that is not an endpoint, was answered `200 text/html` with the app shell, so an OTLP
+  exporter sending a signal evald does not take (`POST /v1/metrics`, the default in many
+  SDKs) read its data as accepted. The fallback now serves only `GET` / `HEAD` outside
+  `/v1/`; the rest is `404 evald: no such endpoint: <METHOD> <path>`. The EE console had the
+  same fallback and the same fix.
+- **Claude Code's MCP tools were all called `mcp_tool`.** With `OTEL_LOG_TOOL_DETAILS=1`
+  Claude Code names the server and tool in `tool_parameters`; evald now names the call as
+  Claude Code does, `mcp__<server>__<tool>`, and reads its arguments from `tool_input`.
+- **Doc drift.**
+  - Five links in the published docs pointed at a benchmark document the mirror does not
+    publish.
+  - `docs/INSTRUMENTATION.md` said the OSS node has no auth.
+  - `docs/CONFIG.md`'s `serve` table lacked `--otlp-grpc` and `--blob-offload-bytes`.
+  - `docs/OPERATIONS.md` named the release archives wrongly.
+  - `.ossync.yaml` still stamped `v0.1.0`.
+- **An empty `EVALD_*` variable crashed the command.** Compose, Kubernetes and systemd templates
+  pass unset optional settings as `${VAR:-}`. `EVALD_RETENTION=` stopped `serve` with "invalid
+  retention window", a restart loop in a container. An `EVALD_*` variable set to the empty
+  string now counts as unset, as `EVALD_AUTH_TOKEN` already did.
+- **The documented image tags did not exist.** Releases pushed `mancube/evald:v0.3.0`, while
+  `docs/DOCKERHUB.md` said to pull `:0.3.0`. Both spellings are now pushed.
+- **The console guide's compose example lost its data.** It mounted `/data` but never pointed
+  the store at it. `compose.yaml` replaces it.
+- **`evald serve` ignored `SIGTERM`.** Only Ctrl-C drained, so `docker stop`, a Kubernetes
+  pod deletion and systemd all ended the server with the `SIGKILL` that follows: nothing
+  acknowledged was lost (the WAL is the acknowledgement boundary), but in-flight requests were
+  cut off. `SIGTERM` now drains and exits `0`, as Ctrl-C does.
+- **`clippy -D warnings` and `cargo fmt --check` failed on the pinned toolchain.** A tuple
+  type in the usage series' label memo (`clippy::type_complexity`), and one unformatted
+  assertion in `src/redact.rs`. Both ran red in the mirror's CI.
+- **SQL counted a span sent twice twice.** A client's resend, or an exporter retrying a
+  request evald had already taken, put two copies of a span in the store. The REST reads
+  showed one, but the `spans` view behind `POST /v1/sql`, `evald cost` and
+  `evald latency` dropped only a cold copy of a hot span, so two copies in the hot tier
+  or in one block counted twice, and doubled cost and call counts. Now:
+  - the hot tier is read with one copy of each span, the first to arrive, as the REST
+    reads keep it;
+  - a flush writes one copy of each span its WAL segment holds;
+  - a merge keeps one copy across its inputs, so copies flushed from two segments
+    become one when their blocks merge.
+
+  Until that merge, copies in two blocks still count twice; `docs/API.md` says when.
+  Deduping across blocks at query time would hold every cold key in memory and keep a
+  filter on `start_unix_nano` from reaching the Parquet scan.
+- **The Docker Hub quick start could not write its store.** The image runs as uid
+  65532, which owns nothing on a developer's machine or a CI runner: `serve` and
+  `eval run` stopped with `Permission denied (os error 13)`, and a bind-mounted
+  `evald-data` that did not exist yet was created by Docker as root. `docs/DOCKERHUB.md`
+  now creates the directory and runs as its owner (`--user "$(id -u):$(id -g)"`), and
+  drops the `chmod 777` advice. The release runs that `eval run`, as written, against
+  the built image before it pushes.
+
 ## [0.3.0] - 2026-09-22
 
 ### Added

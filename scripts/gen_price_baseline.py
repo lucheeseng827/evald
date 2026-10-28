@@ -10,14 +10,21 @@ subset of it) unchanged.
 
     python scripts/gen_price_baseline.py                 # latest upstream, via the `gh` CLI
     python scripts/gen_price_baseline.py --ref <sha>     # a pinned upstream commit
+    python scripts/gen_price_baseline.py --clone <dir>   # from a clone, without the GitHub API
     python scripts/gen_price_baseline.py --in prices.json --commit <sha> --date YYYY-MM-DD
+
+`--clone` takes any clone of BerriAI/litellm with the commit that last touched the file; a
+blob-less shallow one is enough:
+`git clone --filter=blob:none --no-checkout --depth 50 https://github.com/BerriAI/litellm`.
 
 The output records the source repository, commit and commit date under `_evald`; the
 binary uses `<commit8>@<date>` as the `price_version` stamped on every derived cost.
-Output is sorted and compact, so regenerating from the same commit is byte-identical.
+Output is sorted and compact, so regenerating from the same commit is byte-identical. It
+prints how many models were added, dropped upstream and repriced against the file it replaces.
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -44,9 +51,18 @@ def gh(*args):
     return subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True).stdout
 
 
+def git(clone, *args):
+    # TZ=UTC: the date is the commit's UTC date, as the API reports it.
+    env = {**os.environ, "TZ": "UTC"}
+    return subprocess.run(
+        ["git", "-C", clone, *args], check=True, capture_output=True, text=True, env=env
+    ).stdout
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="infile")
+    ap.add_argument("--clone")
     ap.add_argument("--ref", default="main")
     ap.add_argument("--commit")
     ap.add_argument("--date")
@@ -58,6 +74,12 @@ def main():
         if not (a.commit and a.date):
             sys.exit("--in needs --commit and --date so the version stamp is honest")
         commit, date = a.commit, a.date
+    elif a.clone:
+        commit = git(a.clone, "log", "-1", "--format=%H", a.ref, "--", PATH).strip()
+        if not commit:
+            sys.exit(f"no commit in {a.clone} touches {PATH}: fetch more history")
+        date = git(a.clone, "log", "-1", "--date=format-local:%Y-%m-%d", "--format=%cd", commit).strip()
+        raw = git(a.clone, "show", f"{commit}:{PATH}")
     else:
         meta = json.loads(gh(f"repos/{REPO}/commits?path={PATH}&sha={a.ref}&per_page=1"))[0]
         commit, date = meta["sha"], meta["commit"]["committer"]["date"][:10]
@@ -77,6 +99,12 @@ def main():
         if "input_cost_per_token" in keep or "output_cost_per_token" in keep:
             out[name] = dict(sorted(keep.items()))
 
+    try:
+        with open(a.out, encoding="utf-8") as f:
+            prev = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+    except (OSError, ValueError):
+        prev = {}
+
     doc = {
         "_evald": {
             "source": f"github.com/{REPO}",
@@ -91,6 +119,11 @@ def main():
         json.dump(doc, f, separators=(",", ":"), ensure_ascii=True)
         f.write("\n")
     print(f"{len(out)} models from {commit[:8]}@{date} -> {a.out}")
+    if prev:
+        added = len(out.keys() - prev.keys())
+        dropped = len(prev.keys() - out.keys())
+        repriced = sum(1 for k in out.keys() & prev.keys() if out[k] != prev[k])
+        print(f"against the previous table: {added} added, {dropped} dropped upstream, {repriced} repriced")
 
 
 if __name__ == "__main__":

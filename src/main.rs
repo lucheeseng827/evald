@@ -177,6 +177,16 @@ enum Cmd {
         /// series count, and so the scrape size and the scraper's memory.
         #[arg(long, default_value_t = 100, env = "EVALD_METRICS_MODEL_CAP")]
         metrics_model_cap: usize,
+        /// What the OTLP logs door (`POST /v1/logs`, gRPC `LogsService`) keeps. `genai`: records
+        /// evald recognises (evaluation results, coding-agent events) become spans and scores,
+        /// the rest are counted and dropped. `all`: every other record is kept too, as a
+        /// zero-duration span. `off`: every record is acknowledged and dropped.
+        #[arg(long, default_value = "genai", value_parser = parse_logs_policy, env = "EVALD_LOGS")]
+        logs: evald::logs::LogsPolicy,
+        /// Let MCP clients on `POST /mcp` write scores (the `add_score` tool). Off by default:
+        /// a connected agent can only read.
+        #[arg(long, env = "EVALD_MCP_ALLOW_WRITES")]
+        mcp_allow_writes: bool,
     },
     /// Eval runner subcommands (offline regression loop).
     Eval {
@@ -211,6 +221,84 @@ enum Cmd {
         /// Max groups to print.
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+    /// Seed a fresh data dir with demo data (a Claude Code session, a small RAG app's
+    /// traces, eval scores), so `serve` has something to show.
+    Demo {
+        /// Where to write the demo store. Must be absent or empty.
+        #[arg(long, default_value = "evald-demo")]
+        data_dir: PathBuf,
+    },
+    /// Check a setup before starting it: the data dir, free disk, the ports, exposure without
+    /// auth, the price table's age. Exits 1 when a check fails.
+    Doctor {
+        /// The data dir `serve` would use.
+        #[arg(long, default_value = "evald-data", env = "EVALD_DATA_DIR")]
+        data_dir: PathBuf,
+        /// The HTTP address `serve` would bind.
+        #[arg(long, default_value = "127.0.0.1:4318", env = "EVALD_OTLP_HTTP_ADDR")]
+        otlp_http: String,
+        /// The gRPC address `serve` would bind (empty: disabled).
+        #[arg(long, default_value = "127.0.0.1:4317", env = "EVALD_OTLP_GRPC_ADDR")]
+        otlp_grpc: String,
+        /// The price table `serve` would lay over the built-in one.
+        #[arg(long = "price-table", env = "EVALD_PRICE_TABLE")]
+        price_table: Option<PathBuf>,
+    },
+    /// Print the configuration that points a tool at this evald: `claude-code`, `codex`,
+    /// `gemini-cli`, `otel-app` (any OpenTelemetry-instrumented app) or `collector` (an OTel
+    /// Collector fan-out).
+    Connect {
+        /// The tool: claude-code | codex | gemini-cli | otel-app | collector.
+        tool: String,
+        /// The HTTP address evald serves on (as given to `serve --otlp-http`).
+        #[arg(long, default_value = "127.0.0.1:4318", env = "EVALD_OTLP_HTTP_ADDR")]
+        otlp_http: String,
+        /// The gRPC address evald serves on (as given to `serve --otlp-grpc`; empty: off).
+        #[arg(long, default_value = "127.0.0.1:4317", env = "EVALD_OTLP_GRPC_ADDR")]
+        otlp_grpc: String,
+        /// The host the tool reaches evald on, when it is not this machine.
+        #[arg(long)]
+        host: Option<String>,
+        /// Send over HTTP/protobuf (:4318) instead of gRPC (:4317).
+        #[arg(long)]
+        http: bool,
+        /// Also send the tool's spans (Claude Code: its beta span tree of each turn; Codex and
+        /// Gemini CLI: the spans of the calls their events already report).
+        #[arg(long)]
+        traces: bool,
+        /// Add the bearer header, read from this environment variable (the token itself is
+        /// never printed).
+        #[arg(long, value_name = "ENV_VAR")]
+        token_env: Option<String>,
+        /// Claude Code and Gemini CLI: print a settings.json block instead of shell exports.
+        #[arg(long)]
+        settings_json: bool,
+    },
+    /// A Model Context Protocol server on stdio, so a coding agent can query this store:
+    /// SQL, traces, sessions, cost and latency reports, eval-run comparisons. Read-only unless
+    /// `--allow-writes`. For a store a running `evald serve` holds, use its `POST /mcp`.
+    Mcp {
+        /// Directory for durable storage (the store to answer from).
+        #[arg(long, default_value = "evald-data", env = "EVALD_DATA_DIR")]
+        data_dir: PathBuf,
+        /// Expose the `add_score` tool.
+        #[arg(long)]
+        allow_writes: bool,
+    },
+    /// Agent sessions, most recently active first: duration, traces, LLM and tool calls and
+    /// their failures, cost and models.
+    Sessions {
+        /// Directory for durable storage (the spans to report over).
+        #[arg(long, default_value = "evald-data", env = "EVALD_DATA_DIR")]
+        data_dir: PathBuf,
+        /// Max sessions to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print JSON (the `GET /v1/sessions/{id}` shape, one object per session) instead of
+        /// a table.
+        #[arg(long)]
+        json: bool,
     },
     /// Export stored scores in another shape.
     Scores {
@@ -285,6 +373,11 @@ enum Cmd {
     },
     /// Print the evald version.
     Version,
+}
+
+/// Parse `--logs` (`genai` / `all` / `off`).
+fn parse_logs_policy(s: &str) -> Result<evald::logs::LogsPolicy, String> {
+    s.parse()
 }
 
 /// Parse a retention window (`30d` / `72h` / `90m` / `3600s`, or a bare number = seconds) into a
@@ -465,8 +558,55 @@ fn parse_alpha(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Exit codes are part of the CLI's contract, because CI reads them: `0` success, `1` a gate
+/// failed (a threshold missed, a regression, a failed suite: the commands that gate call
+/// `std::process::exit(1)` themselves), `2` evald could not do what was asked (bad
+/// configuration, an unreadable file, a store it cannot open). clap's own usage errors are
+/// already `2`. Before 0.4.0 both of the last two were `1`, so a CI step could not tell a
+/// regression from a typo.
+fn main() -> std::process::ExitCode {
+    unset_empty_evald_vars();
+    // What `#[tokio::main]` builds, built here so the environment is settled first.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: could not start the async runtime: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    match runtime.block_on(run()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // The same rendering `fn main() -> anyhow::Result<()>` gave (the error chain, and a
+            // backtrace when `RUST_BACKTRACE` asks for one).
+            eprintln!("Error: {e:?}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
+/// An `EVALD_*` variable set to the empty string counts as unset. Compose files, Kubernetes
+/// manifests and systemd units routinely pass optional settings through as `${VAR:-}`, and clap
+/// would otherwise parse `""` as the value: `EVALD_RETENTION=` stopped `serve` with "invalid
+/// retention window", which in a container is a restart loop. `EVALD_AUTH_TOKEN` was already
+/// read this way (empty ⇒ auth off).
+///
+/// Runs first in `main`, before the runtime exists, so no other thread can be reading the
+/// environment while it changes.
+fn unset_empty_evald_vars() {
+    let empty: Vec<std::ffi::OsString> = std::env::vars_os()
+        .filter(|(k, v)| k.to_string_lossy().starts_with("EVALD_") && v.is_empty())
+        .map(|(k, _)| k)
+        .collect();
+    for k in empty {
+        std::env::remove_var(k);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Serve {
             otlp_http,
@@ -495,6 +635,8 @@ async fn main() -> anyhow::Result<()> {
             price_table,
             no_usage_metrics,
             metrics_model_cap,
+            logs,
+            mcp_allow_writes,
         } => {
             evald::init_tracing();
             // `EVALD_AUTH_TOKEN` is read HERE, not via a clap `env` fallback, so it UNIONS with
@@ -555,6 +697,7 @@ async fn main() -> anyhow::Result<()> {
                     enabled: !no_usage_metrics,
                     model_cap: metrics_model_cap,
                 },
+                logs,
                 merge: evald::store::MergePolicy {
                     hour_threshold: cold_merge_threshold,
                     max_spans_per_block: cold_merge_max_spans,
@@ -591,7 +734,10 @@ async fn main() -> anyhow::Result<()> {
                      disk guardrail were enabled"
                 );
             }
-            evald::ingest::serve(addr, grpc_addr, data_dir, config, auth).await?;
+            let mcp = evald::mcp::Access {
+                writes: mcp_allow_writes,
+            };
+            evald::ingest::serve(addr, grpc_addr, data_dir, config, auth, mcp).await?;
         }
         Cmd::Eval { action } => match action {
             EvalCmd::Run {
@@ -674,6 +820,83 @@ async fn main() -> anyhow::Result<()> {
             evald::init_tracing();
             let dimension = evald::cost::Dimension::parse(&by)?;
             evald::cost::cost_command(dimension, &data_dir, limit, price_table.as_deref()).await?;
+        }
+        Cmd::Demo { data_dir } => {
+            evald::init_tracing();
+            let seeded = evald::demo::demo_command(&data_dir).await?;
+            let d = data_dir.display();
+            println!(
+                "evald demo: wrote {} spans, {} scores and {} sessions to {d}\n\n\
+                 Look at it:\n  \
+                 evald serve --data-dir {d}        then open http://127.0.0.1:4318/\n  \
+                 curl -s localhost:4318/v1/sessions\n\n\
+                 Or, with no server running:\n  \
+                 evald sessions --data-dir {d}\n  \
+                 evald cost --by model --data-dir {d}\n  \
+                 evald query \"SELECT name, model, cost_usd FROM spans WHERE model IS NOT NULL\" --data-dir {d}",
+                seeded.spans, seeded.scores, seeded.sessions
+            );
+        }
+        Cmd::Doctor {
+            data_dir,
+            otlp_http,
+            otlp_grpc,
+            price_table,
+        } => {
+            // The same sources `serve` reads its tokens from (the flag is serve's own).
+            let auth_configured = std::env::var("EVALD_AUTH_TOKEN")
+                .is_ok_and(|v| !v.trim().is_empty())
+                || std::env::var_os("EVALD_AUTH_TOKEN_FILE").is_some();
+            let checks = evald::doctor::run_checks(&evald::doctor::Setup {
+                data_dir: &data_dir,
+                otlp_http: &otlp_http,
+                otlp_grpc: &otlp_grpc,
+                auth_configured,
+                price_table: price_table.as_deref(),
+            });
+            if !evald::doctor::print(&checks) {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Connect {
+            tool,
+            otlp_http,
+            otlp_grpc,
+            host,
+            http,
+            traces,
+            token_env,
+            settings_json,
+        } => {
+            let mut target = evald::connect::Target::from_addrs(&otlp_http, &otlp_grpc)?;
+            if let Some(h) = host {
+                target.host = h;
+            }
+            // `--http` can turn gRPC off; it cannot turn on a gRPC `serve` has off.
+            target.grpc = target.grpc && !http;
+            target.traces = traces;
+            target.token_env = token_env;
+            target.settings_json = settings_json;
+            print!("{}", evald::connect::snippet(&tool, &target)?);
+        }
+        Cmd::Mcp {
+            data_dir,
+            allow_writes,
+        } => {
+            // Logs to stderr; stdout is the protocol.
+            evald::init_tracing();
+            let access = evald::mcp::Access {
+                writes: allow_writes,
+            };
+            evald::mcp::stdio_command(&data_dir, access).await?;
+        }
+        Cmd::Sessions {
+            data_dir,
+            limit,
+            json,
+        } => {
+            evald::init_tracing();
+            evald::sessions::sessions_command(&data_dir, limit, json).await?;
         }
         Cmd::Latency {
             by,

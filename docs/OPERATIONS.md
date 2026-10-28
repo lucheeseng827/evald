@@ -6,7 +6,7 @@ database, container, or sidecar to operate. Durability contract, stated
 honestly: **accepted spans are durable (fsynced before the ACK); under overload
 evald sheds with explicit `429 + Retry-After` — it never silently drops.**
 Internals (commit protocol, data model) live in [`PLAN.md`](../PLAN.md);
-measured capacity numbers live in [`BENCHMARKS.md`](./BENCHMARKS.md).
+measured capacity numbers are in the [README's Performance section](../README.md#performance).
 
 ## What the state is — `--data-dir` layout
 
@@ -73,14 +73,61 @@ Copy one binary; give it a directory:
 evald serve --data-dir /var/lib/evald            # loopback :4318
 ```
 
-- Run it under any supervisor (systemd, container, CI step). Ctrl-C / SIGINT
-  triggers a graceful drain.
+- Run it under any supervisor (systemd, container, CI step). Ctrl-C / SIGINT and
+  SIGTERM (`systemctl stop`, `docker stop`, a pod deletion) trigger a graceful drain.
+- **systemd:** [`ops/evald.service`](../ops/evald.service) is a hardened unit: its own
+  dynamic user, the store in `/var/lib/evald`, nothing else writable, settings and the
+  auth token in `/etc/evald/evald.env`. Install steps are at its top.
+- **Docker Compose:** [`compose.yaml`](../compose.yaml) runs evald and the console with the
+  store on a named volume, ports published on `127.0.0.1` only. `docker compose up -d`.
 - **One process per data-dir.** The redb lock is exclusive — a second process
   (including `evald eval run` / `query` / `cost`) opening the same dir fails
   with `Database already open. Cannot acquire lock.` Point CLI runs at their own
   `--data-dir`, or stop the server first.
 - Container images: see [`docs/DOCKERHUB.md`](./DOCKERHUB.md) and the
-  [`Dockerfile`](../Dockerfile)s.
+  [`Dockerfile`](../Dockerfile)s. From 0.4.0 `docker run mancube/evald` serves on both
+  ports into the `/data` volume; the images are cosign-signed (verify below).
+
+### Verify what you pulled
+
+The first operational step is confirming the artefact is the one we published. Release
+binaries ship with a signed `SHA256SUMS` and build provenance, both produced by the
+release workflow with **keyless** signing — an ephemeral certificate bound to the
+workflow identity, logged to the public transparency log. There is no long-lived key to
+distribute, leak or rotate, and nothing to trust beyond the identity of the workflow
+that built it.
+
+```bash
+# 1. the checksums cover the archives
+sha256sum -c SHA256SUMS --ignore-missing
+
+# 2. the signature covers the checksums, and says which workflow signed them
+cosign verify-blob \
+  --certificate SHA256SUMS.pem --signature SHA256SUMS.sig \
+  --certificate-identity-regexp '^https://github\.com/lucheeseng827/evald/\.github/workflows/release\.yml@.+' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+
+# 3. build provenance for the archive itself
+gh attestation verify evald-<target>.tar.gz --repo lucheeseng827/evald
+
+# 4. the container image (0.4.0+): signed by digest, with its SBOM attested
+cosign verify docker.io/mancube/evald:<version> \
+  --certificate-identity-regexp '^https://github\.com/lucheeseng827/evald/\.github/workflows/release\.yml@.+' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Step 2 is the one that matters and the one most often skipped. A checksum alone proves
+only that the file matches a list you downloaded from the same place as the file — it
+detects corruption, not substitution. The `--certificate-identity-regexp` is what turns
+it into a provenance check: it asserts *which workflow in which repository* produced the
+signature, so a valid signature from some other identity fails rather than passes.
+
+An SBOM (SPDX) is published alongside each release if you need to audit the dependency
+set rather than the build.
+
+**Air-gapped?** Keyless verification contacts the transparency log, so do steps 2 and 3
+on a connected host and carry the verified archive across, rather than skipping them.
 
 ## Backup & restore
 
@@ -333,7 +380,7 @@ Do not leave it on under load. Formatting and ANSI-colouring those ~14 fields me
 spans over OTLP/HTTP under callgrind: ~113k instructions/span at `debug` vs ~75k at
 `warn`, compaction off). End to end, on a 4-vCPU VM whose ceiling is fsync rather than
 CPU, turning it on still cost **+14% of the server's CPU per span and −7% throughput**
-([BENCHMARKS.md § Log level](./BENCHMARKS.md#log-level--read-before-comparing-any-of-these-numbers)).
+([CONFIG.md § Logging](./CONFIG.md#logging--rust_log)).
 It is at `debug` for exactly that reason.
 
 Going the other way costs nothing: the default and `RUST_LOG=warn` measured within 0.5%
@@ -465,7 +512,7 @@ FROM r GROUP BY g ORDER BY spans DESC
 batch (not per span); label values are interned once, so a span costs a few integer hash lookups and
 additions and allocates nothing. A cap-hit scrape (100 models) is about 28 lines and 4–5 KB per series.
 
-Capacity guidance (measured, same-box: see [BENCHMARKS.md](./BENCHMARKS.md)):
+Capacity guidance (measured, same-box: see the [README's Performance section](../README.md#performance)):
 ~56k spans/s fsynced-before-ACK at 32 connections on ~1.8 cores, 8.5 MB idle
 RSS. SQL scans run off the ingest hot path but do burn CPU — schedule heavy
 analytics accordingly.
@@ -535,7 +582,8 @@ It is large; an overlay is easier to review. The overlay's version is stamped as
 version>`, so a stored cost tells you both.
 
 To rebuild the *built-in* baseline (for building evald itself, not for operating it) use
-`scripts/gen_price_baseline.py`; it records the upstream commit and date under `_evald`.
+`scripts/gen_price_baseline.py`; it records the upstream commit and date under `_evald`. Each release
+refreshes it ([`RELEASING.md`](../RELEASING.md)).
 
 ### Loading it
 

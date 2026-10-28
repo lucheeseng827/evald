@@ -8,6 +8,9 @@
 //!   [`coerce_otlp_json_ints`]), runs one [`crate::normalize`] pass, then **durably
 //!   appends** to the [`Store`]. The reply mirrors the request format; on overload the
 //!   bounded ingest channel sheds with `429 + Retry-After` (never a silent drop).
+//! - `POST /v1/logs` — OTLP logs ingest, same formats and replies as traces. Recognised records
+//!   (evaluation results, mapped coding-agent events) become spans and scores; the rest are
+//!   counted and dropped unless `--logs all` ([`crate::logs`]).
 //! - `GET /v1/spans` — read recent spans back, optionally filtered by `trace_id`.
 //! - `GET /v1/traces/{trace_id}` — all spans of one trace, in arrival order.
 //! - `POST /v1/scores` / `GET /v1/scores[/{id}]` — the universal [`Score`] object
@@ -31,6 +34,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
@@ -41,7 +47,7 @@ use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::{
     auth::Auth, normalize, DataType, NormalizedSpan, Score, ScoreSource, ScoreTarget, Store,
-    StoreConfig, StoreError, Tokens, UsageMissingReason,
+    StoreConfig, StoreError, UsageMissingReason,
 };
 
 /// Cap a single OTLP batch body. OTLP batches are bounded by the SDK's
@@ -60,7 +66,7 @@ const MAX_SQL_LIMIT: usize = 100_000;
 /// rollup scans the most-recent spans and filters by `session_id` (there is no session→span
 /// index yet); this bounds that scan so a huge store can't make one request unbounded. When
 /// the scan hits this cap the rollup is flagged `truncated` (it may omit older session spans).
-const SESSION_SCAN_CAP: usize = 50_000;
+const SESSION_SCAN_CAP: usize = crate::sessions::SCAN_CAP;
 
 const CT_PROTOBUF: &str = "application/x-protobuf";
 const CT_JSON: &str = "application/json";
@@ -85,9 +91,11 @@ pub fn router_with_auth(store: Store, auth: Auth) -> Router {
 fn build_router(store: Store, body_limit: usize, auth: Auth) -> Router {
     let router = Router::new()
         .route("/v1/traces", post(export_traces))
+        .route("/v1/logs", post(export_logs))
         .route("/v1/spans", get(get_spans))
         .route("/v1/traces/{trace_id}", get(get_trace))
         .route("/v1/traces/{trace_id}/scores", get(get_trace_rollup))
+        .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{session_id}", get(get_session))
         .route("/v1/scores", post(post_scores).get(get_scores))
         .route("/v1/scores/{id}", get(get_score_by_id))
@@ -96,6 +104,11 @@ fn build_router(store: Store, body_limit: usize, auth: Auth) -> Router {
         .route("/v1/stats", get(get_stats))
         .route("/v1/meta", get(get_meta))
         .route("/v1/blobs/{key}", get(get_blob))
+        // The MCP server (Streamable HTTP): a coding agent's questions about this store.
+        .route(
+            "/mcp",
+            post(post_mcp).get(mcp_no_stream).delete(mcp_no_stream),
+        )
         // Inside the auth gate on purpose: a scrape exposes ingest rates, backlog depth and
         // shed counts. In the default posture (loopback, no gate) it is freely readable;
         // once an operator arms the gate — i.e. exposes this node — the scraper presents a
@@ -181,6 +194,7 @@ pub async fn serve(
     data_dir: PathBuf,
     config: StoreConfig,
     auth: Auth,
+    mcp: crate::mcp::Access,
 ) -> anyhow::Result<()> {
     let store = Store::open(&data_dir, config)
         .map_err(|e| anyhow::anyhow!("failed to open store at {}: {e}", data_dir.display()))?;
@@ -204,6 +218,9 @@ pub async fn serve(
     }
     tracing::info!(
         "  query    GET  http://{local}/v1/spans  ·  GET http://{local}/v1/traces/{{trace_id}}"
+    );
+    tracing::info!(
+        "  mcp      POST http://{local}/mcp  (claude mcp add --transport http evald http://{local}/mcp)"
     );
     tracing::info!(
         "  data     {}  (mount as a volume to persist across restarts)",
@@ -232,8 +249,11 @@ pub async fn serve(
         let _ = rx.changed().await;
     };
 
-    let http = axum::serve(listener, router_with_auth(store.clone(), auth.clone()))
-        .with_graceful_shutdown(on_shutdown(shutdown_rx.clone()));
+    let http = axum::serve(
+        listener,
+        router_with_auth(store.clone(), auth.clone()).layer(axum::Extension(mcp)),
+    )
+    .with_graceful_shutdown(on_shutdown(shutdown_rx.clone()));
 
     match grpc_addr {
         Some(gaddr) => {
@@ -281,7 +301,7 @@ fn log_auth_posture(http: SocketAddr, grpc: Option<SocketAddr>, auth: &Auth) {
 /// warranting a "your data won't survive a restart" warning? Component-based prefix match against
 /// known-ephemeral roots — conservative, so it flags only the obvious cases (`/tmp`, `/var/tmp`,
 /// `/dev/shm`, `/run`) and never a real data directory like `/var/lib/evald`.
-fn is_ephemeral_path(dir: &std::path::Path) -> bool {
+pub(crate) fn is_ephemeral_path(dir: &std::path::Path) -> bool {
     const EPHEMERAL_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/run"];
     EPHEMERAL_ROOTS.iter().any(|root| dir.starts_with(root))
 }
@@ -304,85 +324,117 @@ mod onboarding_tests {
     }
 }
 
-/// Resolve when Ctrl-C is received, triggering axum's graceful shutdown.
+/// Resolve on Ctrl-C (SIGINT) or, on Unix, SIGTERM, triggering the graceful shutdown of every
+/// listener. SIGTERM is what `docker stop`, a Kubernetes pod deletion and systemd send; without
+/// it the process ran until the SIGKILL that follows, so nothing drained (the WAL kept every
+/// acknowledged span durable regardless, but in-flight requests were cut off).
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "could not listen for SIGTERM; only Ctrl-C will drain");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received — draining");
 }
 
 /// `POST /v1/traces` — decode (protobuf or JSON), normalize, durably store.
 async fn export_traces(State(store): State<Store>, headers: HeaderMap, body: Bytes) -> Response {
-    let is_json = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("json"));
-
-    let request = if is_json {
-        match decode_otlp_json(&body) {
-            Ok(req) => req,
-            Err(err) => {
-                tracing::warn!(%err, bytes = body.len(), "rejected: OTLP-JSON decode failed");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("evald: could not decode OTLP-JSON: {err}\n"),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        match ExportTraceServiceRequest::decode(body.as_ref()) {
-            Ok(req) => req,
-            Err(err) => {
-                tracing::warn!(%err, bytes = body.len(), "rejected: OTLP protobuf decode failed");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("evald: could not decode OTLP protobuf: {err}\n"),
-                )
-                    .into_response();
-            }
-        }
+    let is_json = is_json_request(&headers);
+    let request = match decode_body::<ExportTraceServiceRequest>(is_json, &body) {
+        Ok(req) => req,
+        Err(rejected) => return rejected,
     };
 
-    let mut spans = normalize::normalize_request(&request);
+    let spans = normalize::normalize_request(&request);
     let count = spans.len();
     log_ingest(request.resource_spans.len(), &spans);
     // `gen_ai.evaluation.result` span events become scores; empty (and free) for the common request.
     let eval_scores = crate::evalevent::extract(&request);
 
-    // Offload oversized input/output payloads to the blob store BEFORE the durable append, so
-    // the WAL and Parquet blocks only ever carry a compact `evald-blob:<key>` reference.
-    // Redact, then offload — see `Store::prepare_for_storage` for why the order and the
-    // placement before `append` are load-bearing.
-    //
-    // The disk floor is checked BEFORE that offload as well as inside `append`. The offload
-    // WRITES, so relying on `append`'s guard alone would spend the last of a full volume
-    // writing blob files and then answer 503 — leaving the blobs behind with no span in the
-    // WAL referencing them, and nothing that ever collects them. The second check inside
-    // `append` is not redundant: free space is sampled on a timer, so the floor can be
-    // crossed between the two.
-    let result = match store.reject_if_disk_full(count) {
-        Err(err) => Err(err),
-        Ok(()) => {
-            store.prepare_for_storage(&mut spans);
-            store.append(spans).await
-        }
+    // Redact, then offload oversized payloads, then the durable append, then the scores: one
+    // core for both signals and both doors (`Store::ingest_batch` says why in that order).
+    match store.ingest_batch(spans, &eval_scores).await {
+        Ok(_) => success_response::<ExportTraceServiceResponse>(is_json),
+        Err(err) => store_error_response(err, count),
+    }
+}
+
+/// `POST /v1/logs` — decode (protobuf or JSON), map the recognised records to spans and scores
+/// ([`crate::logs`]), durably store. Replies like `/v1/traces`. A record evald does not keep is
+/// still acknowledged: dropping it is the policy, not a failure the exporter should retry.
+async fn export_logs(State(store): State<Store>, headers: HeaderMap, body: Bytes) -> Response {
+    let is_json = is_json_request(&headers);
+    let request = match decode_body::<ExportLogsServiceRequest>(is_json, &body) {
+        Ok(req) => req,
+        Err(rejected) => return rejected,
     };
 
-    match result {
-        Ok(()) => {
-            // After the spans are durable. Ids are deterministic, so a retry after a failure
-            // here overwrites instead of duplicating; a real store error is retryable (503).
-            if let Err(err) = store.put_scores(&eval_scores) {
-                tracing::error!(%err, count = eval_scores.len(), "failed to store evaluation events");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "evald: store unavailable\n",
-                )
-                    .into_response();
-            }
-            success_response(is_json)
-        }
-        Err(StoreError::Backpressure) => {
+    let batch = crate::logs::normalize_logs(&request, store.logs_policy());
+    let count = batch.spans.len();
+    tracing::info!(
+        records = batch.records,
+        spans = count,
+        scores = batch.scores.len(),
+        "ingesting OTLP/HTTP logs"
+    );
+    match store.ingest_batch(batch.spans, &batch.scores).await {
+        Ok(_) => success_response::<ExportLogsServiceResponse>(is_json),
+        Err(err) => store_error_response(err, count),
+    }
+}
+
+fn is_json_request(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("json"))
+}
+
+/// Decode an OTLP export body (protobuf, or OTLP-JSON when `is_json`), or the `400` to reply.
+#[allow(clippy::result_large_err)] // the Err is the reply itself, returned at once
+fn decode_body<T>(is_json: bool, body: &[u8]) -> Result<T, Response>
+where
+    T: Message + Default + serde::de::DeserializeOwned,
+{
+    if is_json {
+        decode_otlp_json_as::<T>(body).map_err(|err| {
+            tracing::warn!(%err, bytes = body.len(), "rejected: OTLP-JSON decode failed");
+            (
+                StatusCode::BAD_REQUEST,
+                format!("evald: could not decode OTLP-JSON: {err}\n"),
+            )
+                .into_response()
+        })
+    } else {
+        T::decode(body).map_err(|err| {
+            tracing::warn!(%err, bytes = body.len(), "rejected: OTLP protobuf decode failed");
+            (
+                StatusCode::BAD_REQUEST,
+                format!("evald: could not decode OTLP protobuf: {err}\n"),
+            )
+                .into_response()
+        })
+    }
+}
+
+/// The reply to a store refusal, the same for every ingest route. `count` is the span count,
+/// for the log line.
+fn store_error_response(err: StoreError, count: usize) -> Response {
+    match err {
+        StoreError::Backpressure => {
             tracing::warn!(count, "shedding: ingest channel full");
             (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -391,7 +443,7 @@ async fn export_traces(State(store): State<Store>, headers: HeaderMap, body: Byt
             )
                 .into_response()
         }
-        Err(err @ StoreError::DiskFull { .. }) => {
+        err @ StoreError::DiskFull { .. } => {
             // 503 + Retry-After, not 429: OTLP treats both as retryable, but 429 means
             // "you are sending too fast" and this is not the client's fault or within its
             // power to fix. 503 keeps the exporter retrying — so when an operator frees
@@ -405,7 +457,7 @@ async fn export_traces(State(store): State<Store>, headers: HeaderMap, body: Byt
             )
                 .into_response()
         }
-        Err(err) => {
+        err => {
             tracing::error!(%err, count, "store write failed");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -524,97 +576,42 @@ async fn get_trace(State(store): State<Store>, AxPath(trace_id): AxPath<String>)
     }
 }
 
-/// A session/thread rollup: cost + token + span/trace totals over every span carrying a
-/// given `session.id`. The recurring "I need per-conversation cost, not per-span" ask
-/// (session-level attribution across a multi-turn thread). Computed from a bounded scan;
-/// `scanned`/`truncated` make the bound explicit rather than silently partial.
-#[derive(serde::Serialize)]
-struct SessionRollup {
-    session_id: String,
-    span_count: usize,
-    /// Distinct traces the session's spans belong to (a session usually spans many traces).
-    trace_count: usize,
-    /// Summed `cost_usd` over spans that reported one; absent when none did.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cost_usd: Option<f64>,
-    /// Field-wise token totals (only populated fields are summed / emitted).
-    #[serde(skip_serializing_if = "Tokens::is_empty")]
-    tokens: Tokens,
-    /// Earliest span start / latest span end (unix nanos) — the session's wall-clock span.
-    start_unix_nano: u64,
-    end_unix_nano: u64,
-    /// Total spans scanned store-wide to build this rollup (the bounded first-cut scan).
-    scanned: usize,
-    /// True when the scan hit `SESSION_SCAN_CAP`, so older session spans may be omitted; a
-    /// dedicated session→span index is the follow-up.
-    truncated: bool,
+/// `GET /v1/sessions?limit=` — the most recently active sessions, rolled up as
+/// [`get_session`] rolls up one. What `evald sessions` prints, for a store a running server
+/// holds (the CLI cannot open it then: the store's lock is exclusive).
+#[derive(serde::Deserialize)]
+struct SessionsQuery {
+    limit: Option<usize>,
 }
 
-/// Fold one span's populated token fields into the running per-field totals.
-fn add_tokens(acc: &mut Tokens, t: &Tokens) {
-    fn add(acc: &mut Option<u64>, v: Option<u64>) {
-        if let Some(v) = v {
-            *acc = Some(acc.unwrap_or(0) + v);
-        }
-    }
-    add(&mut acc.prompt, t.prompt);
-    add(&mut acc.completion, t.completion);
-    add(&mut acc.total, t.total);
-    add(&mut acc.cache_read, t.cache_read);
-    add(&mut acc.cache_write, t.cache_write);
-    add(&mut acc.reasoning, t.reasoning);
+async fn list_sessions(State(store): State<Store>, Query(q): Query<SessionsQuery>) -> Response {
+    let limit = q.limit.unwrap_or(20).min(1000);
+    let scanned = match query_blocking(move || store.query(None, SESSION_SCAN_CAP)).await {
+        Ok(spans) => spans,
+        Err(err) => return query_error(err),
+    };
+    let truncated = scanned.len() >= SESSION_SCAN_CAP;
+    let mut rows = crate::sessions::rollups(&scanned, truncated);
+    rows.truncate(limit);
+    Json(rows).into_response()
 }
 
-/// `GET /v1/sessions/{session_id}` — cost/token/span rollup for one session (thread).
+/// `GET /v1/sessions/{session_id}` — one session rolled up: spans, traces, cost, tokens, wall
+/// time, LLM and tool calls and their failures, models and tools ([`crate::sessions`]).
 async fn get_session(State(store): State<Store>, AxPath(session_id): AxPath<String>) -> Response {
     let scanned = match query_blocking(move || store.query(None, SESSION_SCAN_CAP)).await {
         Ok(spans) => spans,
         Err(err) => return query_error(err),
     };
-    let scanned_count = scanned.len();
-    let truncated = scanned_count >= SESSION_SCAN_CAP;
-
-    let mut span_count = 0usize;
-    let mut traces: HashSet<String> = HashSet::new();
-    let mut cost: Option<f64> = None;
-    let mut tokens = Tokens::default();
-    let mut start = u64::MAX;
-    let mut end = 0u64;
-
-    for s in &scanned {
-        if s.session_id.as_deref() != Some(session_id.as_str()) {
-            continue;
-        }
-        span_count += 1;
-        traces.insert(s.trace_id.clone());
-        if let Some(c) = s.cost_usd {
-            cost = Some(cost.unwrap_or(0.0) + c);
-        }
-        add_tokens(&mut tokens, &s.tokens);
-        start = start.min(s.start_unix_nano);
-        end = end.max(s.end_unix_nano);
-    }
-
-    if span_count == 0 {
-        return (
+    let truncated = scanned.len() >= SESSION_SCAN_CAP;
+    match crate::sessions::rollup(&scanned, &session_id, truncated) {
+        Some(r) => Json(r).into_response(),
+        None => (
             StatusCode::NOT_FOUND,
             "evald: no spans for that session_id\n",
         )
-            .into_response();
+            .into_response(),
     }
-
-    Json(SessionRollup {
-        session_id,
-        span_count,
-        trace_count: traces.len(),
-        cost_usd: cost,
-        tokens,
-        start_unix_nano: start,
-        end_unix_nano: end,
-        scanned: scanned_count,
-        truncated,
-    })
-    .into_response()
 }
 
 /// `GET /v1/stats` — ingest-pipeline load: hot-tier backlog, channel depth, cumulative
@@ -698,6 +695,72 @@ async fn get_meta() -> Response {
 /// reference. Returns the raw bytes (`application/octet-stream`), or `404` for an unknown /
 /// malformed key. Bytes are opaque on purpose — the offload treats a payload as a blob, not
 /// tokenizable text — so the caller renders/decodes as it sees fit.
+/// `POST /mcp`: one MCP message (or a batch) in, its reply out as JSON (the Streamable HTTP
+/// transport without the optional event stream; [`crate::mcp`]). A notification is `202` with no
+/// body. A browser page on another origin is refused (`403`), so a site you visit cannot drive a
+/// local evald through your browser (DNS rebinding); a client that sends no `Origin`, as agents
+/// and CLIs do not, is not affected.
+async fn post_mcp(
+    State(store): State<Store>,
+    access: Option<axum::Extension<crate::mcp::Access>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        if !mcp_origin_allowed(origin.to_str().unwrap_or("")) {
+            return (
+                StatusCode::FORBIDDEN,
+                "evald: MCP requests from another origin are refused\n",
+            )
+                .into_response();
+        }
+    }
+    let access = access.map(|a| a.0).unwrap_or_default();
+    let msg: Json2 = match serde_json::from_slice(&body) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(crate::mcp::parse_error(&e.to_string())),
+            )
+                .into_response()
+        }
+    };
+    match crate::mcp::handle(&store, access, msg).await {
+        Some(reply) => axum::Json(reply).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// `GET` / `DELETE /mcp`: this server keeps no stream and no session to open or close.
+async fn mcp_no_stream() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "POST")],
+        "evald: POST MCP messages to /mcp; there is no event stream or session\n",
+    )
+        .into_response()
+}
+
+/// An `Origin` may drive `/mcp` only when it is a loopback address. Matching it against the
+/// request's `Host` would prove nothing: under DNS rebinding the page's own name resolves to
+/// this server, and the browser sends that name as both (`Origin: http://evil.example:4318`,
+/// `Host: evil.example:4318`). No page evald serves calls `/mcp`.
+fn mcp_origin_allowed(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let hostname = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    matches!(hostname, "localhost" | "127.0.0.1" | "::1")
+}
+
 async fn get_blob(State(store): State<Store>, AxPath(key): AxPath<String>) -> Response {
     match store.get_blob(&key) {
         Ok(Some(bytes)) => {
@@ -1265,9 +1328,47 @@ fn now_unix_nano() -> u64 {
 /// `pub` so the fleet ingest gateway (`evald_fleet::fleet::gateway`) can reuse it
 /// instead of re-implementing the OTLP-JSON int coercion.
 pub fn decode_otlp_json(body: &[u8]) -> Result<ExportTraceServiceRequest, serde_json::Error> {
+    decode_otlp_json_as(body)
+}
+
+/// [`decode_otlp_json`] for any OTLP export request (traces, logs).
+pub fn decode_otlp_json_as<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+) -> Result<T, serde_json::Error> {
     let mut value: Json2 = serde_json::from_slice(body)?;
     coerce_otlp_json_ints(&mut value);
+    drop_empty_any_values(&mut value);
     serde_json::from_value(value)
+}
+
+/// An `AnyValue` with no value set is legal OTLP, and Node's OTLP/HTTP-JSON exporters send one
+/// for every attribute left `undefined` (Gemini CLI 0.65.0: `{"key":"mcp_server_name",
+/// "value":{}}`, on most records). The generated deserializer rejects an empty `AnyValue`, which
+/// refused such an export whole. Read it as protobuf does, as no value: a `KeyValue`'s `value`
+/// is dropped, and so is an empty element of an array or key-value list.
+pub fn drop_empty_any_values(value: &mut Json2) {
+    let empty = |v: &Json2| v.as_object().is_some_and(|o| o.is_empty());
+    match value {
+        Json2::Object(map) => {
+            if map.contains_key("key") && map.get("value").is_some_and(empty) {
+                map.remove("value");
+            }
+            for (key, val) in map.iter_mut() {
+                if key == "values" {
+                    if let Json2::Array(items) = val {
+                        items.retain(|i| !empty(i));
+                    }
+                }
+                drop_empty_any_values(val);
+            }
+        }
+        Json2::Array(items) => {
+            for item in items {
+                drop_empty_any_values(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// OTLP-JSON encodes int64 fields as strings (protobuf JSON mapping), but the
@@ -1300,10 +1401,10 @@ pub fn coerce_otlp_json_ints(value: &mut Json2) {
 
 /// A spec-shaped success reply in the same format as the request. An empty
 /// `ExportTraceServiceResponse` (no `partial_success`) means full success.
-fn success_response(is_json: bool) -> Response {
-    let reply = ExportTraceServiceResponse {
-        partial_success: None,
-    };
+/// The full-success reply to an export, in the request's own format. An empty
+/// `partial_success` means every item was accepted.
+fn success_response<R: Message + Default + serde::Serialize>(is_json: bool) -> Response {
+    let reply = R::default();
     if is_json {
         let body = serde_json::to_vec(&reply).unwrap_or_else(|_| b"{}".to_vec());
         ([(header::CONTENT_TYPE, CT_JSON)], body).into_response()
@@ -1561,6 +1662,30 @@ mod tests {
         let bytes = req.encode_to_vec();
         let decoded = ExportTraceServiceRequest::decode(bytes.as_slice()).expect("decode");
         assert_eq!(decoded, req);
+    }
+
+    /// Node's OTLP/HTTP-JSON exporters (Gemini CLI) send `"value": {}` for an attribute left
+    /// `undefined`; the export used to be refused whole.
+    #[test]
+    fn an_empty_any_value_is_read_as_no_value() {
+        let body = br#"{"resourceLogs":[{"resource":{"attributes":[]},"scopeLogs":[{"logRecords":[
+            {"timeUnixNano":"1","attributes":[
+                {"key":"event.name","value":{"stringValue":"gemini_cli.tool_call"}},
+                {"key":"mcp_server_name","value":{}},
+                {"key":"finish_reasons","value":{"arrayValue":{"values":[{},{"stringValue":"stop"}]}}}
+            ]}]}]}]}"#;
+        let req: opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest =
+            decode_otlp_json_as(body).expect("an empty AnyValue decodes");
+        let attrs = &req.resource_logs[0].scope_logs[0].log_records[0].attributes;
+        assert_eq!(attrs.len(), 3, "the attribute is kept, with no value");
+        assert!(attrs[1].value.is_none());
+        let Some(AnyValue {
+            value: Some(AnyVal::ArrayValue(a)),
+        }) = &attrs[2].value
+        else {
+            panic!("array kept: {:?}", attrs[2]);
+        };
+        assert_eq!(a.values.len(), 1, "the empty element dropped");
     }
 
     #[test]
@@ -2602,6 +2727,254 @@ mod tests {
         router_with_auth(store, Auth::from_tokens([TEST_TOKEN]).unwrap())
     }
 
+    // --- OTLP logs door: POST /v1/logs --------------------------------------------
+
+    fn post_logs(content_type: &str, body: impl Into<Body>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(body.into())
+            .unwrap()
+    }
+
+    fn eval_log_request() -> ExportLogsServiceRequest {
+        use opentelemetry_proto::tonic::logs::v1::LogRecord;
+        crate::logs::tests::request(
+            "my.evals",
+            "app",
+            vec![LogRecord {
+                event_name: crate::evalevent::EVENT_NAME.into(),
+                time_unix_nano: 1_700_000_000_000_000_000,
+                trace_id: vec![0x11; 16],
+                span_id: vec![0x22; 8],
+                attributes: vec![
+                    str_kv("gen_ai.evaluation.name", "faithfulness"),
+                    dbl_kv("gen_ai.evaluation.score.value", 0.5),
+                ],
+                ..Default::default()
+            }],
+        )
+    }
+
+    /// One unrecognised record in OTLP-JSON, int64s spelled as strings as the mapping requires.
+    const LOGS_JSON: &str = r#"{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"app"}}]},"scopeLogs":[{"scope":{"name":"app.logger"},"logRecords":[{"timeUnixNano":"1700000000000000000","severityText":"INFO","body":{"stringValue":"hello"},"attributes":[{"key":"n","value":{"intValue":"3"}}]}]}]}]}"#;
+
+    #[tokio::test]
+    async fn logs_protobuf_export_stores_the_evaluation_and_replies_in_kind() {
+        let (store, _dir) = test_store();
+        let resp = router(store.clone())
+            .oneshot(post_logs(CT_PROTOBUF, eval_log_request().encode_to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            CT_PROTOBUF
+        );
+        let reply = ExportLogsServiceResponse::decode(body_bytes(resp).await.as_ref())
+            .expect("a logs reply");
+        assert!(reply.partial_success.is_none());
+
+        let scores = store
+            .scores_for_target(&ScoreTarget::Span("22".repeat(8)))
+            .unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].name, "faithfulness");
+        assert_eq!(scores[0].num_value, Some(0.5));
+        assert_eq!(store.span_count().unwrap(), 0, "a score, not a span");
+    }
+
+    #[tokio::test]
+    async fn logs_json_is_acknowledged_and_an_unrecognised_record_is_not_stored() {
+        let (store, _dir) = test_store();
+        let resp = router(store.clone())
+            .oneshot(post_logs(CT_JSON, LOGS_JSON))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "dropping is policy, not a failure"
+        );
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), CT_JSON);
+        assert_eq!(store.span_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn logs_all_keeps_an_unrecognised_record_as_a_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreConfig {
+                logs: crate::logs::LogsPolicy::All,
+                compact_interval: None,
+                ..StoreConfig::default()
+            },
+        )
+        .unwrap();
+        let resp = router(store.clone())
+            .oneshot(post_logs(CT_JSON, LOGS_JSON))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router(store).oneshot(get("/v1/spans")).await.unwrap();
+        let spans: Vec<serde_json::Value> =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "hello");
+        assert_eq!(spans[0]["service_name"], "app");
+        assert_eq!(spans[0]["raw_attributes"]["n"], 3);
+        assert_eq!(spans[0]["raw_attributes"]["log.severity_text"], "INFO");
+    }
+
+    #[tokio::test]
+    async fn logs_undecodable_bodies_are_400() {
+        let (store, _dir) = test_store();
+        for (ct, body) in [(CT_PROTOBUF, &b"\xff\xff\xff"[..]), (CT_JSON, &b"{"[..])] {
+            let resp = router(store.clone())
+                .oneshot(post_logs(ct, body.to_vec()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{ct}");
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_door_is_behind_the_auth_gate() {
+        let (store, _dir) = test_store();
+        let resp = auth_router(store.clone())
+            .oneshot(post_logs(CT_PROTOBUF, eval_log_request().encode_to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(store
+            .scores_for_target(&ScoreTarget::Span("22".repeat(8)))
+            .unwrap()
+            .is_empty());
+    }
+
+    // --- Claude Code over both signals: one call, one span ------------------------
+
+    /// The sum of a `/metrics` counter family's samples (every label set).
+    async fn metric_sum(store: &Store, name: &str) -> f64 {
+        let resp = router(store.clone())
+            .oneshot(get("/metrics"))
+            .await
+            .unwrap();
+        let text = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        text.lines()
+            .filter(|l| l.starts_with(name) && !l.starts_with('#'))
+            .filter(|l| l[name.len()..].starts_with(['{', ' ']))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    }
+
+    /// Claude Code with tracing on describes every API call as an event AND a span. Sent in
+    /// either order, each call must be stored once and counted once, and the call only the span
+    /// describes (the permission classifier's) must still arrive.
+    #[tokio::test]
+    async fn claude_code_calls_sent_on_both_signals_are_stored_and_counted_once() {
+        use crate::claude_code::tests::{TRACED_LOGS, TRACED_SPANS};
+        for logs_first in [true, false] {
+            let (store, _dir) = test_store();
+            let mut sends = vec![("/v1/logs", TRACED_LOGS), ("/v1/traces", TRACED_SPANS)];
+            if !logs_first {
+                sends.reverse();
+            }
+            for (uri, body) in sends {
+                let resp = router(store.clone())
+                    .oneshot(post_json(uri, body))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+            let spans = store.query(None, 1000).unwrap();
+            let llm: Vec<_> = spans
+                .iter()
+                .filter(|s| s.name == "claude_code.llm_request")
+                .collect();
+            let distinct: HashSet<&str> = llm
+                .iter()
+                .map(|s| s.raw_attributes["request_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                distinct.len(),
+                3,
+                "two calls on both signals, one span-only"
+            );
+            assert_eq!(
+                llm.len(),
+                3,
+                "each call stored once (logs first: {logs_first})"
+            );
+            assert_eq!(
+                metric_sum(&store, "evald_llm_requests_total").await,
+                3.0,
+                "and counted once (logs first: {logs_first})"
+            );
+            // Two LLM copies either way; with the span first the tool event is dropped too.
+            assert_eq!(
+                store.duplicate_calls_dropped(),
+                if logs_first { 2 } else { 3 }
+            );
+            // The tool call: with the span first its event copy is dropped; with the event
+            // first both are kept (the span cannot be dropped), which the docs state.
+            let tools = spans
+                .iter()
+                .filter(|s| s.name == "claude_code.tool")
+                .count();
+            assert_eq!(tools, if logs_first { 2 } else { 1 });
+        }
+    }
+
+    /// Re-sending the same events (an exporter retry after a lost reply) stores nothing new.
+    #[tokio::test]
+    async fn claude_code_events_resent_are_not_counted_again() {
+        use crate::claude_code::tests::EVENTS_ONLY;
+        let (store, _dir) = test_store();
+        for _ in 0..2 {
+            let resp = router(store.clone())
+                .oneshot(post_json("/v1/logs", EVENTS_ONLY))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(metric_sum(&store, "evald_llm_requests_total").await, 2.0);
+        let cost = metric_sum(&store, "evald_llm_cost_usd_total").await;
+        assert!((cost - (0.00238249 + 0.00047599)).abs() < 1e-9, "{cost}");
+    }
+
+    #[tokio::test]
+    async fn sessions_list_reads_what_evald_sessions_prints_from_a_live_store() {
+        use crate::claude_code::tests::EVENTS_ONLY;
+        let (store, _dir) = test_store();
+        let resp = router(store.clone())
+            .oneshot(post_json("/v1/logs", EVENTS_ONLY))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router(store.clone())
+            .oneshot(get("/v1/sessions?limit=5"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["llm_calls"], 2);
+        assert_eq!(rows[0]["tool_calls"], 2);
+        let id = rows[0]["session_id"].as_str().unwrap().to_string();
+        // The one-session read agrees with the list.
+        let one = json_body(
+            router(store)
+                .oneshot(get(&format!("/v1/sessions/{id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(one, rows[0]);
+    }
+
     // --- observability surface: /metrics, /healthz, /readyz -----------------------
 
     // --- score rollup --------------------------------------------------------------
@@ -3145,6 +3518,148 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- MCP: POST /mcp ---------------------------------------------------------------
+
+    fn post_mcp_req(body: &str, origin: Option<&str>, token: Option<&str>) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "127.0.0.1:4318")
+            .header(header::CONTENT_TYPE, CT_JSON)
+            .header(header::ACCEPT, "application/json, text/event-stream");
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    const MCP_INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+
+    #[tokio::test]
+    async fn mcp_answers_a_request_and_accepts_a_notification() {
+        let (store, _dir) = test_store();
+        let app = router(store);
+        let resp = app
+            .clone()
+            .oneshot(post_mcp_req(MCP_INIT, None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Json2 = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["result"]["serverInfo"]["name"], "evald");
+
+        let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let resp = app
+            .clone()
+            .oneshot(post_mcp_req(note, None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let resp = app
+            .clone()
+            .oneshot(post_mcp_req("{not json", None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = app.oneshot(get_bearer("/mcp", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn mcp_refuses_another_origin_and_sits_behind_the_gate() {
+        let (store, _dir) = test_store();
+        let app = router(store);
+        for (origin, ok) in [
+            ("http://localhost:5173", true),
+            ("http://127.0.0.1:4318", true),
+            ("http://[::1]:4318", true),
+            ("https://evil.example", false),
+            ("http://127.0.0.1.evil.example", false),
+            ("null", false),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(post_mcp_req(MCP_INIT, Some(origin), None))
+                .await
+                .unwrap();
+            let want = if ok {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(resp.status(), want, "{origin}");
+        }
+        // DNS rebinding: the attacker's name resolves to this server, so the browser sends it as
+        // both Origin and Host. Agreeing with Host proves nothing; it is refused.
+        let (store, _dir) = test_store();
+        let mut rebound = post_mcp_req(MCP_INIT, Some("http://evil.example:4318"), None);
+        rebound.headers_mut().insert(
+            header::HOST,
+            header::HeaderValue::from_static("evil.example:4318"),
+        );
+        let resp = router(store).oneshot(rebound).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let (store, _dir) = test_store();
+        let gated = auth_router(store);
+        let resp = gated
+            .clone()
+            .oneshot(post_mcp_req(MCP_INIT, None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = gated
+            .oneshot(post_mcp_req(MCP_INIT, None, Some(TEST_TOKEN)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mcp_writes_only_when_serve_allows_them() {
+        let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add_score","arguments":{"target_type":"trace","target_id":"t1","name":"ok","value":1}}}"#;
+        let (store, _dir) = test_store();
+        let resp = router(store)
+            .oneshot(post_mcp_req(call, None, None))
+            .await
+            .unwrap();
+        let body: Json2 = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body["error"].is_object(), "read-only by default: {body}");
+
+        let (store, _dir) = test_store();
+        let app = router(store.clone()).layer(axum::Extension(crate::mcp::Access { writes: true }));
+        let resp = app.oneshot(post_mcp_req(call, None, None)).await.unwrap();
+        let body: Json2 = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["result"]["isError"], false, "{body}");
+        assert_eq!(
+            store
+                .scores_for_target(&crate::ScoreTarget::Trace("t1".into()))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     // --- gen_ai.evaluation.result span events become scores (every ingest door) -----------

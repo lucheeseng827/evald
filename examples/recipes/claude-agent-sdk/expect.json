@@ -1,0 +1,5 @@
+{
+  "service": "recipe-claude-agent-sdk",
+  "llm": {"min": 2, "model": "claude-sonnet-5", "tokens": true, "cost": true},
+  "tool": {"min": 1, "name": "mcp__weather__get_weather"}
+}

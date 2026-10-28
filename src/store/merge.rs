@@ -39,13 +39,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, UInt64Array};
+use datafusion::arrow::compute::filter_record_batch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 
 use super::cold::{self, BlockMeta, Provenance};
 use super::index::Index;
-use super::BLOCKS_SUBDIR;
+use super::{key_of, SpanKey, BLOCKS_SUBDIR};
 
 /// Rows per Parquet row group in a merged block, and the batch size inputs are read in.
 /// Bounds a merge's memory to roughly one row group of the widest columns, whatever the
@@ -439,6 +440,13 @@ fn merge_chunk(
     let mut all_traces: BTreeSet<String> = BTreeSet::new();
     let mut max_start: u64 = 0;
     let mut rows_written: u64 = 0;
+    // One row per `(trace_id, span_id)` across the chunk: copies of a span in two of its
+    // inputs (a span sent again after its first copy was flushed, an exporter's retry that
+    // landed in the next WAL segment) become one, the first in seqno order. A flush writes
+    // one copy per segment, so this is where copies in different blocks meet. The keys of
+    // the rows written so far are held for it: at most `max_spans_per_block` of them.
+    let mut seen: HashSet<SpanKey> = HashSet::new();
+    let mut copies: u64 = 0;
     let bytes_out = {
         let file = File::create(&tmp_path)?;
         let props = cold::writer_properties_builder(&provenance)
@@ -468,9 +476,16 @@ fn merge_chunk(
                             ),
                         )
                     })?;
+                // The input's trace mappings come from every row it holds, a dropped copy's
+                // too, so that the commit retires all of them; the output holds each such
+                // trace through the span's first copy.
                 collect_keys(&batch, &mut traces, &mut max_start)?;
+                let (batch, dropped) = first_copies(batch, &mut seen)?;
+                copies += dropped;
                 rows_written += batch.num_rows() as u64;
-                writer.write(&batch).map_err(io::Error::other)?;
+                if batch.num_rows() > 0 {
+                    writer.write(&batch).map_err(io::Error::other)?;
+                }
             }
             all_traces.extend(traces.iter().cloned());
             per_input.push((c.rel.clone(), traces));
@@ -522,6 +537,7 @@ fn merge_chunk(
         out = %out_rel,
         inputs = chunk.len(),
         rows = rows_written,
+        copies,
         bytes_in,
         bytes_out,
         "merged cold blocks"
@@ -543,6 +559,32 @@ fn merge_chunk(
 pub(crate) fn mark_retired(abs: &Path) -> io::Result<()> {
     let file = fs::File::options().write(true).open(abs)?;
     file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+}
+
+/// `batch` with only the rows whose `(trace_id, span_id)` is not in `seen` yet, all of
+/// which it then holds, and how many rows were left out.
+fn first_copies(batch: RecordBatch, seen: &mut HashSet<SpanKey>) -> io::Result<(RecordBatch, u64)> {
+    let ids = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("block has no {name} column"),
+                )
+            })
+    };
+    let (traces, spans) = (ids("trace_id")?, ids("span_id")?);
+    let keep: Vec<bool> = (0..batch.num_rows())
+        .map(|i| seen.insert(key_of(traces.value(i), spans.value(i))))
+        .collect();
+    let dropped = keep.iter().filter(|kept| !**kept).count() as u64;
+    if dropped == 0 {
+        return Ok((batch, 0));
+    }
+    let kept = filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(io::Error::other)?;
+    Ok((kept, dropped))
 }
 
 /// Pull the trace ids and the newest start time out of a batch — the two things the index

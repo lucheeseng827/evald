@@ -5,8 +5,9 @@ traces — point your app's OTel exporter at evald's endpoint and your spans, to
 counts, costs, and scores show up in the console (trace list → span tree → scores),
 the SQL surface, and the cost view.
 
-- **Endpoint:** `POST /v1/traces` on `http://<host>:4318` (OTLP/HTTP).
-- **Wire formats:** OTLP **protobuf** (gzip-aware) *and* **OTLP-JSON** — same route.
+- **Endpoints:** `POST /v1/traces` and `POST /v1/logs` on `http://<host>:4318` (OTLP/HTTP), and
+  the same two services over OTLP/gRPC on `<host>:4317`.
+- **Wire formats:** OTLP **protobuf** (gzip-aware) *and* **OTLP-JSON** — same routes.
 - **No lock-in:** it's stock OpenTelemetry. The same instrumentation can fan out to
   evald and to any other OTLP backend at the same time.
 
@@ -112,6 +113,246 @@ new NodeSDK({
 
 ---
 
+## Coding agents
+
+Coding agents export OpenTelemetry themselves. Point them at evald and every session shows up
+with its model calls, tokens, cost and tool calls, with no code to write.
+
+| Tool | Tested with | evald reads | Setup |
+|---|---|---|---|
+| Claude Code | 2.1.306 | its events; its beta spans too, one call counted once | `evald connect claude-code` |
+| Codex CLI | 0.163.0 | its events; its spans are kept, never counted | `evald connect codex` |
+| Gemini CLI | 0.65.0 | its events; its spans are kept, never counted | `evald connect gemini-cli` |
+
+Each mapping was written against what that version actually sends: a real session, captured
+with `scripts/capture-coding-agent.sh` (the CLI runs against the recipes' stub provider and a
+stub MCP server, so no key and no network), committed under `tests/fixtures/<tool>/<version>/`
+and checked by the dialect's tests. The `evald connect` snippets were then run as printed, with
+the real CLI, into a real `evald serve`. A newer version is not refused: an attribute a mapping
+does not know is kept on the span, so SQL sees it.
+
+Across the three, a session reads the same way: one trace per turn under a `*.user_prompt`
+marker, one LLM span per model call, one TOOL span per tool call, and MCP tools named
+`mcp__<server>__<tool>` whatever the tool's own spelling.
+
+The snippets are **privacy first**: where a tool exports content by default (Gemini CLI's
+prompts, Codex's tool output), `evald connect` turns it off, even when that costs a report a
+detail, and the snippet says what. Opting back in is one line in the tool's config.
+
+### Claude Code
+
+Claude Code sends its **events** over the OTLP logs signal: one per API request (model,
+tokens, Claude Code's own cost estimate, duration, time to first token), one per tool result
+and permission decision, one per prompt. That is all evald needs, and it is stable. Spans are
+a beta on top: they add the timing tree of a turn, and are optional.
+
+`evald connect claude-code` prints this block for the evald you run (`--http`, `--traces`,
+`--token-env`, or `--settings-json` for a `~/.claude/settings.json` `env` block), so
+`eval "$(evald connect claude-code)"` is the whole setup. Then `evald sessions` lists each
+session's calls, tool calls, failures and cost. By hand:
+
+```bash
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export OTEL_LOGS_EXPORTER=otlp
+export OTEL_METRICS_EXPORTER=none              # evald does not ingest OTLP metrics
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc        # or http/protobuf with :4318
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_LOGS_EXPORT_INTERVAL=1000          # see "both signals" below
+
+# Optional: the span tree of each turn (beta).
+export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1
+export OTEL_TRACES_EXPORTER=otlp
+```
+
+With auth on, add `export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $EVALD_TOKEN"`.
+Prompt text, tool inputs and responses stay redacted unless you turn Claude Code's
+`OTEL_LOG_*` switches on; nothing here needs them. One is worth knowing: without
+`OTEL_LOG_TOOL_DETAILS=1` Claude Code reports every MCP tool as `mcp_tool`. With it, evald names
+the call as Claude Code does (`mcp__<server>__<tool>`) and the session view can spot repeated
+identical calls, at the cost of storing each tool's arguments (Bash commands included).
+
+**What each event becomes** (verified against Claude Code 2.1.306; fixtures in
+`tests/fixtures/claude-code/`):
+
+| Event | evald span |
+|---|---|
+| `api_request` | `claude_code.llm_request`, kind LLM: model, tokens (input excludes cache reads and writes, as Claude Code reports it; priced once), `cost_usd` = Claude Code's estimate, duration, time to first token |
+| `api_error` | the same, with an error status and message |
+| `tool_result` | `claude_code.tool`, kind TOOL: tool name, `gen_ai.tool.call.id`, duration, an error status when it failed |
+| `tool_decision` with `decision=reject` | `claude_code.tool` with the error status `rejected (<source>)` |
+| `user_prompt` | `claude_code.user_prompt`, a zero-duration marker per turn |
+| accepted `tool_decision`, `assistant_response`, `api_refusal` | folded: the result or request event carries the facts |
+| startup, plugin, hook and settings events | not GenAI facts: dropped (or kept as plain spans under `--logs all`) |
+
+Every attribute the event carried is kept on its span, `session.id` and `prompt.id` included,
+so anything Claude Code sends is queryable with SQL. A turn is one trace: the record's own trace
+context when it has one, otherwise a trace per `prompt.id` under its `user_prompt` marker.
+
+**Spans over traces.** Claude Code 2.1.306 names its token counts `input_tokens`,
+`output_tokens`, `cache_read_tokens` and `cache_creation_tokens` on `claude_code.llm_request`
+spans, not the `gen_ai.usage.*` names. evald reads both.
+
+**Both signals on.** Each API call then arrives twice. Both copies get the same span id
+(derived from Claude Code's `request_id`), and the second to arrive is dropped at ingest, so
+cost, tokens and `/metrics` count each call once (`evald_duplicate_calls_dropped_total` counts
+the copies dropped). Which copy is kept matters for cost: the event carries Claude Code's own
+cost, while a kept span copy is priced from evald's price table, and a model the table does not
+know yet is left unpriced (re-price later with `evald cost --price-table`). Exporting logs more
+often than traces (`OTEL_LOGS_EXPORT_INTERVAL=1000`; traces default to 5 s) makes the event
+arrive first. Calls only spans describe, such as the permission classifier's, still arrive from
+the span. Tool calls are different: a tool span is not dropped, because other spans hang under
+it. A `tool_result` event that arrives after its span is dropped, one that arrives before it is
+kept. So with both signals on, a tool call can appear twice in raw SQL; `evald.source = 'log'`
+marks the event copy.
+
+**When spans don't arrive.** Claude Code samples its spans from the parent trace context: under
+an inherited `TRACEPARENT` whose sampled flag is `00` (some CI runners and SDK hosts set one),
+no spans are exported at all, while events still are. Events alone are a complete record.
+
+**Privacy.** Claude Code puts `user.email`, account and organization ids on every event. evald
+stores them as received. `--redact email` rewrites the email before anything is written; the ids
+need a `--redact-custom` rule ([CONFIG.md](./CONFIG.md#evald-serve)).
+
+### Codex CLI
+
+Codex sends its **events** over the OTLP logs signal (`[otel] exporter`): one per model request
+and one when its stream completes (with the tokens), one per tool decision and tool result, one
+per prompt. Its **spans** (`[otel] trace_exporter`) are its internals, hundreds a turn (file
+reads, auth, tool routing): evald keeps them if sent, but its reports come from the events.
+
+`evald connect codex` prints the `[otel]` table for `~/.codex/config.toml` (`--http`,
+`--traces`, `--token-env`):
+
+```toml
+[otel]
+exporter = { otlp-grpc = { endpoint = "http://localhost:4317" } }
+# or: { otlp-http = { endpoint = "http://localhost:4318/v1/logs", protocol = "binary" } }
+log_user_prompt = false          # Codex's default, stated
+tool_result = { max_bytes = 0 }  # see Privacy
+```
+
+`config.toml` expands no variables: with auth on, the snippet leaves a
+`headers = { authorization = "Bearer <your evald token>" }` placeholder in the exporter for the
+token itself. Codex sends its **metrics** to OpenAI's analytics (`statsig`) unless
+`metrics_exporter` says otherwise, whatever `exporter` is; evald takes no metrics, so the
+snippet leaves that setting to you (`metrics_exporter = "none"` stops them).
+
+**What each event becomes** (verified against Codex 0.163.0; fixtures in `tests/fixtures/codex/`):
+
+| Event | evald span |
+|---|---|
+| `sse_event` with `event.kind = response.completed` and token counts | `codex.llm_request`, kind LLM: model, tokens (input *includes* the cached tokens, output the reasoning ones: OpenAI's reading), time to first token, priced from the table |
+| `api_request` / `websocket_request` that failed, `sse_event` with an error | the same, with an error status (`HTTP 429`, the stream's error) |
+| `tool_result` | `codex.tool`, kind TOOL: tool name (`mcp__<server>__<tool>` for MCP), `gen_ai.tool.call.id`, arguments, duration, an error status when it failed |
+| `tool_decision` that is not an approval | the result's error status: `denied (User)`, `abort (Config)` |
+| `user_prompt` | `codex.user_prompt`, a zero-duration marker per turn |
+| `conversation_starts`, a successful request, every other `sse_event`, approvals | folded: remembered for the records above, or covered by them |
+| `startup_phase`, `turn_ttft`, `turn_cost`, `sandbox_outcome`, … | not mapped (kept as plain spans under `--logs all`) |
+
+Codex fills the OTLP `event_name` field with a Rust `tracing` callsite
+(`event otel/src/events/session_telemetry.rs:1132`); evald reads the `event.name` attribute
+first, which is where Codex puts the name.
+
+**A command that fails is not a failed tool call to Codex.** `exec_command` reports
+`success = true` for `exit 3`, with `Process exited with code 3` in its output. evald gives such
+a call the error status `exit code 3` when the output is exported. With `tool_result =
+{ max_bytes = 0 }`, which `evald connect codex` sets on purpose, it is not: Codex's verdict
+stands, and the session's tool-error count leaves failed commands out (refused calls and
+failed MCP calls still count). To count them, drop that line, and evald stores up to 2 KiB of
+every command's output.
+
+**Where a span sits.** Codex's records carry a trace context, but not one to place by: with its
+spans exported each turn has a trace, without them every turn of a conversation shares one. So
+evald places by turn: each `user_prompt` starts a trace, and the spans after it sit under its
+marker. The record's own context is kept as `evald.otel.trace_id` / `evald.otel.span_id`, the
+join to Codex's spans. The completion record that carries a call's tokens is logged outside any
+span and usually lands in a later export than its request (a stream outlasts the exporter's
+one-second flush): evald remembers each conversation's last request for a while, across export
+requests, to give the call its start time. A restart in between costs that call its duration,
+never its tokens or cost.
+
+**Both signals on.** The one span with token counts (`handle_responses`, on the stream's
+completion) has them set aside (`evald.usage = "copy"`), and Codex's spans are kept out of the
+session rollup, so each call and each turn counts once.
+
+**The WebSocket transport.** Against OpenAI itself, Codex can use the Responses API over a
+WebSocket, and then logs `websocket_request` where it would log `api_request`. That is mapped
+from Codex's source at the 0.163.0 tag; the captured session ran over HTTP.
+
+**Privacy.** Prompts arrive as `[REDACTED]` unless `log_user_prompt = true`. Tool calls are a
+different matter: every `tool_result` carries the call's **arguments** (a shell command in
+full) and, by default, up to 2 KiB of its **output**. `tool_result = { max_bytes = 0 }` keeps
+the output out (the snippet sets it); the arguments have no switch, and evald stores them.
+
+### Gemini CLI
+
+Gemini CLI sends its **events** over the OTLP logs signal whenever its telemetry is on: one per
+model request and one per response (with the tokens), one per tool call, one per prompt. It
+also always sends **spans** of the same calls, each carrying its 31 KB system prompt and its
+tool list.
+
+`evald connect gemini-cli` prints the variables (`--http`, `--traces`, `--token-env`, or
+`--settings-json` for a `~/.gemini/settings.json` `telemetry` block):
+
+```bash
+export GEMINI_TELEMETRY_ENABLED=true
+export GEMINI_TELEMETRY_TARGET=local
+export GEMINI_TELEMETRY_OTLP_PROTOCOL=grpc      # or http, with :4318
+export GEMINI_TELEMETRY_OTLP_ENDPOINT=http://localhost:4317
+export GEMINI_TELEMETRY_LOG_PROMPTS=false       # Gemini CLI logs prompts by default
+export OTEL_TRACES_SAMPLER=always_off           # its spans repeat the events; --traces keeps them
+```
+
+With auth on, add `export GEMINI_TELEMETRY_OTLP_HEADERS="Authorization=Bearer $EVALD_TOKEN"`.
+Leave `GEMINI_TELEMETRY_TRACES_ENABLED` unset: it does not turn spans on (they are always
+sent), it adds prompts and tool output to them.
+
+**What each event becomes** (verified against Gemini CLI 0.65.0; fixtures in
+`tests/fixtures/gemini-cli/`):
+
+| Event | evald span |
+|---|---|
+| `gemini_cli.api_response` | `gemini_cli.llm_request`, kind LLM: model, tokens (input *includes* the cached tokens; the thinking tokens come *on top of* the output, and are priced once, at the output rate), duration |
+| `gemini_cli.api_error` | the same, with an error status |
+| `gemini_cli.tool_call` | `gemini_cli.tool`, kind TOOL: tool name (`mcp__<server>__<tool>` for MCP), duration, an error status when it failed (`tool_not_registered`, …) or was rejected |
+| `gemini_cli.user_prompt` | `gemini_cli.user_prompt`, a zero-duration marker per turn |
+| `gemini_cli.api_request`, `gen_ai.client.inference.operation.details` | folded |
+| `config`, `model_routing`, `startup_stats`, … | not mapped (kept as plain spans under `--logs all`) |
+
+`gen_ai.client.inference.operation.details` is the GenAI conventions' event: Gemini CLI sends
+two per call (at the start and at the end), without the cache or thinking counts, and with its
+whole system prompt on each copy whatever `logPrompts` says. evald folds them and stores none.
+
+**A command that fails is not a failed tool call to Gemini CLI either**: `exit 3` is
+`success: true`, and the exit code is in output it does not export.
+
+**Where a span sits.** Gemini CLI gives every model call and every tool call a trace of its own.
+evald places by turn instead: each `user_prompt` starts a trace, and the spans after it sit
+under its marker, with the record's own context kept as `evald.otel.trace_id` /
+`evald.otel.span_id` (a model call's names its `llm_call` span). Gemini CLI reuses one
+`prompt_id` for every turn of a headless session, so the turn is the prompt event, not the id.
+
+**Both signals on** (`--traces`). An `llm_call` span's usage is set aside, its `tool_call` spans
+are not read as tool calls, and none of its spans is part of the session rollup: each call and
+each turn counts once.
+
+**Privacy.** Prompts are logged unless `logPrompts` is false (the snippet sets it). The
+process's command line rides on every record as a resource attribute (`process.command_args`),
+and for `gemini -p "…"` that is the prompt; evald keeps no resource attribute but
+`service.name`, so it never reaches the store.
+
+### Compatibility fixes these tools found
+
+Both were refusing data from any exporter that does the same, not only these tools:
+
+* **gzip over gRPC.** Node's OTLP/gRPC exporters compress every message. evald's gRPC door
+  refused them all `UNIMPLEMENTED` (Gemini CLI's default protocol); it now accepts gzip.
+* **Empty values in OTLP/JSON.** Node's OTLP/HTTP-JSON exporters send `"value": {}` for an
+  attribute left undefined. The JSON door refused such an export whole; it now reads an empty
+  value as no value, as protobuf does.
+
+---
+
 ## B. Manual spans (any language, or custom frameworks)
 
 No auto-instrumentor for your stack? Emit plain OTel spans and set the attributes
@@ -148,6 +389,9 @@ Both dialects are accepted; set **one** family per concern.
 | Session / thread | `gen_ai.conversation.id` | `session.id` |
 | User | — | `user.id` |
 | Service | resource `service.name` | resource `service.name` |
+| Agent | `gen_ai.agent.name` / `gen_ai.agent.id` | `agent.name` |
+| Tool and call | `gen_ai.tool.name` / `gen_ai.tool.call.id` / `gen_ai.tool.call.arguments` | `tool.name` / `tool_call.id` / `input.value` |
+| MCP tool call | `mcp.method.name` = `tools/call`, with `gen_ai.tool.name` | — |
 
 - **Tokens** power the **Cost** view (grouped by model/provider/service/user) and
   the SQL `spans.total_tokens` column. Set them and cost attribution just works.
@@ -157,6 +401,30 @@ Both dialects are accepted; set **one** family per concern.
   price for stays empty and is reported as `(no price)`.
 - Large `input.value`/`output.value` payloads are offloaded to the blob store and
   shown in the console as an `evald-blob:<key>` reference (fetch via `/v1/blobs/<key>`).
+- **Agents and tools.** A tool or agent span that names its tool, call or agent only by an
+  alias (OpenInference's, the Vercel AI SDK's `ai.toolCall.*`, Claude Code's `tool_name`) also
+  gets the `gen_ai.*` key at ingest, so one key answers a SQL query; the alias stays. The
+  session view counts a call once across its copies and reports the trajectory: model calls per
+  trace, the tool-error rate, and repeated identical tool calls (three in a row is a suspected
+  loop). `/metrics` carries `evald_tool_calls_total` and `evald_tool_call_errors_total` by tool.
+- **An agent's total is not spend.** The GenAI conventions let an `invoke_agent` span report
+  the usage of the whole invocation. When the agent runs in your process its model calls are
+  spans of their own, so evald keeps that total only in the span's raw attributes (marked
+  `evald.usage = "aggregate"`) and prices the model calls; otherwise every cost report would
+  count the run twice. A `CLIENT` agent span (a remote agent, whose model calls leave no spans
+  here) keeps its usage, and is priced.
+- **Operations.** `gen_ai.operation.name` decides the span's kind: `chat`, `text_completion`,
+  `generate_content` are model calls; `execute_tool` a tool; `invoke_agent`, `create_agent` an
+  agent; `retrieval`, `search_memory` a retriever; `embeddings` an embedding. Any other
+  operation is a model call when it carries `gen_ai.request.*`, `gen_ai.response.*` or
+  `gen_ai.usage.*` attributes, and a chain (a workflow, a plan, an agent step) when it does not.
+
+### Agent frameworks
+
+[`examples/recipes/`](../examples/recipes/README.md) has one tested recipe per framework —
+LangGraph, the OpenAI Agents SDK, Pydantic AI, CrewAI, the LiteLLM proxy, the Vercel AI SDK and
+the Claude Agent SDK — each the few lines that send its telemetry here, run in CI against a stub
+model provider with a check of what evald made of it.
 
 ---
 
@@ -283,8 +551,9 @@ with tracer.start_as_current_span("chat") as span:
 
 It works over OTLP/HTTP (protobuf or JSON) and OTLP/gRPC. Re-sent batches do not duplicate the
 score. An event with no evaluation name, or with neither a number, a label nor an `error.type`, is
-dropped and counted in `evald_eval_events_malformed_total`, and never affects the span. Events
-emitted as OTLP **log records** are not ingested: attach them to the span instead. The exact
+dropped and counted in `evald_eval_events_malformed_total`, and never affects the span. The same event
+emitted as an OTLP **log record** works too (`POST /v1/logs` or the gRPC `LogsService`), targeting
+the span its trace context names. The exact
 mapping, limits and the pinned specification version are in [API.md](./API.md#post-v1traces); read
 scores back out in the same shape with `evald scores export --format gen_ai-event`.
 
@@ -347,9 +616,11 @@ curl -H 'content-type: application/json' localhost:4318/v1/traces -d '{
   `:4318`. In an EE fleet, apps export to the **gateway** (`trace_id`-sharded ingest)
   instead; the console served by the fleet-query node then reads the consolidated
   store. Same OTLP contract either way.
-- **Security:** `:4318` has no auth in the OSS node — bind it to localhost or a
-  trusted network, or terminate auth/TLS at a reverse proxy in front of it.
-  See [`OPERATIONS.md`](OPERATIONS.md).
+- **Security:** evald binds loopback by default and has no auth until you arm it. Before
+  exposing `:4318` / `:4317`, set `--auth-token` (or `EVALD_AUTH_TOKEN`); exporters then send
+  `OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer <token>"` (`evald connect … --token-env`
+  prints it). evald does no TLS: terminate it at a reverse proxy on an untrusted network.
+  See [`OPERATIONS.md` § Security posture](./OPERATIONS.md#security-posture).
 - **Batching:** use a `BatchSpanProcessor` (not `SimpleSpanProcessor`) in real
   services so export doesn't sit on the request path; evald absorbs bursts but the
   SDK-side batch still matters for your app's latency.

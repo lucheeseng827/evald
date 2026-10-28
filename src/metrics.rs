@@ -170,14 +170,33 @@ pub fn render(store: &Store) -> String {
     counter(
         &mut out,
         "evald_eval_events_ingested_total",
-        "gen_ai.evaluation.result span events stored as scores.",
+        "gen_ai.evaluation.result events (span events or log records) stored as scores.",
         eval_events as f64,
     );
     counter(
         &mut out,
         "evald_eval_events_malformed_total",
-        "gen_ai.evaluation.result span events dropped as malformed (no evaluation name, or no value, label or error type). The spans in the same request are unaffected.",
+        "gen_ai.evaluation.result events (span events or log records) dropped as malformed (no evaluation name, or no value, label or error type). Everything else in the same request is unaffected.",
         eval_events_bad as f64,
+    );
+    counter(
+        &mut out,
+        "evald_duplicate_calls_dropped_total",
+        "Spans dropped at ingest as a second copy of a call already stored: the same call sent as both a log event and a span (Claude Code with tracing on), or re-sent.",
+        store.duplicate_calls_dropped() as f64,
+    );
+    // Every outcome is published, zeros included, so an alert on `outcome="unmapped"` has a
+    // series to watch before the first record arrives.
+    let log_outcomes: Vec<(String, u64)> = crate::logs::outcome_counts()
+        .iter()
+        .map(|(o, n)| (o.label().to_string(), *n))
+        .collect();
+    counter_labeled(
+        &mut out,
+        "evald_log_records_total",
+        "OTLP log records received, by what became of them: span or score (kept), folded (recognised, covered by another record), unmapped (not recognised, dropped under --logs genai), off (dropped under --logs off), malformed (a gen_ai.evaluation.result too malformed to keep).",
+        "outcome",
+        &log_outcomes,
     );
     gauge(
         &mut out,

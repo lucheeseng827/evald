@@ -155,6 +155,8 @@ pub struct StoreConfig {
     /// The LLM usage series exposed on `/metrics` ([`crate::usage`]): on by default, with a
     /// cap on distinct model labels.
     pub usage: crate::usage::UsageConfig,
+    /// What the OTLP logs door keeps ([`crate::logs`]): recognised records by default.
+    pub logs: crate::logs::LogsPolicy,
 }
 
 impl Default for StoreConfig {
@@ -211,6 +213,7 @@ impl Default for StoreConfig {
             rollup: crate::rollup::RollupConfig::default(),
             merge: MergePolicy::default(),
             usage: crate::usage::UsageConfig::default(),
+            logs: crate::logs::LogsPolicy::default(),
         }
     }
 }
@@ -293,6 +296,11 @@ pub struct Store {
     /// LLM usage series; `None` under `--no-usage-metrics`. Fed by the writer at the commit
     /// point (never by WAL replay) and by [`Store::put_scores`].
     usage: Option<Arc<crate::usage::UsageMetrics>>,
+    /// What the OTLP logs door keeps.
+    logs_policy: crate::logs::LogsPolicy,
+    /// Calls recently stored, so a second copy of one (the same call sent on two signals) is
+    /// dropped at ingest ([`crate::calls`]).
+    calls: Arc<crate::calls::CallLedger>,
 }
 
 /// A point-in-time snapshot of the ingest pipeline's load, for `GET /v1/stats` — the
@@ -515,7 +523,51 @@ impl Store {
             merge_policy: config.merge,
             merge_counters,
             usage,
+            logs_policy: config.logs,
+            calls: Arc::new(crate::calls::CallLedger::default()),
         })
+    }
+
+    /// Spans dropped at ingest as a second copy of a call already stored.
+    pub fn duplicate_calls_dropped(&self) -> u64 {
+        self.calls.dropped()
+    }
+
+    /// What the OTLP logs door keeps (`--logs`).
+    pub fn logs_policy(&self) -> crate::logs::LogsPolicy {
+        self.logs_policy
+    }
+
+    /// The one ingest core behind every door (HTTP, gRPC) and every signal (traces, logs):
+    /// check the disk floor, redact and offload, durably append, then store the scores the
+    /// request carried. Returns the number of spans appended.
+    ///
+    /// The floor is checked BEFORE [`Store::prepare_for_storage`] because the offload writes:
+    /// relying on `append`'s own check would spend the last of a full volume on blob files no
+    /// span then references. Scores are stored only once the spans are durable; their ids are
+    /// deterministic, so a retry after a failure here overwrites instead of duplicating.
+    pub async fn ingest_batch(
+        &self,
+        mut spans: Vec<NormalizedSpan>,
+        scores: &[Score],
+    ) -> Result<usize, StoreError> {
+        // A call already stored from the other signal is dropped first, so it is neither
+        // written nor counted twice. Its key is remembered only once this batch is durable.
+        let calls = if crate::calls::CallLedger::may_carry_keys(&spans) {
+            self.calls.filter(&mut spans)
+        } else {
+            Vec::new()
+        };
+        let count = spans.len();
+        self.reject_if_disk_full(count)?;
+        self.prepare_for_storage(&mut spans);
+        self.append(spans).await?;
+        self.calls.remember(calls);
+        if let Err(err) = self.put_scores(scores) {
+            tracing::error!(%err, count = scores.len(), "failed to store scores from an ingest request");
+            return Err(StoreError::Io(err));
+        }
+        Ok(count)
     }
 
     /// Offload any oversized `input_value` / `output_value` on these spans to the blob store,
@@ -972,11 +1024,18 @@ impl Store {
     }
 
     /// A snapshot of the hot tier — un-compacted spans still living in memory / the WAL,
-    /// not yet flushed to a Parquet block. The SQL engine unions these with the cold
-    /// blocks (deduping by `(trace_id, span_id)`) so a query sees the full, current set.
+    /// not yet flushed to a Parquet block — with one span per `(trace_id, span_id)`: the
+    /// first to arrive, the copy the read path keeps. A client that sends a span twice, an
+    /// exporter retrying a request evald had already taken, puts two copies in the hot
+    /// tier. The SQL engine unions these with the cold blocks, where a hot span suppresses
+    /// its cold copies, so a query sees the full, current set.
     pub fn hot_spans(&self) -> Vec<NormalizedSpan> {
         let hot = self.hot.read().expect("hot tier lock");
-        hot.all_spans().cloned().collect()
+        let mut seen: HashSet<SpanKey> = HashSet::with_capacity(hot.len());
+        hot.all_spans()
+            .filter(|s| seen.insert(span_key(s)))
+            .cloned()
+            .collect()
     }
 
     /// Retention by **partition drop**: unlink every cold Parquet block whose spans *all* started
@@ -1119,14 +1178,20 @@ async fn recv_ack(ack_rx: oneshot::Receiver<Result<(), StoreError>>) -> Result<(
 }
 
 fn span_key(s: &NormalizedSpan) -> SpanKey {
-    match (decode_hex::<16>(&s.trace_id), decode_hex::<8>(&s.span_id)) {
+    key_of(&s.trace_id, &s.span_id)
+}
+
+/// The [`SpanKey`] of the span with these ids, for a caller holding the ids rather than a
+/// [`NormalizedSpan`]: a merge reading a block's columns.
+fn key_of(trace_id: &str, span_id: &str) -> SpanKey {
+    match (decode_hex::<16>(trace_id), decode_hex::<8>(span_id)) {
         (Some(trace), Some(span)) => {
             let mut k = [0u8; 24];
             k[..16].copy_from_slice(&trace);
             k[16..].copy_from_slice(&span);
             SpanKey::Otlp(k)
         }
-        _ => SpanKey::Other(Box::new((s.trace_id.clone(), s.span_id.clone()))),
+        _ => SpanKey::Other(Box::new((trace_id.to_string(), span_id.to_string()))),
     }
 }
 
@@ -1783,6 +1848,22 @@ fn flush_one(
         Some(spans) => spans.clone(),
         None => return Ok(()),
     };
+    // One row per `(trace_id, span_id)`: a span the segment holds twice, sent again by its
+    // client or by an exporter retrying, is written once, the first copy, as the read path
+    // keeps it. A block never holds two copies, so a SQL scan of one never counts two.
+    let held = spans.len();
+    let mut seen: HashSet<SpanKey> = HashSet::with_capacity(held);
+    let spans: Vec<NormalizedSpan> = spans
+        .into_iter()
+        .filter(|s| seen.insert(span_key(s)))
+        .collect();
+    if spans.len() < held {
+        tracing::debug!(
+            seqno,
+            copies = held - spans.len(),
+            "dropped spans the segment held twice"
+        );
+    }
 
     // 1. Write block(s) durably (tmp -> fsync -> rename -> fsync dir), one per partition.
     let mut blocks = Vec::new();
@@ -1973,6 +2054,7 @@ mod tests {
                 hour_threshold: 0,
                 ..MergePolicy::default()
             },
+            logs: crate::logs::LogsPolicy::default(),
         }
     }
 
@@ -2590,8 +2672,9 @@ mod tests {
         // The background compactor (not compact_now) should pick it up within a few ticks. Poll for
         // up to 5 s: at 1 s this failed whenever the machine was busy (a parallel build, a
         // benchmark), while passing alone every time; the assertion below is what matters.
+        // Wait for the hot drop too: a flush commits the watermark before it drops the group.
         for _ in 0..250 {
-            if store.index.watermark().unwrap() >= 1 {
+            if store.index.watermark().unwrap() >= 1 && store.hot.read().unwrap().len() == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

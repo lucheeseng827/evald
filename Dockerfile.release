@@ -3,16 +3,30 @@
 # multi-arch buildx is seconds instead of an emulated arm64 cargo+LTO build of the full
 # DataFusion/Arrow tree.
 #
-# The docker job stages `evald-amd64` and `evald-arm64` into the build context; buildx sets
-# TARGETARCH per platform, so each image gets its matching static binary.
+# The docker job stages `evald-amd64`, `evald-arm64` and an empty `data/` into the build
+# context; buildx sets TARGETARCH per platform, so each image gets its matching static binary.
 #
 # For a from-source local build use the plain ./Dockerfile instead.
+#
+# `docker run mancube/evald` SERVES (since 0.4.0; it printed the version before): OTLP/HTTP
+# and the UI on 4318, OTLP/gRPC on 4317, the store in the /data volume. Inside a container the
+# listeners bind every interface, since the published ports are the boundary; arm
+# `--auth-token` before publishing them beyond your machine. Every default is an `EVALD_*`
+# variable rather than a flag, so `docker run mancube/evald version`, `eval run …` and an
+# explicit `serve --otlp-http …` all work unchanged.
 FROM gcr.io/distroless/static-debian12:nonroot
 ARG TARGETARCH
 LABEL org.opencontainers.image.source="https://github.com/lucheeseng827/evald" \
       org.opencontainers.image.description="Embedded OTel-native trace + eval store for LLM apps (single binary)" \
       org.opencontainers.image.licenses="Apache-2.0"
 COPY evald-${TARGETARCH} /usr/local/bin/evald
-EXPOSE 4318
+# Owned by the image's user (nonroot, 65532), so a fresh named volume is writable. A bind
+# mount keeps its host ownership: run as its owner (`--user "$(id -u):$(id -g)"`).
+COPY --chown=65532:65532 data /data
+ENV EVALD_OTLP_HTTP_ADDR=0.0.0.0:4318 \
+    EVALD_OTLP_GRPC_ADDR=0.0.0.0:4317 \
+    EVALD_DATA_DIR=/data
+VOLUME ["/data"]
+EXPOSE 4317 4318
 ENTRYPOINT ["/usr/local/bin/evald"]
-CMD ["version"]
+CMD ["serve"]

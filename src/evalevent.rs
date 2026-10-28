@@ -22,8 +22,8 @@
 //!
 //! * **Span events** in a traces export: yes. The target is the span carrying the event.
 //! * **Log-record events** (the OTLP *logs* signal, which is how the spec's SDKs emit events
-//!   today): **not ingested**, evald has no logs endpoint. Emit the evaluation as a span event,
-//!   or post it to `POST /v1/scores`.
+//!   today): yes, through `POST /v1/logs` and the gRPC `LogsService` ([`crate::logs`]). The
+//!   target is the span the record's trace context names, else its trace.
 //! * `gen_ai.response.id`: not stored. A span event is already attached to its span, which is
 //!   the correlation the spec falls back to the id for.
 //!
@@ -103,8 +103,16 @@ pub fn extract(req: &ExportTraceServiceRequest) -> Vec<Score> {
             }
         }
     }
-    if !out.is_empty() {
-        INGESTED.fetch_add(out.len() as u64, Ordering::Relaxed);
+    count(out.len(), bad);
+    out
+}
+
+/// Account for one request's worth of evaluation events: `ok` stored as scores, `bad`
+/// dropped as malformed. Shared by the span-event path here and the log-record path
+/// ([`crate::logs`]), so `/metrics` counts the event the same way whichever signal carried it.
+pub(crate) fn count(ok: usize, bad: u64) {
+    if ok > 0 {
+        INGESTED.fetch_add(ok as u64, Ordering::Relaxed);
     }
     if bad > 0 {
         MALFORMED.fetch_add(bad, Ordering::Relaxed);
@@ -114,11 +122,34 @@ pub fn extract(req: &ExportTraceServiceRequest) -> Vec<Score> {
              {VALUE}, a {LABEL} or an {ERROR_TYPE}"
         );
     }
-    out
 }
 
 fn to_score(span: &Span, event: &Event) -> Option<Score> {
-    let a = &event.attributes;
+    let ts = if event.time_unix_nano > 0 {
+        event.time_unix_nano
+    } else {
+        span.end_time_unix_nano
+    };
+    score_from_event(
+        &span.trace_id,
+        &span.span_id,
+        &event.attributes,
+        event.time_unix_nano,
+        ts,
+    )
+}
+
+/// One evaluation event as a [`Score`] on the span (`span_id`) or, without one, the trace
+/// (`trace_id`) it names. `None` when it is malformed or names neither. `id_time` feeds the
+/// deterministic id; `ts` is the score's timestamp. The log-record path calls this with the
+/// record's trace context and time.
+pub(crate) fn score_from_event(
+    trace_id: &[u8],
+    span_id: &[u8],
+    a: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+    id_time: u64,
+    ts: u64,
+) -> Option<Score> {
     let name = cap(attr_str(a, NAME)?.trim(), MAX_NAME);
     if name.is_empty() {
         return None;
@@ -149,24 +180,19 @@ fn to_score(span: &Span, event: &Event) -> Option<Score> {
         (None, None) => None,
     };
 
-    let trace_id = hex::encode(&span.trace_id);
-    let (target, span_id) = if span.span_id.is_empty() {
+    let trace_id = hex::encode(trace_id);
+    let (target, span_id) = if span_id.is_empty() {
         if trace_id.is_empty() {
             return None;
         }
         (ScoreTarget::Trace(trace_id.clone()), String::new())
     } else {
-        let s = hex::encode(&span.span_id);
+        let s = hex::encode(span_id);
         (ScoreTarget::Span(s.clone()), s)
-    };
-    let ts = if event.time_unix_nano > 0 {
-        event.time_unix_nano
-    } else {
-        span.end_time_unix_nano
     };
 
     Some(Score {
-        id: score_id(&trace_id, &span_id, &name, event.time_unix_nano),
+        id: score_id(&trace_id, &span_id, &name, id_time),
         target,
         name,
         num_value,

@@ -1,0 +1,12 @@
+# LiteLLM proxy -> evald: every call through the proxy becomes a span in evald.
+# `callbacks: ["otel"]` is the whole integration; the exporter is configured by environment
+# (OTEL_EXPORTER=otlp_http, OTEL_ENDPOINT=<evald>/v1/traces), set by app.py.
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_base: os.environ/OPENAI_BASE_URL
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  callbacks: ["otel"]

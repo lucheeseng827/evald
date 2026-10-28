@@ -1,0 +1,6 @@
+langgraph==1.2.16
+langchain-openai==1.7.2
+langchain-core==1.6.12
+openinference-instrumentation-langchain==0.1.79
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1

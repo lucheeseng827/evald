@@ -15,8 +15,13 @@
 //! serves a matching asset (`index.html`, `assets/*.js`, `assets/*.css`), else falls back to
 //! `index.html` so the single-page app owns client-side navigation. In debug builds
 //! `rust-embed` reads the files from disk; in release it embeds their bytes.
+//!
+//! The fallback is for a **browser**: only `GET` / `HEAD`, and never under `/v1/`. Anything else
+//! is a 404 that names the request. Answering it with the app shell would tell an OTLP exporter
+//! pointed at a signal evald does not take (`POST /v1/metrics`), or an API client with a typo in
+//! the path, that its request succeeded.
 
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{header, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
@@ -25,9 +30,17 @@ use rust_embed::RustEmbed;
 struct Assets;
 
 /// Serve an embedded asset by request path, falling back to `index.html` (the SPA shell)
-/// for paths that don't map to a bundled file.
-pub async fn static_handler(uri: Uri) -> Response {
+/// for paths that don't map to a bundled file. A request a browser would not make for the
+/// console (another method, or a path under `/v1/`) is a 404.
+pub async fn static_handler(method: Method, uri: Uri) -> Response {
     let raw = uri.path().trim_start_matches('/');
+    if !(method == Method::GET || method == Method::HEAD) || raw == "v1" || raw.starts_with("v1/") {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("evald: no such endpoint: {method} {}\n", uri.path()),
+        )
+            .into_response();
+    }
 
     // Reject path traversal before any lookup. In *debug* builds rust-embed reads from disk,
     // so a literal `..` segment could otherwise escape `frontend/` and disclose a local
@@ -191,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_falls_back_to_index() {
-        let resp = static_handler("/some/spa/route".parse().unwrap()).await;
+        let resp = static_handler(Method::GET, "/some/spa/route".parse().unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -205,7 +218,7 @@ mod tests {
         let path = Assets::iter()
             .find(|p| p.ends_with(".js"))
             .expect("a JS asset");
-        let resp = static_handler(format!("/{path}").parse().unwrap()).await;
+        let resp = static_handler(Method::GET, format!("/{path}").parse().unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -221,8 +234,32 @@ mod tests {
             "/../../etc/passwd",
             "/assets/../../src/ui.rs",
         ] {
-            let resp = static_handler(evil.parse().unwrap()).await;
+            let resp = static_handler(Method::GET, evil.parse().unwrap()).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "should 404: {evil}");
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_browser_request_gets_the_app_shell() {
+        // An exporter sending a signal evald does not take, or an API path that does not
+        // exist, must not read as accepted.
+        for (method, path) in [
+            (Method::POST, "/v1/metrics"),
+            (Method::POST, "/"),
+            (Method::PUT, "/some/spa/route"),
+            (Method::GET, "/v1/no-such-endpoint"),
+            (Method::GET, "/v1"),
+        ] {
+            let resp = static_handler(method.clone(), path.parse().unwrap()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {path}");
+            let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains(&format!("{method} {path}")), "{body}");
+        }
+        let head = static_handler(Method::HEAD, "/".parse().unwrap()).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        // A client route that merely starts with the letters is still the console's.
+        let route = static_handler(Method::GET, "/v1x/route".parse().unwrap()).await;
+        assert_eq!(route.status(), StatusCode::OK);
     }
 }

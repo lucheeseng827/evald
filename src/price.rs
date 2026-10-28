@@ -1030,7 +1030,12 @@ mod tests {
             b.version
         );
         assert!(b.as_of.is_some());
-        for m in ["gpt-4o", "claude-sonnet-4-5", "gemini-2.5-pro"] {
+        for m in [
+            "gpt-4o",
+            "claude-sonnet-4-5",
+            "claude-haiku-5-5",
+            "gemini-2.5-pro",
+        ] {
             assert!(b.lookup(m).is_some(), "baseline is missing {m}");
         }
         let (_, gpt) = b.lookup("gpt-4o").unwrap();

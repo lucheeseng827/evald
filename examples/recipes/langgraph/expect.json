@@ -1,0 +1,5 @@
+{
+  "service": "recipe-langgraph",
+  "llm": {"min": 2, "model": "gpt-4o-mini", "tokens": true, "cost": true},
+  "tool": {"min": 1, "name": "get_weather"}
+}

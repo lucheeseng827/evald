@@ -1,0 +1,1050 @@
+{
+ "resourceSpans": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "host.name",
+      "value": {
+       "stringValue": "host-fixture-1"
+      }
+     },
+     {
+      "key": "host.arch",
+      "value": {
+       "stringValue": "amd64"
+      }
+     },
+     {
+      "key": "process.pid",
+      "value": {
+       "intValue": 4979
+      }
+     },
+     {
+      "key": "process.executable.name",
+      "value": {
+       "stringValue": "/opt/node22/bin/node"
+      }
+     },
+     {
+      "key": "process.executable.path",
+      "value": {
+       "stringValue": "/opt/node22/bin/node"
+      }
+     },
+     {
+      "key": "process.command_args",
+      "value": {
+       "arrayValue": {
+        "values": [
+         {
+          "stringValue": "[blanked by otlp-fixture]"
+         }
+        ]
+       }
+      }
+     },
+     {
+      "key": "process.runtime.version",
+      "value": {
+       "stringValue": "22.22.0"
+      }
+     },
+     {
+      "key": "process.runtime.name",
+      "value": {
+       "stringValue": "nodejs"
+      }
+     },
+     {
+      "key": "process.runtime.description",
+      "value": {
+       "stringValue": "Node.js"
+      }
+     },
+     {
+      "key": "process.command",
+      "value": {
+       "stringValue": "[blanked by otlp-fixture]"
+      }
+     },
+     {
+      "key": "process.owner",
+      "value": {
+       "stringValue": "[blanked by otlp-fixture]"
+      }
+     },
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "gemini-cli"
+      }
+     },
+     {
+      "key": "service.version",
+      "value": {
+       "stringValue": "v22.22.0"
+      }
+     },
+     {
+      "key": "session.id",
+      "value": {
+       "stringValue": "session-fixture-1"
+      }
+     }
+    ],
+    "droppedAttributesCount": 0
+   },
+   "scopeSpans": [
+    {
+     "scope": {
+      "name": "gemini-cli",
+      "version": "v1"
+     },
+     "spans": [
+      {
+       "traceId": "f43304218064afe932dffe77bfef9809",
+       "spanId": "f7ab2fd952d3019c",
+       "name": "llm_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861514000000",
+       "endTimeUnixNano": "1792610861628221463",
+       "attributes": [
+        {
+         "key": "gen_ai.request.model",
+         "value": {
+          "stringValue": "gemini-3.8-flash"
+         }
+        },
+        {
+         "key": "gen_ai.prompt.name",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.system_instructions",
+         "value": {
+          "stringValue": "\"You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. You are currently operating in **YOLO** mode. Your primary goal is to help users safely and effectively.\\n\\n# Core Mandates\\n\\n## Security & System Integrity\\n- **Credential Protection:** Never log, print, or commit secrets, API keys, or sensitive credentials. Rigorously protect `.env` files, `.git`, and system configuration folders.\\n- **Source Control:** Do not stage or commit changes unless specifically requested by ...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.tool.definitions",
+         "value": {
+          "stringValue": "[{\"functionDeclarations\":[{\"name\":\"update_topic\",\"description\":\"Manages your narrative flow. Include `title` and `summary` only when starting a new Chapter (logical phase) or shifting strategic intent.\",\"parametersJsonSchema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"The title of the new topic or chapter.\"},\"summary\":{\"type\":\"string\",\"description\":\"(OPTIONAL) A detailed summary (5-10 sentences) covering both the work completed in the previous topic and the strategic intent of th...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "llm_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        },
+        {
+         "key": "gen_ai.usage.input_tokens",
+         "value": {
+          "intValue": 120
+         }
+        },
+        {
+         "key": "gen_ai.usage.output_tokens",
+         "value": {
+          "intValue": 24
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "367e6f38caa3309f68c785028594fb45",
+       "spanId": "35b319c24364544e",
+       "parentSpanId": "2ad29079e2b14521",
+       "name": "tool_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861657000000",
+       "endTimeUnixNano": "1792610861676580053",
+       "attributes": [
+        {
+         "key": "gen_ai.tool.name",
+         "value": {
+          "stringValue": "run_shell_command"
+         }
+        },
+        {
+         "key": "gen_ai.tool.call_id",
+         "value": {
+          "stringValue": "tool-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.tool.description",
+         "value": {
+          "stringValue": "This tool executes a given shell command as `bash -c <command>`. Command can start background processes using `&`. Command is executed as a subprocess that leads its own process group. Command process group can be terminated as `kill -- -PGID` or signaled as `kill -s SIGNAL -- -PGID`.\n\n      Efficiency Guidelines:\n      - Quiet Flags: Always prefer silent or quiet flags (e.g., `npm install --silent`, `git --no-pager`) to reduce output volume while still capturing necessary information.\n      - Pagination: A...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "tool_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "367e6f38caa3309f68c785028594fb45",
+       "spanId": "2ad29079e2b14521",
+       "name": "schedule_tool_calls",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861630000000",
+       "endTimeUnixNano": "1792610861679545296",
+       "attributes": [
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "schedule_tool_calls"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "4f3ba374d69fa74b8279abea3a1f4b15",
+       "spanId": "6ce69ed3adfd518e",
+       "name": "llm_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861683000000",
+       "endTimeUnixNano": "1792610861742363832",
+       "attributes": [
+        {
+         "key": "gen_ai.request.model",
+         "value": {
+          "stringValue": "gemini-3.8-flash"
+         }
+        },
+        {
+         "key": "gen_ai.prompt.name",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.system_instructions",
+         "value": {
+          "stringValue": "\"You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. You are currently operating in **YOLO** mode. Your primary goal is to help users safely and effectively.\\n\\n# Core Mandates\\n\\n## Security & System Integrity\\n- **Credential Protection:** Never log, print, or commit secrets, API keys, or sensitive credentials. Rigorously protect `.env` files, `.git`, and system configuration folders.\\n- **Source Control:** Do not stage or commit changes unless specifically requested by ...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.tool.definitions",
+         "value": {
+          "stringValue": "[{\"functionDeclarations\":[{\"name\":\"update_topic\",\"description\":\"Manages your narrative flow. Include `title` and `summary` only when starting a new Chapter (logical phase) or shifting strategic intent.\",\"parametersJsonSchema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"The title of the new topic or chapter.\"},\"summary\":{\"type\":\"string\",\"description\":\"(OPTIONAL) A detailed summary (5-10 sentences) covering both the work completed in the previous topic and the strategic intent of th...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "llm_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        },
+        {
+         "key": "gen_ai.usage.input_tokens",
+         "value": {
+          "intValue": 120
+         }
+        },
+        {
+         "key": "gen_ai.usage.output_tokens",
+         "value": {
+          "intValue": 24
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "6fe3e871b3213149c17c6da16511ea27",
+       "spanId": "7f1c7d951df55722",
+       "parentSpanId": "51afb27600b0ee51",
+       "name": "tool_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861746000000",
+       "endTimeUnixNano": "1792610861749485490",
+       "attributes": [
+        {
+         "key": "gen_ai.tool.name",
+         "value": {
+          "stringValue": "mcp_weather_get_weather"
+         }
+        },
+        {
+         "key": "gen_ai.tool.call_id",
+         "value": {
+          "stringValue": "tool-fixture-2"
+         }
+        },
+        {
+         "key": "gen_ai.tool.description",
+         "value": {
+          "stringValue": "The current weather in a city."
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "tool_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "6fe3e871b3213149c17c6da16511ea27",
+       "spanId": "51afb27600b0ee51",
+       "name": "schedule_tool_calls",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861743000000",
+       "endTimeUnixNano": "1792610861749960789",
+       "attributes": [
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "schedule_tool_calls"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "ba2dba5644917d9dc66a4f8adffddb98",
+       "spanId": "1cdfae8d3b8ddd94",
+       "name": "llm_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861754000000",
+       "endTimeUnixNano": "1792610861771035027",
+       "attributes": [
+        {
+         "key": "gen_ai.request.model",
+         "value": {
+          "stringValue": "gemini-3.8-flash"
+         }
+        },
+        {
+         "key": "gen_ai.prompt.name",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.system_instructions",
+         "value": {
+          "stringValue": "\"You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. You are currently operating in **YOLO** mode. Your primary goal is to help users safely and effectively.\\n\\n# Core Mandates\\n\\n## Security & System Integrity\\n- **Credential Protection:** Never log, print, or commit secrets, API keys, or sensitive credentials. Rigorously protect `.env` files, `.git`, and system configuration folders.\\n- **Source Control:** Do not stage or commit changes unless specifically requested by ...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.tool.definitions",
+         "value": {
+          "stringValue": "[{\"functionDeclarations\":[{\"name\":\"update_topic\",\"description\":\"Manages your narrative flow. Include `title` and `summary` only when starting a new Chapter (logical phase) or shifting strategic intent.\",\"parametersJsonSchema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"The title of the new topic or chapter.\"},\"summary\":{\"type\":\"string\",\"description\":\"(OPTIONAL) A detailed summary (5-10 sentences) covering both the work completed in the previous topic and the strategic intent of th...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "llm_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        },
+        {
+         "key": "gen_ai.usage.input_tokens",
+         "value": {
+          "intValue": 120
+         }
+        },
+        {
+         "key": "gen_ai.usage.output_tokens",
+         "value": {
+          "intValue": 24
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "94177985b2f325f068c2c40aca24be8b",
+       "spanId": "9ea6dce91b58afed",
+       "parentSpanId": "0575f777e704a194",
+       "name": "tool_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861776000000",
+       "endTimeUnixNano": "1792610861799064410",
+       "attributes": [
+        {
+         "key": "gen_ai.tool.name",
+         "value": {
+          "stringValue": "run_shell_command"
+         }
+        },
+        {
+         "key": "gen_ai.tool.call_id",
+         "value": {
+          "stringValue": "tool-fixture-3"
+         }
+        },
+        {
+         "key": "gen_ai.tool.description",
+         "value": {
+          "stringValue": "This tool executes a given shell command as `bash -c <command>`. Command can start background processes using `&`. Command is executed as a subprocess that leads its own process group. Command process group can be terminated as `kill -- -PGID` or signaled as `kill -s SIGNAL -- -PGID`.\n\n      Efficiency Guidelines:\n      - Quiet Flags: Always prefer silent or quiet flags (e.g., `npm install --silent`, `git --no-pager`) to reduce output volume while still capturing necessary information.\n      - Pagination: A...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "tool_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "94177985b2f325f068c2c40aca24be8b",
+       "spanId": "0575f777e704a194",
+       "name": "schedule_tool_calls",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861771000000",
+       "endTimeUnixNano": "1792610861800962304",
+       "attributes": [
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "schedule_tool_calls"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "61f788f32b3e55721d6ff9456ceeff3b",
+       "spanId": "b76e61981e4a6782",
+       "name": "llm_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610861805000000",
+       "endTimeUnixNano": "1792610861818566008",
+       "attributes": [
+        {
+         "key": "gen_ai.request.model",
+         "value": {
+          "stringValue": "gemini-3.8-flash"
+         }
+        },
+        {
+         "key": "gen_ai.prompt.name",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.system_instructions",
+         "value": {
+          "stringValue": "\"You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. You are currently operating in **YOLO** mode. Your primary goal is to help users safely and effectively.\\n\\n# Core Mandates\\n\\n## Security & System Integrity\\n- **Credential Protection:** Never log, print, or commit secrets, API keys, or sensitive credentials. Rigorously protect `.env` files, `.git`, and system configuration folders.\\n- **Source Control:** Do not stage or commit changes unless specifically requested by ...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.tool.definitions",
+         "value": {
+          "stringValue": "[{\"functionDeclarations\":[{\"name\":\"update_topic\",\"description\":\"Manages your narrative flow. Include `title` and `summary` only when starting a new Chapter (logical phase) or shifting strategic intent.\",\"parametersJsonSchema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"The title of the new topic or chapter.\"},\"summary\":{\"type\":\"string\",\"description\":\"(OPTIONAL) A detailed summary (5-10 sentences) covering both the work completed in the previous topic and the strategic intent of th...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "llm_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        },
+        {
+         "key": "gen_ai.usage.input_tokens",
+         "value": {
+          "intValue": 120
+         }
+        },
+        {
+         "key": "gen_ai.usage.output_tokens",
+         "value": {
+          "intValue": 24
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "host.name",
+      "value": {
+       "stringValue": "host-fixture-1"
+      }
+     },
+     {
+      "key": "host.arch",
+      "value": {
+       "stringValue": "amd64"
+      }
+     },
+     {
+      "key": "process.pid",
+      "value": {
+       "intValue": 5022
+      }
+     },
+     {
+      "key": "process.executable.name",
+      "value": {
+       "stringValue": "/opt/node22/bin/node"
+      }
+     },
+     {
+      "key": "process.executable.path",
+      "value": {
+       "stringValue": "/opt/node22/bin/node"
+      }
+     },
+     {
+      "key": "process.command_args",
+      "value": {
+       "arrayValue": {
+        "values": [
+         {
+          "stringValue": "[blanked by otlp-fixture]"
+         }
+        ]
+       }
+      }
+     },
+     {
+      "key": "process.runtime.version",
+      "value": {
+       "stringValue": "22.22.0"
+      }
+     },
+     {
+      "key": "process.runtime.name",
+      "value": {
+       "stringValue": "nodejs"
+      }
+     },
+     {
+      "key": "process.runtime.description",
+      "value": {
+       "stringValue": "Node.js"
+      }
+     },
+     {
+      "key": "process.command",
+      "value": {
+       "stringValue": "[blanked by otlp-fixture]"
+      }
+     },
+     {
+      "key": "process.owner",
+      "value": {
+       "stringValue": "[blanked by otlp-fixture]"
+      }
+     },
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "gemini-cli"
+      }
+     },
+     {
+      "key": "service.version",
+      "value": {
+       "stringValue": "v22.22.0"
+      }
+     },
+     {
+      "key": "session.id",
+      "value": {
+       "stringValue": "session-fixture-1"
+      }
+     }
+    ],
+    "droppedAttributesCount": 0
+   },
+   "scopeSpans": [
+    {
+     "scope": {
+      "name": "gemini-cli",
+      "version": "v1"
+     },
+     "spans": [
+      {
+       "traceId": "7d5d14432d05eb1ba68ccae29c1d0063",
+       "spanId": "614874f1c89eb763",
+       "name": "llm_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610865468000000",
+       "endTimeUnixNano": "1792610865533155519",
+       "attributes": [
+        {
+         "key": "gen_ai.request.model",
+         "value": {
+          "stringValue": "gemini-3.8-flash"
+         }
+        },
+        {
+         "key": "gen_ai.prompt.name",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.system_instructions",
+         "value": {
+          "stringValue": "\"You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. You are currently operating in **Default** mode. Your primary goal is to help users safely and effectively.\\n\\n# Core Mandates\\n\\n## Security & System Integrity\\n- **Credential Protection:** Never log, print, or commit secrets, API keys, or sensitive credentials. Rigorously protect `.env` files, `.git`, and system configuration folders.\\n- **Source Control:** Do not stage or commit changes unless specifically requested ...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.tool.definitions",
+         "value": {
+          "stringValue": "[{\"functionDeclarations\":[{\"name\":\"update_topic\",\"description\":\"Manages your narrative flow. Include `title` and `summary` only when starting a new Chapter (logical phase) or shifting strategic intent.\",\"parametersJsonSchema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"The title of the new topic or chapter.\"},\"summary\":{\"type\":\"string\",\"description\":\"(OPTIONAL) A detailed summary (5-10 sentences) covering both the work completed in the previous topic and the strategic intent of th...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "llm_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        },
+        {
+         "key": "gen_ai.usage.input_tokens",
+         "value": {
+          "intValue": 120
+         }
+        },
+        {
+         "key": "gen_ai.usage.output_tokens",
+         "value": {
+          "intValue": 24
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "d93eb51a51c476788709b54f293e1701",
+       "spanId": "6b8b51340fa702b7",
+       "name": "schedule_tool_calls",
+       "kind": 1,
+       "startTimeUnixNano": "1792610865535000000",
+       "endTimeUnixNano": "1792610865541710989",
+       "attributes": [
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "schedule_tool_calls"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      },
+      {
+       "traceId": "c22a82c1e88d3fb01c0f8b443be929c1",
+       "spanId": "90799410b38c1708",
+       "name": "llm_call",
+       "kind": 1,
+       "startTimeUnixNano": "1792610865546000000",
+       "endTimeUnixNano": "1792610865562803796",
+       "attributes": [
+        {
+         "key": "gen_ai.request.model",
+         "value": {
+          "stringValue": "gemini-3.8-flash"
+         }
+        },
+        {
+         "key": "gen_ai.prompt.name",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.system_instructions",
+         "value": {
+          "stringValue": "\"You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. You are currently operating in **Default** mode. Your primary goal is to help users safely and effectively.\\n\\n# Core Mandates\\n\\n## Security & System Integrity\\n- **Credential Protection:** Never log, print, or commit secrets, API keys, or sensitive credentials. Rigorously protect `.env` files, `.git`, and system configuration folders.\\n- **Source Control:** Do not stage or commit changes unless specifically requested ...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.tool.definitions",
+         "value": {
+          "stringValue": "[{\"functionDeclarations\":[{\"name\":\"update_topic\",\"description\":\"Manages your narrative flow. Include `title` and `summary` only when starting a new Chapter (logical phase) or shifting strategic intent.\",\"parametersJsonSchema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\",\"description\":\"The title of the new topic or chapter.\"},\"summary\":{\"type\":\"string\",\"description\":\"(OPTIONAL) A detailed summary (5-10 sentences) covering both the work completed in the previous topic and the strategic intent of th...[cut by otlp-fixture --max-string]"
+         }
+        },
+        {
+         "key": "gen_ai.conversation.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "gen_ai.operation.name",
+         "value": {
+          "stringValue": "llm_call"
+         }
+        },
+        {
+         "key": "gen_ai.agent.name",
+         "value": {
+          "stringValue": "gemini-cli"
+         }
+        },
+        {
+         "key": "gen_ai.agent.description",
+         "value": {
+          "stringValue": "Gemini CLI is an open-source AI agent that brings the power of Gemini directly into your terminal. It is designed to be a terminal-first, extensible, and powerful tool for developers, engineers, SREs, and beyond."
+         }
+        },
+        {
+         "key": "gen_ai.usage.input_tokens",
+         "value": {
+          "intValue": 120
+         }
+        },
+        {
+         "key": "gen_ai.usage.output_tokens",
+         "value": {
+          "intValue": 24
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "events": [],
+       "droppedEventsCount": 0,
+       "status": {
+        "code": 1
+       },
+       "links": [],
+       "droppedLinksCount": 0,
+       "flags": 257
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

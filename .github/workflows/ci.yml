@@ -17,6 +17,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only, and no job keeps the token in .git/config: the recipe jobs install and run
+# third-party packages (the frameworks, LiteLLM), which could read it.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -26,6 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,6 +49,17 @@ jobs:
       # default build, and it makes no network call here.
       - name: Clippy (judge feature)
         run: cargo clippy --all-targets --features judge -- -D warnings
+      # "No outbound call in the default build", checked from the resolved dependency graph and
+      # the source rather than stated. The selftest proves the check can fail: the opt-in judge
+      # build carries reqwest + rustls and must be flagged.
+      - name: No network client in the default build
+        run: |
+          scripts/check-no-network.sh
+          scripts/check-no-network.sh --selftest
+      - name: Every relative doc link resolves
+        run: python3 scripts/check-doc-links.py .
+      - name: install.sh lints
+        run: shellcheck -s sh install.sh
 
   # A backup nobody has restored is a cron job producing files. This runs the documented
   # recovery end to end on every push and asserts the property that matters: a restore
@@ -56,6 +74,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -80,6 +100,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -104,6 +126,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust (musl target)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -122,3 +146,85 @@ jobs:
           "$bin" version
           # Confirm it is a static binary (no dynamic interpreter).
           file "$bin"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: evald-musl
+          path: target/x86_64-unknown-linux-musl/release/evald
+          retention-days: 1
+
+  # 0.4.0's release bar: a clean machine to a coding agent's first session in three commands,
+  # by the README's own quick start. A bare ubuntu container (no Rust, no clone) runs the README's
+  # lines as written, installing the static binary above through install.sh, then a real
+  # Claude Code whose model calls go to the recipes' stub provider (no key, no network), and
+  # requires the session it made: a model call with its model, tokens and cost.
+  # scripts/clean-machine.py says what it stands in for and what it checks after each line.
+  clean-machine:
+    name: clean machine — the README quick start on bare ubuntu
+    needs: musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: evald-musl
+          path: bin
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The README quick start on ubuntu:24.04
+        run: python3 scripts/clean-machine.py --evald bin/evald
+
+  # Each framework recipe (examples/recipes/<name>) run end to end: the framework's real agent
+  # loop against the stub provider (no key, no network), its telemetry into a real evald, then
+  # check.py asserts evald's reading of it — model, tokens, cost on the model calls, the tool
+  # call under its canonical name, and no usage on any other span. A framework release that
+  # renames an attribute, or an evald change that misreads one, fails here.
+  recipes-build:
+    name: recipes — build evald
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --bin evald
+      - uses: actions/upload-artifact@v4
+        with:
+          name: evald-debug
+          path: target/debug/evald
+          retention-days: 1
+
+  recipes:
+    name: recipe — ${{ matrix.recipe }}
+    needs: recipes-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        recipe: [langgraph, openai-agents, pydantic-ai, crewai, litellm-proxy, vercel-ai-sdk, claude-agent-sdk]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: evald-debug
+          path: bin
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run the recipe
+        env:
+          RECIPE: ${{ matrix.recipe }}
+        run: |
+          chmod +x bin/evald
+          EVALD="$PWD/bin/evald" sh examples/recipes/run.sh "$RECIPE"

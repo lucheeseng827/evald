@@ -688,7 +688,15 @@ mod http {
     }
 
     fn env_base(var: &str, default: &str) -> String {
-        std::env::var(var).unwrap_or_else(|_| default.to_string())
+        api_root(&std::env::var(var).unwrap_or_else(|_| default.to_string()))
+    }
+
+    /// The server root a base URL names. The OpenAI SDKs' own convention is a base that ends in
+    /// `/v1` (`http://host:8000/v1`), and the paths below add `/v1/...` themselves, so a
+    /// trailing `/v1` (and any trailing `/`) is dropped rather than doubled.
+    fn api_root(raw: &str) -> String {
+        let t = raw.trim_end_matches('/');
+        t.strip_suffix("/v1").unwrap_or(t).to_string()
     }
 
     /// Truncate a provider error body before surfacing it (defensive — keep logs/errors bounded).
@@ -772,6 +780,26 @@ mod http {
             .as_str()
             .unwrap_or_default();
         Ok(out.to_string())
+    }
+
+    #[cfg(test)]
+    mod api_root_tests {
+        use super::api_root;
+
+        #[test]
+        fn a_base_with_or_without_v1_names_the_same_root() {
+            for raw in [
+                "http://host:8000",
+                "http://host:8000/",
+                "http://host:8000/v1",
+                "http://host:8000/v1/",
+            ] {
+                assert_eq!(api_root(raw), "http://host:8000", "{raw}");
+            }
+            // Only a whole trailing segment is dropped.
+            assert_eq!(api_root("http://host/apiv1"), "http://host/apiv1");
+            assert_eq!(api_root("http://host/v1/proxy"), "http://host/v1/proxy");
+        }
     }
 }
 

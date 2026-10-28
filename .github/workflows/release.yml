@@ -41,7 +41,29 @@ env:
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
+  # The tag names the release, the image and the formula; Cargo.toml names the crate and what
+  # `evald version` prints. If they differ every later job still succeeds (crates.io skips a
+  # version it already has), so a mismatch fails here, before anything is built.
+  version:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Compare
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          have="$(awk -F'"' '/^\[package\]/ { p = 1; next } /^\[/ { p = 0 } p && $1 ~ /^version *= *$/ { print $2; exit }' Cargo.toml)"
+          if [[ "$have" != "$want" ]]; then
+            echo "::error::tag $TAG is version $want but Cargo.toml says $have; bump Cargo.toml or tag v$have."
+            exit 1
+          fi
+          echo "tag $TAG matches Cargo.toml $have"
+
   build:
+    needs: version
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -147,12 +169,21 @@ jobs:
         # Verify: cosign verify-blob --certificate SHA256SUMS.pem --signature SHA256SUMS.sig \
         #   --certificate-identity-regexp '^https://github\.com/lucheeseng827/evald/\.github/workflows/release\.yml@.+' \
         #   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+        # Pinned: --new-bundle-format (below) is cosign 2.4 and later.
         uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
       - name: Cosign keyless-sign the checksums
+        # Twice: the detached .sig + .pem that install.sh checks online, and a Sigstore bundle
+        # that also carries the transparency-log proof, so it verifies with no network (given a
+        # trusted root). The detached pair cannot: verified offline it needs Rekor.
         run: |
           cosign sign-blob --yes \
             --output-signature dist/SHA256SUMS.sig \
             --output-certificate dist/SHA256SUMS.pem \
+            dist/SHA256SUMS
+          cosign sign-blob --yes --new-bundle-format \
+            --bundle dist/SHA256SUMS.sigstore.json \
             dist/SHA256SUMS
       - name: Attest SLSA build provenance
         # GitHub-native, keyless SLSA provenance for the release binaries. Verify with:
@@ -177,7 +208,74 @@ jobs:
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
             dist/SHA256SUMS.pem
+            dist/SHA256SUMS.sigstore.json
             dist/evald.sbom.spdx.json
+
+  airgap:
+    name: air-gap bundle
+    needs: release
+    runs-on: ubuntu-latest
+    # The bundle a machine with no network installs from (docs/OPERATIONS.md § Air-gapped
+    # install): the linux/amd64 binary as released, the image as a loadable archive, the chart,
+    # the price table, the SBOM and provenance, a Sigstore trusted root and verify.sh, under one
+    # SHA256SUMS signed keyless into a Sigstore bundle. Checked offline before it is attached.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: azure/setup-helm@v4
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+      - name: The release, as published
+        run: |
+          mkdir -p rel
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir rel \
+            --pattern 'evald-x86_64-unknown-linux-musl.tar.gz' --pattern 'SHA256SUMS*' \
+            --pattern 'evald.sbom.spdx.json'
+          gh attestation download rel/evald-x86_64-unknown-linux-musl.tar.gz \
+            --repo "$GITHUB_REPOSITORY"
+          mv sha256:*.jsonl rel/provenance.jsonl
+      - name: The image, as an archive docker or podman loads
+        run: |
+          mkdir -p ctx/data
+          tar -xzf rel/evald-x86_64-unknown-linux-musl.tar.gz -C ctx
+          mv ctx/evald ctx/evald-amd64
+          cp Dockerfile.release ctx/Dockerfile
+          docker buildx build ctx --platform linux/amd64 \
+            --output "type=docker,dest=evald-image-amd64.tar,name=evald:${TAG#v}"
+      - name: A snapshot of the Sigstore trusted root
+        run: |
+          cosign initialize
+          cp "$(find ~/.sigstore/root -name trusted_root.json | head -1)" trusted_root.json
+      - name: Assemble and sign
+        id: bundle
+        run: |
+          dir="$(ops/airgap/build.sh --version "$TAG" --target x86_64-unknown-linux-musl \
+            --binary rel/evald-x86_64-unknown-linux-musl.tar.gz --image evald-image-amd64.tar \
+            --chart ops/helm/evald --sbom rel/evald.sbom.spdx.json \
+            --provenance rel/provenance.jsonl --release-sums rel/SHA256SUMS \
+            --trusted-root trusted_root.json --out out)"
+          cosign sign-blob --yes --new-bundle-format \
+            --bundle "$dir/SHA256SUMS.sigstore.json" "$dir/SHA256SUMS"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+      - name: Verify it as a user would, with no network
+        run: |
+          mkdir -p "$RUNNER_TEMP/empty-home"
+          sudo env "PATH=$PATH" HOME="$RUNNER_TEMP/empty-home" unshare -n \
+            sh "${{ steps.bundle.outputs.dir }}/verify.sh" --trusted-root trusted_root.json
+      - name: Pack and attach
+        run: |
+          name="$(basename "${{ steps.bundle.outputs.dir }}")"
+          tar -C out -cf "out/$name.tar" "$name"
+          gh release upload "$TAG" "out/$name.tar" --repo "$GITHUB_REPOSITORY" --clobber
 
   cratesio:
     name: publish to crates.io
@@ -291,6 +389,12 @@ jobs:
     # a job only sees environment-scoped secrets when it declares the environment.
     environment: cicd
     runs-on: ubuntu-latest
+    # id-token for cosign keyless signing of the pushed image (the archives are already signed
+    # in the release job; the image was not). Job-level permissions replace the workflow's, so
+    # contents is restated read-only.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -313,7 +417,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p ctx
+          # data/ becomes the image's /data volume, owned by its nonroot user (Dockerfile.release).
+          mkdir -p ctx/data
           tar -xzf art/evald-x86_64-unknown-linux-musl.tar.gz  -C ctx && mv ctx/evald ctx/evald-amd64
           tar -xzf art/evald-aarch64-unknown-linux-musl.tar.gz -C ctx && mv ctx/evald ctx/evald-arm64
           cp Dockerfile.release ctx/Dockerfile
@@ -324,16 +429,83 @@ jobs:
           PROMOTE: ${{ github.event_name == 'push' || inputs.promote }}
         shell: bash
         run: |
-          tags="${IMAGE}:${TAG}"
+          # Both spellings: the git tag (`v0.4.0`) and the bare version (`0.4.0`) that
+          # docs/DOCKERHUB.md and most users write. Before 0.4.0 only the first was pushed, so
+          # the documented `mancube/evald:0.3.0` did not exist.
+          tags="${IMAGE}:${TAG}"$'\n'"${IMAGE}:${TAG#v}"
           if [[ "$TAG" != *-* && "$PROMOTE" == "true" ]]; then tags="$tags"$'\n'"${IMAGE}:latest"; fi
           { echo "list<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build for the smoke test (amd64, loaded, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/amd64
+          load: true
+          tags: evald:smoke
+      - name: The documented offline eval writes its store into a mounted directory
+        # docs/DOCKERHUB.md's quick start, as written: run as the directory's owner. The
+        # image's uid 65532 cannot create the store in a directory it does not own, and the
+        # quick start shipped without --user because nothing ran it before a push.
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          cp examples/eval/eval.yaml examples/eval/dataset.jsonl "$work"/
+          docker run --rm --user "$(id -u):$(id -g)" -v "$work:/work" -w /work evald:smoke \
+            eval run --config eval.yaml --data-dir /work/evald-data
+          [ -d "$work/evald-data" ] || { echo "::error::eval run wrote no store into the mount"; exit 1; }
+      - name: The image serves by default, drains on docker stop, and keeps its store
+        # The 0.4.0 defaults, as a user meets them: `docker run` with no command serves on both
+        # ports into the /data volume; `docker stop` (SIGTERM) drains and exits 0; a restart on
+        # the same volume still has the span; `version` still works as a command.
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 127.0.0.1:4318:4318 -p 127.0.0.1:4317:4317 \
+            -v evald-smoke:/data evald:smoke
+          up() { for _ in $(seq 60); do curl -fsS http://127.0.0.1:4318/healthz >/dev/null 2>&1 && return 0; sleep 0.5; done; docker logs smoke; return 1; }
+          up
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4318/v1/traces \
+            -H 'Content-Type: application/json' \
+            -d '{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"0123456789abcdef0123456789abcdef","spanId":"0123456789abcdef","name":"chat","startTimeUnixNano":"1700000000000000000","endTimeUnixNano":"1700000000500000000"}]}]}]}')
+          [ "$code" = 200 ] || { echo "::error::ingest answered $code"; docker logs smoke; exit 1; }
+          docker stop -t 20 smoke
+          [ "$(docker inspect smoke --format '{{.State.ExitCode}}')" = 0 ] \
+            || { echo "::error::docker stop did not drain to exit 0"; docker logs smoke; exit 1; }
+          docker start smoke
+          up
+          n=$(curl -s http://127.0.0.1:4318/v1/spans | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+          [ "$n" = 1 ] || { echo "::error::the span did not survive a restart ($n)"; exit 1; }
+          docker rm -f smoke
+          docker run --rm evald:smoke version
       - name: Build + push
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: ctx
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.imgtags.outputs.list }}
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: SBOM of the pushed image (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: image.sbom.spdx.json
+          upload-artifact: false
+      - name: Cosign keyless-sign the image and attest its SBOM
+        # Signed by digest, so every tag of this push is covered. Verify:
+        #   cosign verify docker.io/mancube/evald:<tag> \
+        #     --certificate-identity-regexp '^https://github\.com/lucheeseng827/evald/\.github/workflows/release\.yml@.+' \
+        #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$REF"
+          cosign attest --yes --type spdxjson --predicate image.sbom.spdx.json "$REF"
       - name: Update Docker Hub description
         # Only on a real (promoted) release — never let an rc rewrite the public overview.
         if: ${{ !contains(env.TAG, '-') && (github.event_name == 'push' || inputs.promote) }}
@@ -353,6 +525,9 @@ jobs:
     needs: release
     environment: cicd
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -370,16 +545,23 @@ jobs:
           PROMOTE: ${{ github.event_name == 'push' || inputs.promote }}
         shell: bash
         run: |
-          tags="${IMAGE_CONSOLE}:${TAG}"
+          tags="${IMAGE_CONSOLE}:${TAG}"$'\n'"${IMAGE_CONSOLE}:${TAG#v}"
           if [[ "$TAG" != *-* && "$PROMOTE" == "true" ]]; then tags="$tags"$'\n'"${IMAGE_CONSOLE}:latest"; fi
           { echo "list<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
       - name: Build + push
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: frontend
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.imgtags.outputs.list }}
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Cosign keyless-sign the image
+        env:
+          REF: ${{ env.IMAGE_CONSOLE }}@${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$REF"
       - name: Update Docker Hub description
         if: ${{ !contains(env.TAG, '-') && (github.event_name == 'push' || inputs.promote) }}
         uses: peter-evans/dockerhub-description@v4

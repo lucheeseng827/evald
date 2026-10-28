@@ -25,18 +25,20 @@ start — the same image points at any backend without a rebuild.
 
 ## docker compose
 
+The repository's [`compose.yaml`](https://github.com/lucheeseng827/evald/blob/main/compose.yaml)
+runs both, with the store on a named volume and the ports on `127.0.0.1`:
+
 ```yaml
 services:
   evald:
-    image: mancube/evald
-    command: ["serve", "--otlp-http", "0.0.0.0:4318"]
-    ports: ["4318:4318"]          # OTLP ingest for your apps
+    image: mancube/evald            # serves on 4318 + 4317 into /data by default (0.4.0+)
+    ports: ["127.0.0.1:4318:4318", "127.0.0.1:4317:4317"]
     volumes: ["evald-data:/data"]
   console:
     image: mancube/evald-console
     environment:
       EVALD_API_URL: http://evald:4318
-    ports: ["8080:8080"]          # the UI
+    ports: ["127.0.0.1:8080:8080"]   # the UI
     depends_on: [evald]
 volumes: { evald-data: {} }
 ```

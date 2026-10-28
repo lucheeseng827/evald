@@ -8,7 +8,7 @@ JSONL dataset, get scores keyed to the exact span. No database, no Python runtim
 no container required — a single static musl binary that runs on your laptop or
 inside a locked-down CI runner.
 
-> **Status: v0.2.0.** `evald serve` runs an OTLP/HTTP receiver on
+> **Status: v0.4.0.** `evald serve` runs an OTLP/HTTP receiver on
 > `:4318` that accepts `POST /v1/traces` in **both** protobuf (gzip-aware) and
 > **OTLP-JSON**, **normalizes** each span into one model unifying the OpenInference and
 > `gen_ai.*` conventions, and **durably stores** it through a real two-tier engine: a
@@ -37,7 +37,7 @@ inside a locked-down CI runner.
 > `scores` tables so the OTel-native join is one query away), and the **embedded SPA**
 > (rust-embed — trace list → trace tree → scores, plus a SQL console; bundled into the binary,
 > works air-gapped) served at `/`. See [`PLAN.md`](./PLAN.md) §4 and the
-> [Architecture](#architecture) diagrams. Last updated 2026-07-13.
+> [Architecture](#architecture) diagrams. Last updated 2026-09-24.
 
 ## The console
 
@@ -81,6 +81,79 @@ batches), fsynced-before-ACK, on 1.8 cores with an 8.5 MB idle RSS**. Accepted s
 are durable (the WAL append is the ACK boundary); beyond ingest+flush throughput evald
 applies backpressure and sheds with `429/503 + Retry-After` rather than dropping
 silently.
+
+## Install
+
+One static binary with no runtime dependencies. Pick one:
+
+```bash
+# Linux / macOS: downloads the release archive for your machine, refuses it unless its checksum is
+# in the release's SHA256SUMS (and, when cosign is installed, unless that file is signed by evald's
+# release workflow), and installs to ~/.local/bin. No root. It says so when ~/.local/bin is not
+# on your PATH (on a fresh Ubuntu or macOS it is not).
+curl -fsSL https://raw.githubusercontent.com/lucheeseng827/evald/main/install.sh | sh
+
+# Homebrew (macOS, Linux). This repository is its own tap.
+brew tap lucheeseng827/evald https://github.com/lucheeseng827/evald && brew install evald
+
+cargo binstall evald     # the prebuilt release binary, via cargo-binstall
+cargo install evald      # from source, via crates.io
+
+# Docker: serves OTLP/HTTP + UI on 4318 and OTLP/gRPC on 4317, the store in a named volume.
+docker run -d -p 127.0.0.1:4318:4318 -p 127.0.0.1:4317:4317 -v evald-data:/data mancube/evald
+```
+
+- **Windows:** `evald-x86_64-pc-windows-msvc.zip` from the [releases](https://github.com/lucheeseng827/evald/releases).
+- **A pinned version:** `… | sh -s -- --version v0.4.0`, or `--dir /usr/local/bin` for another location.
+- **Air-gapped or behind a mirror:** copy a release's files (`evald-<target>.tar.gz`, `SHA256SUMS`,
+  `SHA256SUMS.sig`, `SHA256SUMS.pem`) to an internal store, then
+  `EVALD_DOWNLOAD_BASE=<directory or URL> sh install.sh`.
+- **Verify by hand:** [`docs/OPERATIONS.md` § Verify what you pulled](./docs/OPERATIONS.md#verify-what-you-pulled).
+- **As a service:** [`compose.yaml`](./compose.yaml) (evald + console) or the systemd unit
+  [`ops/evald.service`](./ops/evald.service).
+
+### Point a coding agent at it
+
+<!-- clean-machine:begin -->
+```bash
+curl -fsSL https://raw.githubusercontent.com/lucheeseng827/evald/main/install.sh | sh && export PATH="$HOME/.local/bin:$PATH"
+evald serve &                          # loopback :4318 (HTTP) and :4317 (gRPC)
+eval "$(evald connect claude-code)"    # Claude Code's events: every model call, tool call, cost
+claude                                 # use it as usual, then:
+curl -s localhost:4318/v1/sessions     # each session's calls, tool calls, failures and cost
+```
+<!-- clean-machine:end -->
+
+From a machine with nothing on it, that is three commands before the agent runs. CI runs these
+lines as written on a bare `ubuntu` container on every change, with a real Claude Code, through
+to the session they record ([`scripts/clean-machine.py`](./scripts/clean-machine.py) lists the
+two stand-ins: this tree's build as the release, and a stub model provider). The `export` puts
+`~/.local/bin` on this shell's PATH; add it to your shell's profile to keep it.
+
+`evald connect codex` (an `[otel]` table for `~/.codex/config.toml`) and
+`evald connect gemini-cli` do the same for Codex CLI and Gemini CLI. Each mapping is tested
+against a session captured from that tool's real CLI
+([INSTRUMENTATION.md § Coding agents](./docs/INSTRUMENTATION.md#coding-agents)).
+
+(`evald sessions` prints the same as a table, over a store no server holds: the store's lock is
+exclusive, so stop the server or point it at another `--data-dir`.)
+
+`evald connect otel-app` and `evald connect collector` print the same for any OpenTelemetry app
+or an OTel Collector fan-out ([`docs/INSTRUMENTATION.md`](./docs/INSTRUMENTATION.md#coding-agents)).
+Seven agent frameworks have a tested recipe in [`examples/recipes/`](./examples/recipes/README.md):
+LangGraph, the OpenAI Agents SDK, Pydantic AI, CrewAI, the LiteLLM proxy, the Vercel AI SDK and
+the Claude Agent SDK.
+
+### Let the agent ask evald
+
+```bash
+claude mcp add --transport http evald http://127.0.0.1:4318/mcp
+```
+
+`evald serve` is also an MCP server: the agent can query your own traces, sessions, costs and
+eval runs ("which session cost the most today?", "why did run B regress?"). Read-only unless
+`serve --mcp-allow-writes`; the answers come from the local store and stay on the machine
+([`docs/API.md`](./docs/API.md#post-mcp)).
 
 ## Getting started
 
@@ -173,17 +246,22 @@ evald eval compare <run_id_a> <run_id_b> --data-dir /tmp/evald
 #   dropped more than the tolerance below run A — a second, run-vs-run CI gate.
 ```
 
-**Try it now (no SDK needed)** — the example emits a demo OTLP protobuf payload; pipe
-it in, then read it back. It survives a restart (the span is fsynced to the WAL):
+**Try it now (no SDK, no app):** `evald demo` writes a store with a Claude Code session, a small
+RAG app's traces (one failed call) and eval scores, all from the last half hour:
 
 ```bash
-evald serve --data-dir /tmp/evald &                             # listens on 127.0.0.1:4318
-cargo run --example otlp_demo_payload \
-  | curl --data-binary @- -H 'Content-Type: application/x-protobuf' \
-         http://127.0.0.1:4318/v1/traces
-curl -s http://127.0.0.1:4318/v1/spans                          # -> the normalized span as JSON
-# kill -9 the server, `evald serve --data-dir /tmp/evald` again, GET /v1/spans -> still there.
+evald demo --data-dir /tmp/evald-demo                    # writes it, prints what to try next
+evald serve --data-dir /tmp/evald-demo                   # then open http://127.0.0.1:4318/
+curl -s localhost:4318/v1/sessions                       # the three sessions, rolled up
+# kill -9 the server and start it again: everything is still there (fsynced before each ACK).
 ```
+
+**Gate CI on it:** `uses: lucheeseng827/evald@v0.4.0` with `config: evals/eval.yaml` installs a pinned
+evald, runs the eval, writes the JUnit report and the job summary, and fails the job when the gate
+does ([`docs/CONFIG.md` § The GitHub Action](./docs/CONFIG.md#the-github-action)).
+
+`evald doctor` checks a setup before you start it: the data dir, free disk, the ports, a
+listener exposed without auth, the price table's age.
 
 ## Exposing evald on a network (auth)
 

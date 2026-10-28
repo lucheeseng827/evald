@@ -1,0 +1,1543 @@
+{
+ "resourceLogs": [
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "host.arch",
+      "value": {
+       "stringValue": "amd64"
+      }
+     },
+     {
+      "key": "os.type",
+      "value": {
+       "stringValue": "linux"
+      }
+     },
+     {
+      "key": "os.version",
+      "value": {
+       "stringValue": "os-fixture-1"
+      }
+     },
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "claude-code"
+      }
+     },
+     {
+      "key": "service.version",
+      "value": {
+       "stringValue": "2.1.306"
+      }
+     }
+    ],
+    "droppedAttributesCount": 0
+   },
+   "scopeLogs": [
+    {
+     "scope": {
+      "name": "com.anthropic.claude_code.events",
+      "version": "2.1.306"
+     },
+     "logRecords": [
+      {
+       "timeUnixNano": "1792577576906000000",
+       "observedTimeUnixNano": "1792577576906000000",
+       "body": {
+        "stringValue": "claude_code.managed_settings_resolved"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "managed_settings_resolved"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:12:56.906Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "managed_settings.trigger",
+         "value": {
+          "stringValue": "startup"
+         }
+        },
+        {
+         "key": "managed_settings.sources",
+         "value": {
+          "arrayValue": {
+           "values": []
+          }
+         }
+        },
+        {
+         "key": "managed_settings.source_behavior",
+         "value": {
+          "stringValue": "first-wins"
+         }
+        },
+        {
+         "key": "managed_settings.helper.state",
+         "value": {
+          "stringValue": "none"
+         }
+        },
+        {
+         "key": "managed_settings.helper.applied",
+         "value": {
+          "stringValue": "none"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "053f5f71f3fc0ce7"
+      },
+      {
+       "timeUnixNano": "1792577576946000000",
+       "observedTimeUnixNano": "1792577576946000000",
+       "body": {
+        "stringValue": "claude_code.plugin_loaded"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "plugin_loaded"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:12:56.946Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 1
+         }
+        },
+        {
+         "key": "plugin.name",
+         "value": {
+          "stringValue": "cc-plugin-agents-md"
+         }
+        },
+        {
+         "key": "marketplace.name",
+         "value": {
+          "stringValue": "builtin"
+         }
+        },
+        {
+         "key": "plugin.scope",
+         "value": {
+          "stringValue": "default-bundle"
+         }
+        },
+        {
+         "key": "enabled_via",
+         "value": {
+          "stringValue": "default-enable"
+         }
+        },
+        {
+         "key": "plugin_id_hash",
+         "value": {
+          "stringValue": "plugin-fixture-1"
+         }
+        },
+        {
+         "key": "has_hooks",
+         "value": {
+          "boolValue": true
+         }
+        },
+        {
+         "key": "has_mcp",
+         "value": {
+          "boolValue": false
+         }
+        },
+        {
+         "key": "host_owned_mcp",
+         "value": {
+          "boolValue": false
+         }
+        },
+        {
+         "key": "skill_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "command_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "agent_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "safe_mode",
+         "value": {
+          "stringValue": "false"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "053f5f71f3fc0ce7"
+      },
+      {
+       "timeUnixNano": "1792577576946000000",
+       "observedTimeUnixNano": "1792577576946000000",
+       "body": {
+        "stringValue": "claude_code.plugin_loaded"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "plugin_loaded"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:12:56.946Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 2
+         }
+        },
+        {
+         "key": "plugin.name",
+         "value": {
+          "stringValue": "cc-plugin-telemetry"
+         }
+        },
+        {
+         "key": "marketplace.name",
+         "value": {
+          "stringValue": "builtin"
+         }
+        },
+        {
+         "key": "plugin.scope",
+         "value": {
+          "stringValue": "default-bundle"
+         }
+        },
+        {
+         "key": "enabled_via",
+         "value": {
+          "stringValue": "default-enable"
+         }
+        },
+        {
+         "key": "plugin_id_hash",
+         "value": {
+          "stringValue": "plugin-fixture-2"
+         }
+        },
+        {
+         "key": "has_hooks",
+         "value": {
+          "boolValue": true
+         }
+        },
+        {
+         "key": "has_mcp",
+         "value": {
+          "boolValue": false
+         }
+        },
+        {
+         "key": "host_owned_mcp",
+         "value": {
+          "boolValue": false
+         }
+        },
+        {
+         "key": "skill_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "command_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "agent_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "safe_mode",
+         "value": {
+          "stringValue": "false"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "053f5f71f3fc0ce7"
+      },
+      {
+       "timeUnixNano": "1792577576947000000",
+       "observedTimeUnixNano": "1792577576947000000",
+       "body": {
+        "stringValue": "claude_code.plugin_loaded"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "plugin_loaded"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:12:56.947Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 3
+         }
+        },
+        {
+         "key": "plugin.name",
+         "value": {
+          "stringValue": "cc-plugin-plugin-authoring"
+         }
+        },
+        {
+         "key": "marketplace.name",
+         "value": {
+          "stringValue": "builtin"
+         }
+        },
+        {
+         "key": "plugin.scope",
+         "value": {
+          "stringValue": "default-bundle"
+         }
+        },
+        {
+         "key": "enabled_via",
+         "value": {
+          "stringValue": "default-enable"
+         }
+        },
+        {
+         "key": "plugin_id_hash",
+         "value": {
+          "stringValue": "plugin-fixture-3"
+         }
+        },
+        {
+         "key": "has_hooks",
+         "value": {
+          "boolValue": true
+         }
+        },
+        {
+         "key": "has_mcp",
+         "value": {
+          "boolValue": false
+         }
+        },
+        {
+         "key": "host_owned_mcp",
+         "value": {
+          "boolValue": false
+         }
+        },
+        {
+         "key": "skill_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "command_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "agent_path_count",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "safe_mode",
+         "value": {
+          "stringValue": "false"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "053f5f71f3fc0ce7"
+      },
+      {
+       "timeUnixNano": "1792577577474000000",
+       "observedTimeUnixNano": "1792577577474000000",
+       "body": {
+        "stringValue": "claude_code.user_prompt"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "user_prompt"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:12:57.474Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 4
+         }
+        },
+        {
+         "key": "prompt.id",
+         "value": {
+          "stringValue": "prompt-fixture-1"
+         }
+        },
+        {
+         "key": "prompt_length",
+         "value": {
+          "stringValue": "75"
+         }
+        },
+        {
+         "key": "prompt",
+         "value": {
+          "stringValue": "<REDACTED>"
+         }
+        },
+        {
+         "key": "prompt_text",
+         "value": {
+          "stringValue": "<REDACTED>"
+         }
+        },
+        {
+         "key": "message.uuid",
+         "value": {
+          "stringValue": "message-fixture-1"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "bee2fb48eb0b1360"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "host.arch",
+      "value": {
+       "stringValue": "amd64"
+      }
+     },
+     {
+      "key": "os.type",
+      "value": {
+       "stringValue": "linux"
+      }
+     },
+     {
+      "key": "os.version",
+      "value": {
+       "stringValue": "os-fixture-1"
+      }
+     },
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "claude-code"
+      }
+     },
+     {
+      "key": "service.version",
+      "value": {
+       "stringValue": "2.1.306"
+      }
+     }
+    ],
+    "droppedAttributesCount": 0
+   },
+   "scopeLogs": [
+    {
+     "scope": {
+      "name": "com.anthropic.claude_code.events",
+      "version": "2.1.306"
+     },
+     "logRecords": [
+      {
+       "timeUnixNano": "1792577579098000000",
+       "observedTimeUnixNano": "1792577579098000000",
+       "body": {
+        "stringValue": "claude_code.tool_decision"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "tool_decision"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:12:59.098Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 5
+         }
+        },
+        {
+         "key": "prompt.id",
+         "value": {
+          "stringValue": "prompt-fixture-1"
+         }
+        },
+        {
+         "key": "decision",
+         "value": {
+          "stringValue": "accept"
+         }
+        },
+        {
+         "key": "source",
+         "value": {
+          "stringValue": "config"
+         }
+        },
+        {
+         "key": "tool_name",
+         "value": {
+          "stringValue": "Bash"
+         }
+        },
+        {
+         "key": "tool_use_id",
+         "value": {
+          "stringValue": "tool-fixture-1"
+         }
+        },
+        {
+         "key": "tool_source",
+         "value": {
+          "stringValue": "builtin"
+         }
+        },
+        {
+         "key": "permission_mode",
+         "value": {
+          "stringValue": "default"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "3e693773ce31e0c9"
+      },
+      {
+       "timeUnixNano": "1792577579119000000",
+       "observedTimeUnixNano": "1792577579119000000",
+       "body": {
+        "stringValue": "claude_code.api_request"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "api_request"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:12:59.119Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 6
+         }
+        },
+        {
+         "key": "prompt.id",
+         "value": {
+          "stringValue": "prompt-fixture-1"
+         }
+        },
+        {
+         "key": "model",
+         "value": {
+          "stringValue": "claude-haiku-5-5"
+         }
+        },
+        {
+         "key": "input_tokens",
+         "value": {
+          "intValue": 2
+         }
+        },
+        {
+         "key": "output_tokens",
+         "value": {
+          "intValue": 84
+         }
+        },
+        {
+         "key": "cache_read_tokens",
+         "value": {
+          "intValue": 27640
+         }
+        },
+        {
+         "key": "cache_creation_tokens",
+         "value": {
+          "intValue": 8122
+         }
+        },
+        {
+         "key": "cache_creation_5m_tokens",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "cache_creation_1h_tokens",
+         "value": {
+          "intValue": 8122
+         }
+        },
+        {
+         "key": "cost_usd",
+         "value": {
+          "doubleValue": 0.0019430000000000003
+         }
+        },
+        {
+         "key": "cost_usd_micros",
+         "value": {
+          "intValue": 1943
+         }
+        },
+        {
+         "key": "duration_ms",
+         "value": {
+          "intValue": 1512
+         }
+        },
+        {
+         "key": "ttft_ms",
+         "value": {
+          "intValue": 1100
+         }
+        },
+        {
+         "key": "request_id",
+         "value": {
+          "stringValue": "request-fixture-1"
+         }
+        },
+        {
+         "key": "client_request_id",
+         "value": {
+          "stringValue": "client-request-fixture-1"
+         }
+        },
+        {
+         "key": "speed",
+         "value": {
+          "stringValue": "normal"
+         }
+        },
+        {
+         "key": "query_source",
+         "value": {
+          "stringValue": "sdk"
+         }
+        },
+        {
+         "key": "effort",
+         "value": {
+          "stringValue": "medium"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "bee2fb48eb0b1360"
+      },
+      {
+       "timeUnixNano": "1792577579220000000",
+       "observedTimeUnixNano": "1792577579220000000",
+       "body": {
+        "stringValue": "claude_code.tool_result"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "tool_result"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:12:59.220Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 7
+         }
+        },
+        {
+         "key": "prompt.id",
+         "value": {
+          "stringValue": "prompt-fixture-1"
+         }
+        },
+        {
+         "key": "tool_name",
+         "value": {
+          "stringValue": "Bash"
+         }
+        },
+        {
+         "key": "tool_use_id",
+         "value": {
+          "stringValue": "tool-fixture-1"
+         }
+        },
+        {
+         "key": "success",
+         "value": {
+          "stringValue": "true"
+         }
+        },
+        {
+         "key": "duration_ms",
+         "value": {
+          "stringValue": "118"
+         }
+        },
+        {
+         "key": "tool_input_size_bytes",
+         "value": {
+          "stringValue": "74"
+         }
+        },
+        {
+         "key": "tool_result_size_bytes",
+         "value": {
+          "stringValue": "15"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "bee2fb48eb0b1360"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "resource": {
+    "attributes": [
+     {
+      "key": "host.arch",
+      "value": {
+       "stringValue": "amd64"
+      }
+     },
+     {
+      "key": "os.type",
+      "value": {
+       "stringValue": "linux"
+      }
+     },
+     {
+      "key": "os.version",
+      "value": {
+       "stringValue": "os-fixture-1"
+      }
+     },
+     {
+      "key": "service.name",
+      "value": {
+       "stringValue": "claude-code"
+      }
+     },
+     {
+      "key": "service.version",
+      "value": {
+       "stringValue": "2.1.306"
+      }
+     }
+    ],
+    "droppedAttributesCount": 0
+   },
+   "scopeLogs": [
+    {
+     "scope": {
+      "name": "com.anthropic.claude_code.events",
+      "version": "2.1.306"
+     },
+     "logRecords": [
+      {
+       "timeUnixNano": "1792577580435000000",
+       "observedTimeUnixNano": "1792577580435000000",
+       "body": {
+        "stringValue": "claude_code.api_request"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "api_request"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:13:00.435Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 8
+         }
+        },
+        {
+         "key": "prompt.id",
+         "value": {
+          "stringValue": "prompt-fixture-1"
+         }
+        },
+        {
+         "key": "model",
+         "value": {
+          "stringValue": "claude-haiku-5-5"
+         }
+        },
+        {
+         "key": "input_tokens",
+         "value": {
+          "intValue": 2
+         }
+        },
+        {
+         "key": "output_tokens",
+         "value": {
+          "intValue": 36
+         }
+        },
+        {
+         "key": "cache_read_tokens",
+         "value": {
+          "intValue": 35762
+         }
+        },
+        {
+         "key": "cache_creation_tokens",
+         "value": {
+          "intValue": 121
+         }
+        },
+        {
+         "key": "cache_creation_5m_tokens",
+         "value": {
+          "intValue": 0
+         }
+        },
+        {
+         "key": "cache_creation_1h_tokens",
+         "value": {
+          "intValue": 121
+         }
+        },
+        {
+         "key": "cost_usd",
+         "value": {
+          "doubleValue": 0.00040002
+         }
+        },
+        {
+         "key": "cost_usd_micros",
+         "value": {
+          "intValue": 400
+         }
+        },
+        {
+         "key": "duration_ms",
+         "value": {
+          "intValue": 1172
+         }
+        },
+        {
+         "key": "ttft_ms",
+         "value": {
+          "intValue": 943
+         }
+        },
+        {
+         "key": "request_id",
+         "value": {
+          "stringValue": "request-fixture-2"
+         }
+        },
+        {
+         "key": "client_request_id",
+         "value": {
+          "stringValue": "client-request-fixture-2"
+         }
+        },
+        {
+         "key": "speed",
+         "value": {
+          "stringValue": "normal"
+         }
+        },
+        {
+         "key": "query_source",
+         "value": {
+          "stringValue": "sdk"
+         }
+        },
+        {
+         "key": "effort",
+         "value": {
+          "stringValue": "medium"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "bee2fb48eb0b1360"
+      },
+      {
+       "timeUnixNano": "1792577580436000000",
+       "observedTimeUnixNano": "1792577580436000000",
+       "body": {
+        "stringValue": "claude_code.assistant_response"
+       },
+       "attributes": [
+        {
+         "key": "user.id",
+         "value": {
+          "stringValue": "user-fixture-1"
+         }
+        },
+        {
+         "key": "session.id",
+         "value": {
+          "stringValue": "session-fixture-1"
+         }
+        },
+        {
+         "key": "ccr.session.id",
+         "value": {
+          "stringValue": "session-fixture-2"
+         }
+        },
+        {
+         "key": "organization.id",
+         "value": {
+          "stringValue": "org-fixture-1"
+         }
+        },
+        {
+         "key": "user.email",
+         "value": {
+          "stringValue": "dev1@example.com"
+         }
+        },
+        {
+         "key": "user.account_uuid",
+         "value": {
+          "stringValue": "account-fixture-1"
+         }
+        },
+        {
+         "key": "user.account_id",
+         "value": {
+          "stringValue": "account-fixture-2"
+         }
+        },
+        {
+         "key": "terminal.type",
+         "value": {
+          "stringValue": "linux"
+         }
+        },
+        {
+         "key": "event.name",
+         "value": {
+          "stringValue": "assistant_response"
+         }
+        },
+        {
+         "key": "event.timestamp",
+         "value": {
+          "stringValue": "2026-10-21T10:13:00.436Z"
+         }
+        },
+        {
+         "key": "event.sequence",
+         "value": {
+          "intValue": 9
+         }
+        },
+        {
+         "key": "prompt.id",
+         "value": {
+          "stringValue": "prompt-fixture-1"
+         }
+        },
+        {
+         "key": "response_length",
+         "value": {
+          "intValue": 92
+         }
+        },
+        {
+         "key": "response",
+         "value": {
+          "stringValue": "<REDACTED>"
+         }
+        },
+        {
+         "key": "request_id",
+         "value": {
+          "stringValue": "request-fixture-2"
+         }
+        },
+        {
+         "key": "message.uuid",
+         "value": {
+          "stringValue": "message-fixture-2"
+         }
+        },
+        {
+         "key": "model",
+         "value": {
+          "stringValue": "claude-haiku-5-5"
+         }
+        },
+        {
+         "key": "query_source",
+         "value": {
+          "stringValue": "sdk"
+         }
+        }
+       ],
+       "droppedAttributesCount": 0,
+       "flags": 1,
+       "traceId": "5c52771f35caca094e6921ab3b860266",
+       "spanId": "bee2fb48eb0b1360"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

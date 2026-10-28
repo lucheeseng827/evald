@@ -532,13 +532,9 @@ mod tests {
         // scanner — including this crate's own OSS-mirror gate — can't tell a realistic test
         // fixture from a real leaked key without running the program, so avoid handing it one
         // contiguous string to match.
-        assert!(
-            scrub(&r, &format!("key sk-{}", "abcdefghijklmnopqrstuvwx"))
-                .contains("[REDACTED:api_key]")
-        );
-        assert!(
-            scrub(&r, &format!("AKIA{}", "IOSFODNN7EXAMPLE")).contains("[REDACTED:api_key]")
-        );
+        assert!(scrub(&r, &format!("key sk-{}", "abcdefghijklmnopqrstuvwx"))
+            .contains("[REDACTED:api_key]"));
+        assert!(scrub(&r, &format!("AKIA{}", "IOSFODNN7EXAMPLE")).contains("[REDACTED:api_key]"));
     }
 
     /// The Luhn gate is the difference between a usable redactor and one that eats every

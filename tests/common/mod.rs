@@ -46,16 +46,41 @@ pub fn stderr_tail(path: &Path) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Block until something accepts TCP connections on `port`. Returns false after `timeout`.
+/// Block until an evald on `port` answers `GET /healthz` with `200`. Returns false after
+/// `timeout`.
+///
+/// An accepted TCP connection is not enough, twice over. A listener accepts connections into
+/// its backlog before the server starts serving them. And a connect to a port nothing listens
+/// on can connect **to itself** when the kernel picks the destination port as the source port
+/// (TCP simultaneous open, allowed on loopback); `free_port` hands out ephemeral ports, which is
+/// exactly that range, and the self-connected socket then also holds the port the server is
+/// about to bind.
 pub fn wait_listening(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if healthz(port) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     false
+}
+
+fn healthz(port: u16) -> bool {
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    if s.local_addr().ok() == s.peer_addr().ok() {
+        return false; // a self-connect, not a server
+    }
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let req = "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if s.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    resp.starts_with(b"HTTP/1.1 200")
 }
 
 /// One minimal OTLP-JSON span whose trace_id (32 hex) and span_id (16 hex) encode `seq`, so
@@ -71,12 +96,24 @@ pub fn span_body(seq: u64) -> String {
 /// POST an OTLP-JSON body to `/v1/traces` over a one-shot (`Connection: close`) HTTP/1.1
 /// connection. Returns the response status code, or `None` on a connection/IO error (treated as
 /// "not ACK'd").
+///
+/// The ACK waits on a WAL fsync, and an fsync on a busy disk (a release build linking beside the
+/// test, a CI runner's shared volume) has been seen to take more than 5 s: a timeout here is not
+/// the server failing, so it is generous. A killed server resets the connection at once, so the
+/// crash tests do not wait on it.
 pub fn post_span(port: u16, body: &str) -> Option<u16> {
+    request(port, "POST", "/v1/traces", body).map(|(code, _)| code)
+}
+
+/// One request over a one-shot (`Connection: close`) HTTP/1.1 connection, as [`post_span`]
+/// sends it. Returns the status code and the whole response (head and body), or `None` on a
+/// connection/IO error.
+pub fn request(port: u16, method: &str, path: &str, body: &str) -> Option<(u16, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    s.set_write_timeout(Some(Duration::from_secs(30))).ok()?;
     let req = format!(
-        "POST /v1/traces HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
@@ -85,11 +122,13 @@ pub fn post_span(port: u16, body: &str) -> Option<u16> {
     s.flush().ok()?;
     let mut resp = Vec::new();
     s.read_to_end(&mut resp).ok()?; // Connection: close → server closes after the response.
-    let head = String::from_utf8_lossy(&resp);
-    head.lines()
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    let code = resp
+        .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse::<u16>().ok())
+        .and_then(|c| c.parse::<u16>().ok())?;
+    Some((code, resp))
 }
 
 /// Number of committed Parquet blocks under `data_dir/blocks` — i.e. compactions that ran AND
@@ -147,6 +186,25 @@ impl Server {
         seal_threshold: u64,
         compact_interval_secs: u64,
     ) -> Result<Server, String> {
+        Self::start_with(
+            bin,
+            data_dir,
+            stderr_log,
+            seal_threshold,
+            compact_interval_secs,
+            &[],
+        )
+    }
+
+    /// [`Server::start`], with `extra` flags appended to `serve`'s.
+    pub fn start_with(
+        bin: &str,
+        data_dir: &Path,
+        stderr_log: PathBuf,
+        seal_threshold: u64,
+        compact_interval_secs: u64,
+        extra: &[&str],
+    ) -> Result<Server, String> {
         let port = free_port();
         let stderr_file = std::fs::File::create(&stderr_log).expect("create server stderr log");
 
@@ -172,6 +230,7 @@ impl Server {
             "--compact-interval-secs",
             &compact_interval_secs.to_string(),
         ])
+        .args(extra)
         .stdout(Stdio::null())
         // To a FILE, not a pipe: nothing reads this handle until a test fails, and a long-lived
         // chatty child would deadlock on a full pipe buffer. `Stdio::null()` here is what made
@@ -214,6 +273,16 @@ impl Server {
 
     pub fn stderr_tail(&self) -> String {
         stderr_tail(&self.stderr_log)
+    }
+}
+
+/// A test that panics must not leave its server running (holding a port, and a data dir its
+/// tempdir guard has already deleted). A server the test already killed or reaped is left alone.
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            kill9(&mut self.child);
+        }
     }
 }
 

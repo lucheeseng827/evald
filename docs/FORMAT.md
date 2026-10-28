@@ -127,6 +127,11 @@ grows — and so does the set of files a query has to open, until scans fail wit
   have the day rewritten on every tick.
 - No merged block exceeds `--cold-merge-max-spans` rows (default 1,000,000), so
   retention — which drops blocks whole — stays granular.
+- A merge keeps one row per `(trace_id, span_id)` across its inputs, the first in
+  seqno order. Copies of a span flushed from two WAL segments (a client's resend,
+  an exporter's retry that landed in the next segment) become one, so a merged
+  block can hold fewer rows than its inputs together. A flush likewise writes one
+  copy of each span its segment holds.
 
 A merge is committed the way a flush is: the output is written to a temp file,
 fsynced, renamed into place, and the directory fsynced; then **one** redb
@@ -149,7 +154,8 @@ SELECT model, COUNT(*) FROM read_parquet('evald-data/blocks/**/*.parquet') GROUP
 ```
 
 Two things to know. Rows are deduplicated by `(trace_id, span_id)` on evald's read
-path, and blocks written across a crash window can briefly overlap — so add
+path; blocks written across a crash window can briefly overlap, and copies of a
+span sent twice can sit in two blocks until those merge — so add
 `SELECT DISTINCT ON (trace_id, span_id)` (or `GROUP BY`) if exactness matters more
 than speed. And spans still in the WAL are not in `blocks/` yet; `evald query`
 unions them, a raw Parquet scan does not.

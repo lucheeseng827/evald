@@ -37,6 +37,17 @@ pub fn normalize_request(req: &ExportTraceServiceRequest) -> Vec<NormalizedSpan>
                 None => (None, None),
             };
             let scope_schema = non_empty(&scope_spans.schema_url).or_else(|| schema_url.clone());
+            // A coding agent's spans need its dialect's fix-up; decided once per scope.
+            let fix: Option<fn(&mut NormalizedSpan)> =
+                if scope_name.as_deref() == Some(crate::claude_code::TRACING_SCOPE) {
+                    Some(crate::claude_code::fix_trace_span)
+                } else if crate::codex::is_trace_scope(service_name.as_deref()) {
+                    Some(crate::codex::fix_trace_span)
+                } else if crate::gemini_cli::is_trace_scope(service_name.as_deref()) {
+                    Some(crate::gemini_cli::fix_trace_span)
+                } else {
+                    None
+                };
             for span in &scope_spans.spans {
                 let mut normalized = normalize_span(
                     span,
@@ -52,6 +63,9 @@ pub fn normalize_request(req: &ExportTraceServiceRequest) -> Vec<NormalizedSpan>
                         .raw_attributes
                         .entry("otel.schema_url".to_string())
                         .or_insert_with(|| Json::String(su.clone()));
+                }
+                if let Some(fix) = fix {
+                    fix(&mut normalized);
                 }
                 crate::price::apply(&prices, &mut normalized);
                 out.push(normalized);
@@ -125,7 +139,7 @@ pub fn normalize_span(
 
     let status = span.status.as_ref();
 
-    NormalizedSpan {
+    let mut normalized = NormalizedSpan {
         dialect: detect_dialect(a),
         trace_id: hex::encode(&span.trace_id),
         span_id: hex::encode(&span.span_id),
@@ -187,38 +201,52 @@ pub fn normalize_span(
         scope_name,
         scope_version,
         raw_attributes: raw_attributes(a),
-    }
+    };
+    // Agent and tool spans: canonical keys, and an in-process agent's aggregate usage set aside
+    // so it is not counted (or priced) a second time.
+    crate::agent::normalize(&mut normalized);
+    normalized
 }
 
 /// Infer an OpenInference-style span kind for OTel-native / `gen_ai.*` spans that don't carry
 /// an explicit `openinference.span.kind`, so they render as a typed span (LLM / EMBEDDING /
-/// TOOL / AGENT) instead of "unknown" — many trace viewers type only `llm.*` spans and leave
-/// the rest unclassified. Returns `None` when there is no gen_ai signal, so a genuinely non-model span
-/// stays unclassified rather than being mislabeled.
+/// TOOL / AGENT / CHAIN / RETRIEVER) instead of "unknown" — many trace viewers type only `llm.*`
+/// spans and leave the rest unclassified. Returns `None` when there is no gen_ai signal, so a
+/// genuinely non-model span stays unclassified rather than being mislabeled.
 fn infer_oi_kind(attrs: &[KeyValue]) -> Option<String> {
+    // gen_ai request/response/usage attributes are a model call's.
+    let has_genai_call = || {
+        attrs.iter().any(|kv| {
+            kv.key.starts_with("gen_ai.request.")
+                || kv.key.starts_with("gen_ai.response.")
+                || kv.key.starts_with("gen_ai.usage.")
+        })
+    };
     // The OTel `gen_ai.operation.name` is the most direct signal.
     if let Some(op) = attr_str(attrs, "gen_ai.operation.name") {
         let kind = match op.to_ascii_lowercase().as_str() {
+            "chat" | "text_completion" | "generate_content" => "LLM",
             "embeddings" | "embedding" => "EMBEDDING",
             "execute_tool" | "tool" => "TOOL",
             "create_agent" | "invoke_agent" | "agent" => "AGENT",
-            // chat / text_completion / generate_content / … and any other named gen_ai
-            // operation is a model call.
-            _ => "LLM",
+            "retrieval" | "search_memory" => "RETRIEVER",
+            // Any other operation (`fetch_response`, a provider's own) is a model call when it
+            // carries a model call's attributes, and a step of the agent's (a workflow, a plan,
+            // a memory write, the Vercel AI SDK's `agent_step`) when it does not.
+            _ if has_genai_call() => "LLM",
+            _ => "CHAIN",
         };
         return Some(kind.to_string());
     }
     // No operation name, but gen_ai request/response/usage attributes ⇒ a model call.
-    let has_genai_call = attrs.iter().any(|kv| {
-        kv.key.starts_with("gen_ai.request.")
-            || kv.key.starts_with("gen_ai.response.")
-            || kv.key.starts_with("gen_ai.usage.")
-    });
-    if has_genai_call {
+    if has_genai_call() {
         return Some("LLM".to_string());
     }
-    // gen_ai tool attributes without an operation name ⇒ a tool span.
-    if attrs.iter().any(|kv| kv.key.starts_with("gen_ai.tool.")) {
+    // gen_ai tool attributes without an operation name ⇒ a tool span, and so is an MCP
+    // `tools/call` (the rest of MCP's methods are protocol traffic, left unclassified).
+    if attrs.iter().any(|kv| kv.key.starts_with("gen_ai.tool."))
+        || attr_str(attrs, "mcp.method.name").as_deref() == Some("tools/call")
+    {
         return Some("TOOL".to_string());
     }
     None
@@ -318,7 +346,7 @@ pub(crate) fn attr_str(attrs: &[KeyValue], key: &str) -> Option<String> {
 
 /// Read an attribute as a non-negative integer. Accepts int, integral double, or a
 /// numeric string (so it is robust to producers that stringify counts).
-fn attr_u64(attrs: &[KeyValue], key: &str) -> Option<u64> {
+pub(crate) fn attr_u64(attrs: &[KeyValue], key: &str) -> Option<u64> {
     match attr(attrs, key)?.value.as_ref()? {
         AnyVal::IntValue(i) if *i >= 0 => Some(*i as u64),
         AnyVal::DoubleValue(d) if *d >= 0.0 && d.fract() == 0.0 => Some(*d as u64),

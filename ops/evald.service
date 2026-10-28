@@ -1,0 +1,58 @@
+# evald as a systemd service.
+#
+#   sudo install -m 0755 evald /usr/local/bin/evald
+#   sudo install -m 0644 evald.service /etc/systemd/system/evald.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now evald
+#   journalctl -u evald -f
+#
+# The store is /var/lib/evald (systemd creates it for the service's own dynamic user). Site
+# settings and secrets, EVALD_AUTH_TOKEN above all, go in /etc/evald/evald.env (mode 0600), one
+# VAR=value per line; every `evald serve` flag has an EVALD_* variable (docs/CONFIG.md).
+[Unit]
+Description=evald, an OTel-native trace and eval store for LLM apps
+Documentation=https://github.com/lucheeseng827/evald
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/evald serve
+Environment=EVALD_DATA_DIR=/var/lib/evald
+Environment=EVALD_OTLP_HTTP_ADDR=127.0.0.1:4318
+Environment=EVALD_OTLP_GRPC_ADDR=127.0.0.1:4317
+EnvironmentFile=-/etc/evald/evald.env
+# evald drains on SIGTERM, which is what `systemctl stop` sends.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+# Its own unprivileged user, and nothing writable but its state directory.
+DynamicUser=yes
+StateDirectory=evald
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

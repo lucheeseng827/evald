@@ -33,6 +33,10 @@ use std::sync::Mutex;
 use crate::metrics::{escape_help, escape_label, format_value};
 use crate::{NormalizedSpan, Score, ScoreTarget};
 
+/// The last `(provider, model, service)` label triple seen in a batch, its interned ids, and
+/// whether it was folded into `other` — reused while consecutive spans share it.
+type LabelMemo<'a> = (&'a str, &'a str, &'a str, (u32, u32, u32), bool);
+
 /// OTLP `Status.code` for an error (`STATUS_CODE_ERROR`).
 const STATUS_ERROR: i32 = 2;
 
@@ -54,6 +58,11 @@ pub const MAX_SERIES: usize = 2048;
 /// providers or services is better served by a per-service evald than by a bigger label space.
 const PROVIDER_CAP: usize = 16;
 const SERVICE_CAP: usize = 32;
+/// Distinct tool names labelled on the tool-call counters, and `(service, tool)` pairs tracked;
+/// past either, a call is counted under `other`. An agent's toolbox is tens of tools; a fleet's
+/// MCP servers can add hundreds, which is what the cap is for.
+const TOOL_CAP: usize = 64;
+const MAX_TOOL_SERIES: usize = 512;
 /// Rolling-score window (most recent scores kept per evaluator) and how many evaluator names
 /// are tracked. 64 × 1024 × 8 bytes is 512 KiB worst case.
 const SCORE_WINDOW: usize = 1024;
@@ -210,9 +219,36 @@ struct Inner {
     services: Interner,
     series: HashMap<(u32, u32, u32), Series>,
     folded: u64,
+    /// Tool calls and failed tool calls by `(service, tool)`.
+    tools: Interner,
+    tool_series: HashMap<(u32, u32), (u64, u64)>,
     /// Most recent numeric scores per evaluator.
     scores: HashMap<String, VecDeque<f64>>,
     scores_untracked: u64,
+}
+
+/// One tool span into the tool-call counters. A call traced at two layers (an agent framework's
+/// tool span and the MCP `tools/call` span under it) counts at each: like every counter here,
+/// these are approximate, and the session rollup is the exact count.
+fn record_tool(inner: &mut Inner, s: &NormalizedSpan) {
+    let mut folded = false;
+    let service = inner
+        .services
+        .intern(s.service_name.as_deref().unwrap_or("unknown"), &mut folded);
+    let tool = inner
+        .tools
+        .intern(crate::agent::tool_name(s).unwrap_or("unknown"), &mut folded);
+    let mut key = (service, tool);
+    if !inner.tool_series.contains_key(&key) && inner.tool_series.len() >= MAX_TOOL_SERIES - 1 {
+        key = (0, 0);
+        folded = true;
+    }
+    if folded {
+        inner.folded += 1;
+    }
+    let e = inner.tool_series.entry(key).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += u64::from(crate::agent::failed(s));
 }
 
 /// The live usage series. Cheap to share; all mutation is behind one short-held lock.
@@ -229,30 +265,51 @@ impl UsageMetrics {
                 services: Interner::new(SERVICE_CAP),
                 series: HashMap::new(),
                 folded: 0,
+                tools: Interner::new(TOOL_CAP),
+                tool_series: HashMap::new(),
                 scores: HashMap::new(),
                 scores_untracked: 0,
             }),
         }
     }
 
-    /// Record one committed batch. Non-LLM spans (retriever, tool, chain, …) are ignored.
+    /// Record one committed batch: LLM spans into the usage series, tool spans into the
+    /// tool-call counters. Other spans (retriever, chain, agent, …) are ignored.
     pub fn record(&self, spans: &[NormalizedSpan]) {
         let mut g = self.inner.lock().expect("usage lock");
         let inner = &mut *g;
+        // Interning the three labels is three string hashes and three map probes, and a batch
+        // almost always carries one service calling one model: remember the last triple and reuse
+        // its ids while it matches, so the hashing is paid once per batch rather than once per
+        // span. Three `&str` comparisons decide it, and an unequal length settles most of those.
+        let mut memo: Option<LabelMemo<'_>> = None;
         for s in spans {
             if !s.is_llm_span() {
+                if crate::agent::is_kind(s, "TOOL") {
+                    record_tool(inner, s);
+                }
                 continue;
             }
-            let mut folded = false;
-            let p = inner
-                .providers
-                .intern(s.provider.as_deref().unwrap_or("unknown"), &mut folded);
-            let m = inner
-                .models
-                .intern(s.model.as_deref().unwrap_or("unknown"), &mut folded);
-            let sv = inner
-                .services
-                .intern(s.service_name.as_deref().unwrap_or("unknown"), &mut folded);
+            let provider = s.provider.as_deref().unwrap_or("unknown");
+            let model = s.model.as_deref().unwrap_or("unknown");
+            let service = s.service_name.as_deref().unwrap_or("unknown");
+            let ((p, m, sv), mut folded) = match memo {
+                Some((mp, mm, ms, ids, was_folded))
+                    if mp == provider && mm == model && ms == service =>
+                {
+                    (ids, was_folded)
+                }
+                _ => {
+                    let mut f = false;
+                    let ids = (
+                        inner.providers.intern(provider, &mut f),
+                        inner.models.intern(model, &mut f),
+                        inner.services.intern(service, &mut f),
+                    );
+                    memo = Some((provider, model, service, ids, f));
+                    (ids, f)
+                }
+            };
             let mut key = (p, m, sv);
             // One slot is reserved for the folded tuple, so the total never exceeds MAX_SERIES.
             if !inner.series.contains_key(&key) && inner.series.len() >= MAX_SERIES - 1 {
@@ -332,7 +389,7 @@ impl UsageMetrics {
             "Distinct (provider, model, service) label tuples currently tracked; bounded by a hard ceiling.");
         let _ = writeln!(out, "evald_usage_series {}", g.series.len());
         family(out, "evald_usage_labels_folded_total", "counter",
-            "LLM spans whose provider, model or service label was folded into `other` because a cardinality cap was reached. Non-zero means raise --metrics-model-cap or shard the fleet.");
+            "LLM and tool spans whose provider, model, service or tool label was folded into `other` because a cardinality cap was reached. Non-zero means raise --metrics-model-cap or shard the fleet.");
         let _ = writeln!(out, "evald_usage_labels_folded_total {}", g.folded);
 
         if !keys.is_empty() {
@@ -399,6 +456,43 @@ impl UsageMetrics {
                         &labels(k),
                     );
                 }
+            }
+        }
+
+        if !g.tool_series.is_empty() {
+            let mut keys: Vec<&(u32, u32)> = g.tool_series.keys().collect();
+            keys.sort_by_key(|k| {
+                (
+                    g.services.names[k.0 as usize].clone(),
+                    g.tools.names[k.1 as usize].clone(),
+                )
+            });
+            let labels = |k: &(u32, u32)| {
+                format!(
+                    "gen_ai_tool_name=\"{}\",service_name=\"{}\"",
+                    escape_label(&g.tools.names[k.1 as usize]),
+                    escape_label(&g.services.names[k.0 as usize]),
+                )
+            };
+            family(out, "evald_tool_calls_total", "counter",
+                "Tool spans accepted since process start, by tool (approximate under exporter retries; a call traced at two layers counts at each).");
+            for k in &keys {
+                let _ = writeln!(
+                    out,
+                    "evald_tool_calls_total{{{}}} {}",
+                    labels(k),
+                    g.tool_series[*k].0
+                );
+            }
+            family(out, "evald_tool_call_errors_total", "counter",
+                "Tool spans accepted with an error status or an error.type since process start. Divide by evald_tool_calls_total for the tool-error rate.");
+            for k in &keys {
+                let _ = writeln!(
+                    out,
+                    "evald_tool_call_errors_total{{{}}} {}",
+                    labels(k),
+                    g.tool_series[*k].1
+                );
             }
         }
 

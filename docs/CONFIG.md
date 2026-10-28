@@ -20,7 +20,7 @@ syntax, and writes to **stderr** so stdout stays parseable.
 | *(unset)* → `info` | **The default.** One line per `POST /v1/traces` (`resource_spans`, `spans`), plus startup, compaction, recovery and guardrail lines. |
 | `evald=debug` | Adds the **per-span** detail line — dialect, trace/span id, name, `oi_kind`, model, provider, token counts, `cost_usd`, duration, attribute count. For inspecting what an SDK actually sends. |
 | `evald::ingest=debug` | The same per-span line, without turning up the rest of the crate. |
-| `warn` | Quietest useful setting. What the throughput numbers in [BENCHMARKS.md](./BENCHMARKS.md) assume. |
+| `warn` | Quietest useful setting. What the throughput numbers in the [README's Performance section](../README.md#performance) assume. |
 
 **The per-span line is `debug` on purpose, and it is not free to turn on.** Formatting
 and colouring its ~14 fields measured **~38,000 instructions per span, about a third of
@@ -29,6 +29,22 @@ server's CPU per span and −7% throughput**. It is off by default and does not 
 a loaded server. Turning the default *down* to `warn` buys nothing — the two measured
 within 0.5% of each other. See [OPERATIONS.md § Logs](./OPERATIONS.md#logs).
 
+## Exit codes
+
+Every command follows one contract, so a CI step can tell a regression from a broken setup:
+
+| Code | Meaning |
+|---|---|
+| `0` | Done; every gate passed. |
+| `1` | A gate failed: a threshold missed (`eval run`), a regression (`eval compare --fail-on-regression`), a failed suite (`suite run`), a judge that needs recalibration (`eval calibrate --fail-on-divergence`), a failed `doctor` check. |
+| `2` | evald could not do what was asked: an invalid flag or address, a missing or malformed config or dataset, a store it cannot open. The message on stderr starts with `Error:`. |
+
+Before 0.4.0, the `2` cases also exited `1`. A script that tests for a non-zero exit is
+unaffected.
+
+`evald serve` drains and exits `0` on `SIGTERM` (what `docker stop`, a Kubernetes pod
+deletion and systemd send) as it does on Ctrl-C.
+
 ## `evald serve`
 
 Runs the OTLP/HTTP receiver + durable store + query/SQL API + embedded SPA.
@@ -36,6 +52,7 @@ Runs the OTLP/HTTP receiver + durable store + query/SQL API + embedded SPA.
 | Flag | Env var | Type | Default | What it does / when to change it |
 |---|---|---|---|---|
 | `--otlp-http` | `EVALD_OTLP_HTTP_ADDR` | `host:port` | `127.0.0.1:4318` | Bind address for the whole HTTP surface (OTLP ingest, `/v1/*` API, SPA). Loopback by default — it never listens on the network unasked; binding wider is a deliberate act (see [OPERATIONS.md § Security posture](./OPERATIONS.md#security-posture)). |
+| `--otlp-grpc` | `EVALD_OTLP_GRPC_ADDR` | `host:port` | `127.0.0.1:4317` | Bind address for the OTLP/gRPC receiver (traces and logs, behind the same auth gate). Empty disables gRPC ingest. Loopback by default, like `--otlp-http`. |
 | `--data-dir` | `EVALD_DATA_DIR` | path | `evald-data` | Directory for all durable state: `wal/`, `blocks/`, `index.redb`, `scores.redb` (layout in [OPERATIONS.md](./OPERATIONS.md#what-the-state-is----data-dir-layout)). Created if absent. |
 | `--seal-threshold` | `EVALD_SEAL_THRESHOLD` | int (spans) | `50000` | Seal the active WAL segment after this many spans; sealed segments become eligible for compaction to Parquet. Lower it to get smaller, more frequent Parquet blocks (and a smaller WAL replay on restart); raise it for fewer, larger blocks. |
 | `--compact-interval-secs` | `EVALD_COMPACT_INTERVAL_SECS` | int (seconds) | `5` | Background compaction interval. `0` disables background compaction entirely — spans then stay in the WAL + hot tier (reads still see them; the WAL is never truncated). |
@@ -45,11 +62,14 @@ Runs the OTLP/HTTP receiver + durable store + query/SQL API + embedded SPA.
 | `--cold-merge-day-quiet-secs` | `EVALD_COLD_MERGE_DAY_QUIET_SECS` | int (seconds) | `3600` | A closed day collapses only once nothing has been written into it for this long, so a backfill (or a client with a skewed clock) does not have the whole day rewritten on every tick. |
 | `--cold-merge-grace-secs` | `EVALD_COLD_MERGE_GRACE_SECS` | int (seconds) | `60` | How long a merge input stays on disk after it leaves the index, so a query that listed it moments before the merge can still read it. Raise it above your slowest query if a long scan ever races a merge. |
 | `--max-hot-spans` | `EVALD_MAX_HOT_SPANS` | int (spans) | `300000` | Durable-backlog bound: shed ingest (`429 + Retry-After`) once this many un-compacted spans are resident in memory. Everything accepted is already durable in the WAL, so this bounds **memory**, not durability — it stops a lagging compactor from OOMing the process. `0` disables the bound. **Size it against your container limit** — see below. |
+| `--blob-offload-bytes` | `EVALD_BLOB_OFFLOAD_BYTES` | int (bytes) | `262144` | Offload a span's input/output payload larger than this to the blob store, leaving a compact `evald-blob:<key>` reference on the span (fetch it with `GET /v1/blobs/{key}`). Keeps a large RAG context or tool output out of the WAL, the Parquet blocks and query responses. `0` keeps payloads inline. |
 | `--auth-token` | `EVALD_AUTH_TOKEN` | string (repeatable) | *(none)* | Require `Authorization: Bearer <token>` on **every** request — HTTP (OTLP ingest, `/v1/*`, SPA; `401` on failure) and OTLP/gRPC (`authorization` metadata; `UNAUTHENTICATED` on failure). Each flag occurrence is **one whole token** (a comma is part of the token); repeat it for several accepted tokens (rotation / per-client revocation). `EVALD_AUTH_TOKEN` is a **comma-separated** list, **unioned** with the flag(s) and the file — not overridden. Tokens must be **≥16 printable-ASCII chars** (rejected at boot). **Nothing set — or a present-but-empty value — ⇒ auth OFF** (the default local posture). Arm it before exposing evald on a shared/public network (see [OPERATIONS.md § Security posture](./OPERATIONS.md#security-posture)). Shared-secret gate, **not** TLS. |
 | `--rollup` | `EVALD_ROLLUP` | `name=fn` (repeatable, comma-separated) | *(defaults)* | How a score name combines when [`GET /v1/traces/{id}/scores`](./API.md#get-v1tracestrace_idscores) rolls span scores into a trace-level value: `mean` \| `min` \| `max` \| `sum` \| `all` \| `any`. Defaults: `mean` for numeric, `all` for boolean. **A CI gate usually wants `min`** — one bad step in a ten-step agent should fail the trace, and a mean dilutes it. Read-time only: nothing is rewritten, and changing this changes the answer for traces already stored. |
 | `--price-table` | `EVALD_PRICE_TABLE` | path | *(built-in table)* | A model price table (the LiteLLM `model_prices_and_context_window.json` shape, or any subset of it) laid over the built-in one; it wins for every model it names. Used at ingest to fill `cost_usd` for spans that carry a model and token counts but no cost of their own. Re-read when the file's modification time changes (a bad edit keeps the previous table); a file that does not parse stops `serve` at start-up. evald makes no network call to update it. Logs a warning when the table is older than 90 days. |
 | `--no-usage-metrics` | `EVALD_NO_USAGE_METRICS` | flag | off | Do not record the LLM usage series (cost, tokens, latency, rolling evaluator scores) on `/metrics`. They are on by default: one lock per committed batch and a bounded number of series. evald's own health series are unaffected. See [API.md § LLM usage series](./API.md#llm-usage-series). |
 | `--metrics-model-cap` | `EVALD_METRICS_MODEL_CAP` | int | `100` | Distinct model names carried as the `gen_ai_request_model` label before the rest fold into `other` (counted by `evald_usage_labels_folded_total`). Bounds the series count, and so the scrape size (~4–5 KB per series) and the scraper's memory. Providers (16) and services (32) have fixed caps, and there are at most 2048 label tuples. |
+| `--logs` | `EVALD_LOGS` | `genai` \| `all` \| `off` | `genai` | What the OTLP logs door (`POST /v1/logs`, gRPC `LogsService`) keeps. `genai`: records evald recognises (`gen_ai.evaluation.result`, Claude Code, Codex CLI and Gemini CLI events) become spans and scores; every other record is acknowledged, counted (`evald_log_records_total{outcome="unmapped"}`) and dropped, so an application's ordinary logs never fill the store. `all`: those are kept too, each as a zero-duration span with its attributes, body and severity, in the record's own trace or, without one, a trace of its own: useful to see what a new tool sends, but it makes evald a log store. `off`: every record is acknowledged and dropped. See [API.md § POST /v1/logs](./API.md#post-v1logs). |
+| `--mcp-allow-writes` | `EVALD_MCP_ALLOW_WRITES` | flag | off | Let MCP clients on [`POST /mcp`](./API.md#post-mcp) write scores (the `add_score` tool). Without it a connected agent can only read. |
 | `--redact` | `EVALD_REDACT` | classes, comma-separated, or `all` (repeatable) | *(none)* | **Redact sensitive values before anything is written.** Classes: `email`, `credit_card` (Luhn-checked), `ssn`, `phone`, `ip`, `api_key`, `jwt`. Applies to prompts (`input_value`), completions (`output_value`) and every string in `raw_attributes` (recursing into nested JSON). **Unset ⇒ no redaction** — the rewrite is irreversible, since the raw value never reaches the WAL, a blob or a Parquet block, so it is always an explicit choice. Not scanned: `user_id`, `session_id`, `service_name`, span name — see [OPERATIONS.md § Redaction](./OPERATIONS.md#redaction). |
 | `--redact-action` | `EVALD_REDACT_ACTION` | `redact` \| `hash` \| `drop` | `redact` | `redact` → `[REDACTED:<class>]`. `hash` → `[<class>:<16 hex>]`: unrecoverable, but **equal values hash equally**, so "how many distinct users" stays answerable without the store holding the value. `drop` removes the match entirely. |
 | `--redact-custom` | — | `name=regex` (repeatable) | *(none)* | An extra rule, e.g. `employee_id=EMP-[0-9]{6}`. Compiled at startup, so a bad pattern fails the process rather than silently never matching under load. |
@@ -143,7 +163,7 @@ used to be.
 | `--junit` | — | path | — | Also write a [JUnit XML report](#junit-xml-reports) here: one test case per evaluator, failing when its threshold is missed. |
 
 Exit code: `0` when every configured threshold is met, `1` on a threshold
-regression — the CI gate.
+regression — the CI gate — and `2` when the run could not happen ([exit codes](#exit-codes)).
 
 ## `evald eval compare <run_a> <run_b>`
 
@@ -157,7 +177,7 @@ regression — the CI gate.
 | `--junit` | — | path | — | Also write a [JUnit XML report](#junit-xml-reports): one test case per evaluator delta, failing exactly when the gate above fails. |
 
 Exit code: `0`, or `1` when `--fail-on-regression` is set and the (raw or
-significance-mode) gate trips.
+significance-mode) gate trips, or `2` when the comparison could not run.
 
 ## `evald eval calibrate`
 
@@ -184,7 +204,42 @@ suite-level pass rate.
 | `--config` | — | path | `suite.yaml` | The suite YAML (`cases[]`, `min_pass_rate`, `repeat`, `min_pass`). |
 | `--junit` | — | path | — | Also write a [JUnit XML report](#junit-xml-reports): one test case per suite case, plus a final `suite pass rate` case that carries the gate's verdict. |
 
-Exit code: `0` when the suite passes, `1` when it fails.
+Exit code: `0` when the suite passes, `1` when it fails, `2` when it could not run.
+
+## The GitHub Action
+
+The repository is also a GitHub Action. It installs a pinned evald (the verified
+`install.sh`), runs `eval run` or `suite run` with a JUnit report, writes the run's output to
+the job summary, and fails the job exactly when evald's exit code says to
+([exit codes](#exit-codes)).
+
+```yaml
+jobs:
+  evals:
+    runs-on: ubuntu-latest        # or macos-*; there is no Windows installer
+    steps:
+      - uses: actions/checkout@v4
+      - id: gate
+        uses: lucheeseng827/evald@v0.4.0
+        with:
+          config: evals/eval.yaml   # required
+          # command: suite          # `eval` (default) or `suite`
+          # version: v0.4.0         # pin the evald release; `latest` follows the newest
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: evald-junit, path: "${{ steps.gate.outputs.junit }}" }
+```
+
+| Input | Default | What it does |
+|---|---|---|
+| `config` | *(required)* | The eval or suite YAML. |
+| `command` | `eval` | `eval` (`evald eval run`) or `suite` (`evald suite run`). |
+| `version` | `latest` | The evald release to install. Pin it for a gate that does not move under you. |
+| `data-dir` | `.evald-data` | Where `eval run` keeps its scores (cache it between runs to compare against the last one). |
+| `junit` | `evald-junit.xml` | The JUnit report's path (also the `junit` output). |
+| `args` | — | Extra arguments, split on whitespace, e.g. `--estimate`. |
+
+Outputs: `exit-code` (0, 1 or 2) and `junit`.
 
 ## JUnit XML reports
 
@@ -259,6 +314,103 @@ estimated, when absent. The equivalent SQL is in [OPERATIONS.md](./OPERATIONS.md
 | `--by` | — | `model` \| `provider` \| `service` | `model` | Grouping dimension (case-insensitive). `user` and `session` are refused: with a percentile per user most groups hold one or two spans. Untagged spans surface as `(untagged)`. |
 | `--data-dir` | `EVALD_DATA_DIR` | path | `evald-data` | The spans to report over. |
 | `--limit` | — | int | `100` | Max groups printed. |
+
+## `evald sessions`
+
+The most recently active sessions, one line each: start, duration, traces, LLM calls and their
+errors, distinct tool calls and their failures, model calls per trace (`steps`), a suspected
+tool loop (`loop`: three identical tool calls in a row), cost and models. `--json` prints the
+[`GET /v1/sessions/{id}`](./API.md#get-v1sessionssession_id) object for each instead, tool
+calls by name included. Reads the most recent 50,000 spans and says so when that cut a session
+short.
+
+| Flag | Env var | Type | Default | What it does |
+|---|---|---|---|---|
+| `--data-dir` | `EVALD_DATA_DIR` | path | `evald-data` | The spans to report over. |
+| `--limit` | — | int | `20` | Max sessions printed. |
+| `--json` | — | flag | off | JSON instead of the table. |
+
+## `evald demo`
+
+Writes a store to look at before any app sends anything: a Claude Code session (the captured
+telemetry the dialect is tested on), three traces from a small RAG app (`support-bot`: chain,
+retriever, model call; one call fails) priced from the built-in table, and a
+`gen_ai.evaluation.result` score on each successful call. Timestamps are moved to the last half
+hour. The data is compiled into the binary; nothing is fetched. It refuses a directory that
+already holds data, so it can never mix demo spans into a real store.
+
+| Flag | Env var | Type | Default | What it does |
+|---|---|---|---|---|
+| `--data-dir` | — | path | `evald-demo` | Where to write. Must be absent or empty. Deliberately not `EVALD_DATA_DIR`. |
+
+## `evald doctor`
+
+Checks the setup `serve` would start with and prints a fix for each problem:
+
+- **data dir:** it exists and is writable (probed with a temporary file), or `serve` will create it.
+- **persistence:** it is not on ephemeral storage (`/tmp`, `/run`, …).
+- **disk:** free space against the default 256 MiB ingest floor.
+- **ports:** each address can be bound (one in use usually means an `evald serve` is already
+  running there).
+- **exposure:** a listener beyond loopback without auth fails.
+- **price table:** its age.
+- **outbound calls:** whether this build has any network client.
+
+Nothing connects anywhere and no store is opened. Exits `1` when any check fails, `0` otherwise
+(warnings included).
+
+| Flag | Env var | Type | Default | What it does |
+|---|---|---|---|---|
+| `--data-dir` | `EVALD_DATA_DIR` | path | `evald-data` | The data dir `serve` would use. |
+| `--otlp-http` | `EVALD_OTLP_HTTP_ADDR` | `host:port` | `127.0.0.1:4318` | The HTTP address `serve` would bind. |
+| `--otlp-grpc` | `EVALD_OTLP_GRPC_ADDR` | `host:port` | `127.0.0.1:4317` | The gRPC address (empty: disabled). |
+
+Auth is read from `EVALD_AUTH_TOKEN` / `EVALD_AUTH_TOKEN_FILE`, the variables `serve` reads.
+
+## `evald connect <tool>`
+
+Prints the configuration that points a tool at this evald, to paste or `eval`. Tools:
+`claude-code` (verified against Claude Code 2.1.306), `codex` (an `[otel]` table for
+`~/.codex/config.toml`, verified against Codex 0.163.0), `gemini-cli` (alias `gemini`; verified
+against Gemini CLI 0.65.0), `otel-app` (any OpenTelemetry-instrumented app), `collector` (an
+OpenTelemetry Collector exporter that fans out beside an existing backend).
+The endpoints come from the same `--otlp-http` / `--otlp-grpc` values `serve` takes, so a
+wildcard bind such as `0.0.0.0` prints as `127.0.0.1`. A token is never printed.
+
+```bash
+eval "$(evald connect claude-code)"     # then run claude as usual
+evald connect claude-code --settings-json --traces   # a ~/.claude/settings.json env block
+evald connect codex >> ~/.codex/config.toml          # if it has no [otel] table yet
+eval "$(evald connect gemini-cli)"      # then run gemini as usual
+```
+
+| Flag | Env var | Type | Default | What it does |
+|---|---|---|---|---|
+| `--otlp-http` | `EVALD_OTLP_HTTP_ADDR` | `host:port` | `127.0.0.1:4318` | Where evald serves HTTP. |
+| `--otlp-grpc` | `EVALD_OTLP_GRPC_ADDR` | `host:port` | `127.0.0.1:4317` | Where evald serves gRPC. |
+| `--host` | — | string | *(from the address)* | The host the tool reaches evald on, when it is another machine. |
+| `--http` | — | flag | off | HTTP/protobuf on the HTTP port instead of gRPC. |
+| `--traces` | — | flag | off | Also send the tool's spans (Claude Code: the beta span tree of each turn; Codex: its internal spans; Gemini CLI: keeps the spans it otherwise turns off). |
+| `--token-env` | — | env var name | *(none)* | Add `Authorization: Bearer ${<var>}`, read from that variable when the tool starts. Codex's `config.toml` and a `settings.json` expand no variables: there, a placeholder for the token itself. |
+| `--settings-json` | — | flag | off | Claude Code: a `settings.json` `env` block; Gemini CLI: a `settings.json` `telemetry` block. Instead of shell exports. |
+
+## `evald mcp`
+
+A [Model Context Protocol](https://modelcontextprotocol.io) server on stdio over the store at
+`--data-dir`: the tools of [`POST /mcp`](./API.md#post-mcp) (SQL, traces, sessions, cost and
+latency reports, eval-run comparison, failing items) for a store **no server holds** — a CI
+run's, a copy, `evald demo`'s. The store's lock is exclusive, so for the store a running
+`evald serve` holds, point the agent at that server's `POST /mcp` instead. One JSON-RPC message
+per line on stdin and stdout; logs go to stderr. Nothing leaves the machine.
+
+```bash
+claude mcp add evald -- evald mcp --data-dir ./ci-run-store
+```
+
+| Flag | Env var | Type | Default | What it does |
+|---|---|---|---|---|
+| `--data-dir` | `EVALD_DATA_DIR` | path | `evald-data` | The store to answer from. |
+| `--allow-writes` | — | flag | off | Expose `add_score` (a score onto a span, trace or session). |
 
 ## `evald query <sql>`
 
