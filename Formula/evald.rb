@@ -2,28 +2,28 @@
 class Evald < Formula
   desc "Embedded OTel-native trace + eval store for LLM apps (single binary)"
   homepage "https://github.com/lucheeseng827/evald"
-  version "0.3.0"
+  version "0.4.0"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
       url "https://github.com/lucheeseng827/evald/releases/download/v#{version}/evald-aarch64-apple-darwin.tar.gz"
-      sha256 "59e3ca72ba5e02d5dbd8d669e6c2dd4ecaf9803b4fddd4def3290fddbac7b2b4"
+      sha256 "82dd3918a6b1e018af791e1495e07586181aba692a438c3942e337effbc183af"
     end
     on_intel do
       url "https://github.com/lucheeseng827/evald/releases/download/v#{version}/evald-x86_64-apple-darwin.tar.gz"
-      sha256 "c07a4a4aa09b317d26919fd3d18904622649529d3b10f11f576ef72e385d1c02"
+      sha256 "d4d178f5ea558f56c495b92a48f5ec0dfde5f34db4deb8be6e6cc1db4d1656bc"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/lucheeseng827/evald/releases/download/v#{version}/evald-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "e47993f630e5a3dd9096d2fb0e7ec82b9be7fb88f7b938fdfad6f82263fdb761"
+      sha256 "a287c3534a92da7c98146b05a27c7cf641201e5aaecc34f2a7bf2244aa7ccee5"
     end
     on_intel do
       url "https://github.com/lucheeseng827/evald/releases/download/v#{version}/evald-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "bfcd845e8db5f1b2e1dc40ffd4f73cb0906898a5fab1291975177163b89c6f5e"
+      sha256 "c3b1940ae1640e3de7a067c4b8ce971a9b91c7e9ab5733f5bd20ee2a45eb0f9a"
     end
   end
 
