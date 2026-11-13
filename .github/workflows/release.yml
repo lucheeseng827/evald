@@ -71,11 +71,12 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,  cross: true }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest,  cross: true }
-          # Both macOS targets build on macos-14 (Apple Silicon): arm64 native, x86_64 via an
+          # Both macOS targets build on macos-15 (Apple Silicon): arm64 native, x86_64 via an
           # in-macOS cross-compile (`cargo build --target x86_64-apple-darwin`, no extra linker).
-          # macos-13 (Intel) is being retired and queues for many minutes — avoid it.
-          - { target: x86_64-apple-darwin,         os: macos-14 }
-          - { target: aarch64-apple-darwin,        os: macos-14 }
+          # macos-13 (Intel) is retired, and macos-14 no longer gets a runner: v0.5.0's builds
+          # were refused with "The configuration 'macos-14-arm64-us-default' is not supported".
+          - { target: x86_64-apple-darwin,         os: macos-15 }
+          - { target: aarch64-apple-darwin,        os: macos-15 }
           - { target: x86_64-pc-windows-msvc,      os: windows-latest }
     steps:
       - uses: actions/checkout@v4

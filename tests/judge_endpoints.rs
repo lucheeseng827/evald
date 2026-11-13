@@ -392,10 +392,24 @@ async fn picky_chat(State(p): State<Picky>, Json(body): Json<serde_json::Value>)
         )
             .into_response()
     };
-    let throttled = p
-        .throttle
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-        .is_ok();
+    // Take one from the throttle budget if any is left. A compare-exchange loop rather than
+    // `fetch_update`, which newer stable deprecates (renamed `try_update`): the mirror's CI
+    // tracks stable with `-D warnings`, and this compiles clean on the pinned toolchain too.
+    let throttled = {
+        let mut n = p.throttle.load(Ordering::SeqCst);
+        loop {
+            if n == 0 {
+                break false;
+            }
+            match p
+                .throttle
+                .compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break true,
+                Err(current) => n = current,
+            }
+        }
+    };
     if throttled {
         return (
             StatusCode::TOO_MANY_REQUESTS,
