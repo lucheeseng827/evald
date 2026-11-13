@@ -21,6 +21,10 @@ evald-data/
 # the README are the exception — re-include them.
 !/docs/assets/*.png
 
+# The root .gitignore ignores `*.txt` globally; the 1.0 surface records read by
+# tests/surface.rs are source — re-include them (a regen must show in `git status`).
+!/tests/fixtures/surface/*.txt
+
 # EE console (private, Elastic-License) — same rule as the OSS frontend: source in
 # ee/frontend/src, built bundle in ee/frontend/dist/ committed + embedded in the
 # fleet binaries. Regenerate with `cd ee/frontend && npm run build`.

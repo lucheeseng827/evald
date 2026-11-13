@@ -1,0 +1,133 @@
+{{- include "evald.guards" . -}}
+{{- $secret := include "evald.authSecret" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "evald.fullname" . }}
+  labels:
+    {{- include "evald.labels" . | nindent 4 }}
+spec:
+  # One writer per store: never more than one.
+  replicas: 1
+  serviceName: {{ include "evald.fullname" . }}-headless
+  # A rollout replaces the pod: the new one opens the store once the old one has let it go.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "evald.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "evald.selector" . | nindent 8 }}
+      annotations:
+        {{- if .Values.auth.create }}
+        checksum/auth: {{ .Values.auth.token | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: evald
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: EVALD_DATA_DIR
+              value: /data
+            - name: EVALD_OTLP_HTTP_ADDR
+              value: "0.0.0.0:{{ .Values.service.httpPort }}"
+            - name: EVALD_OTLP_GRPC_ADDR
+              value: {{ if .Values.service.grpc }}"0.0.0.0:{{ .Values.service.grpcPort }}"{{ else }}""{{ end }}
+            {{- if $secret }}
+            # From a file, not the environment: a token in env shows in `kubectl describe`.
+            - name: EVALD_AUTH_TOKEN_FILE
+              value: /run/secrets/evald/{{ .Values.auth.key }}
+            {{- end }}
+            {{- if .Values.retention }}
+            - name: EVALD_RETENTION
+              value: {{ .Values.retention | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+            {{- if .Values.service.grpc }}
+            - name: grpc
+              containerPort: {{ .Values.service.grpcPort }}
+            {{- end }}
+          # Both probes are outside the auth gate. Liveness never consults the store, so a slow
+          # disk does not get a healthy process killed; readiness is the writer being alive.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          # WAL replay on a large store can take a while before the first answer.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- if $secret }}
+            - name: auth
+              mountPath: /run/secrets/evald
+              readOnly: true
+            {{- end }}
+      {{- if $secret }}
+      volumes:
+        - name: auth
+          secret:
+            secretName: {{ $secret }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

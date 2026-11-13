@@ -25,8 +25,12 @@ FROM rust:1.98.1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
+# Cargo features to build with, e.g. `--build-arg FEATURES=judge` for the LLM-as-judge backend
+# (what ops/stacks/ builds, so `eval run` and `serve --online-eval` can call a judge). Empty: the
+# default build, with no HTTP client in it.
+ARG FEATURES=""
 # Alpine's host target is *-unknown-linux-musl → a fully static binary by default.
-RUN cargo build --release --bin evald && \
+RUN cargo build --release --bin evald ${FEATURES:+--features "$FEATURES"} && \
     strip target/release/evald && \
     mkdir -p /data-empty
 

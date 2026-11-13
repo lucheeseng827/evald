@@ -1,0 +1,21 @@
+# The HTTP routes 1.0 freezes (docs/STABILITY.md). tests/surface.rs proves each one answers.
+# `GET`/`DELETE /mcp` answer 405 by the MCP spec (no event stream), so they are not listed.
+GET /healthz
+GET /readyz
+POST /v1/traces
+POST /v1/logs
+GET /v1/spans
+GET /v1/traces/{trace_id}
+GET /v1/traces/{trace_id}/scores
+GET /v1/sessions
+GET /v1/sessions/{session_id}
+POST /v1/scores
+GET /v1/scores
+GET /v1/scores/{id}
+POST /v1/span_annotations
+POST /v1/sql
+GET /v1/stats
+GET /v1/meta
+GET /v1/blobs/{key}
+POST /mcp
+GET /metrics

@@ -132,6 +132,26 @@ arrive is dropped at ingest (`evald_duplicate_calls_dropped_total`), so cost, to
 usage series count the call once. What this does and does not cover is in
 [INSTRUMENTATION.md § Claude Code](./INSTRUMENTATION.md#claude-code).
 
+## OTLP conformance
+
+Both export paths (`/v1/traces`, `/v1/logs`) behave as the OTLP/HTTP specification requires,
+and `tests/otlp_conformance.rs` holds each rule:
+
+- **The reply is in the request's own format.** A protobuf request is answered in
+  `application/x-protobuf`, a JSON one (with or without `; charset=utf-8`) in `application/json`.
+  Full success is `200` with an empty `Export*ServiceResponse` (`{}` in JSON).
+- **Every 4xx and 5xx body is a `google.rpc.Status`**, in that same encoding, with evald's
+  message in `message`. This covers a malformed body (`400`), a bad gzip stream, a missing token
+  (`401`), the wrong method (`405`) and a full disk (`503`). In JSON it reads
+  `{"code": 3, "message": "evald: could not decode OTLP protobuf: …"}`. Strict exporters (Java,
+  .NET, PHP) decode the error body, and a plain-text one breaks them.
+- **A refusal to store is retryable, and says when.** A full ingest queue answers `429` with
+  `Retry-After: 1`. A disk below its floor answers `503` with `Retry-After: 30`. The exporter
+  keeps the batch and retries instead of dropping it.
+- **`/v1/metrics` is refused as OTLP, too.** evald does not take metrics, but an exporter
+  configured for every signal posts there. It gets a `404` `Status` (`UNIMPLEMENTED`), not a
+  false success.
+
 ## GET /v1/spans
 
 Recent spans (hot ∪ cold, deduped by `(trace_id, span_id)`), most-recent-first,
@@ -244,7 +264,7 @@ build time. `/v1/meta` isn't a gate; it only drives the console's edition badge.
 
 ```bash
 curl -s http://localhost:4318/v1/meta
-# -> {"edition":"oss","fleet":false,"judge":false,"version":"0.3.0","price_table":"159b5b2f@2026-10-21"}
+# -> {"edition":"oss","fleet":false,"judge":false,"version":"0.5.0","price_table":"dc65705e@2026-11-13","semconv":"1.38.0"}
 ```
 
 | Field | Meaning |
@@ -253,6 +273,7 @@ curl -s http://localhost:4318/v1/meta
 | `fleet` | `true` on the EE `fleet-query` node; drives the console's edition badge only — the EE views are already present or absent per which binary's bundle is serving. |
 | `judge` | Whether this build has the managed/BYO-key judge path compiled in (`--features judge`). |
 | `version` | `CARGO_PKG_VERSION` of the serving binary. |
+| `semconv` | The OpenTelemetry semantic-conventions release the span mapping is written against ([INSTRUMENTATION.md § Semantic conventions](./INSTRUMENTATION.md#semantic-conventions)). |
 | `price_table` | The price table deriving `cost_usd` right now: the built-in baseline's `<commit>@<date>`, or `<file's version>+<baseline>` under `--price-table`. Nothing per span records its table; each Parquet block names the one in force when it was written (`evald.price_tables`). |
 
 ## POST /v1/scores
@@ -343,6 +364,24 @@ Read-only DataFusion SQL over the store. Registered tables:
   `raw_attributes_json` (JSON string), ….
 - `scores` — the score store; `target_id` joins to `spans.span_id`
   (the OTel-native join).
+
+### Any attribute is queryable
+
+Every attribute a span carried, under the key it was sent with, is in `raw_attributes_json`.
+`attr(raw_attributes_json, 'key')` reads one back: no vendor prefix to adopt, no mapping to
+configure, nothing renamed. A string comes back as it is, a number or boolean as its text, an
+array or map as its JSON, and an absent key as `NULL`. The same holds for an attribute evald
+also promotes to a column (`gen_ai.request.model` is in `model` *and* in `attr(…)`), and for
+the hot tier and cold Parquet alike (`tests/any_attribute.rs`):
+
+```sql
+SELECT attr(raw_attributes_json, 'acme.tenant.id') AS tenant, count(*) AS calls, sum(cost_usd) AS usd
+FROM spans
+WHERE CAST(attr(raw_attributes_json, 'app.retry_count') AS BIGINT) > 2
+GROUP BY 1 ORDER BY usd DESC
+```
+
+A key with a quote in it doubles the quote, as SQL does: `attr(raw_attributes_json, 'it''s')`.
 
 Body: `{"sql": "...", "limit": 1000}` — `limit` caps the **result** (default
 1 000, max 100 000; `truncated: true` when the tail was dropped), not the scan.
@@ -477,7 +516,7 @@ default 100; providers 16; services 32; and at most 2048 label tuples overall).
 | `evald_llm_cache_write_tokens_total` | counter | Cache-write (creation) input tokens. |
 | `evald_llm_reasoning_tokens_total` | counter | Reasoning output tokens. |
 | `gen_ai_client_operation_duration_seconds` | histogram | Wall time of the span (`end − start`), seconds. Buckets: `0.01 … 81.92` (the OpenTelemetry GenAI advisory boundaries, doubling from 10 ms) plus `163.84`, `327.68` for long generations and reasoning models. |
-| `gen_ai_client_operation_time_to_first_chunk_seconds` | histogram | Time to first chunk, seconds, same buckets. **Only series whose spans carried a time-to-first-token attribute appear**; spans without one are never observed and never estimated. Attributes read: `gen_ai.response.time_to_first_chunk` (s), `ai.response.msToFirstChunk`, `ai.stream.msToFirstChunk`, `time_to_first_token_ms` (ms). |
+| `gen_ai_client_operation_time_to_first_chunk_seconds` | histogram | Time to first chunk, seconds, same buckets. **Only series whose spans carried a time-to-first-token attribute appear**; spans without one are never observed and never estimated. Attributes read: `gen_ai.response.time_to_first_chunk` (s), `ai.response.msToFirstChunk`, `ai.stream.msToFirstChunk`, `time_to_first_token_ms` (ms), `gen_ai.latency.time_to_first_token` (s, vLLM's own request span). |
 | `evald_eval_score_mean{evaluator}` | gauge | Mean of the most recent numeric scores per evaluator (window below). Run-level aggregates are excluded. Boolean scores read as a pass rate. |
 | `evald_eval_score_window_samples{evaluator}` | gauge | Scores currently in that window (at most 1024). |
 | `evald_eval_scores_untracked_total` | counter | Numeric scores ignored because 64 evaluator names were already tracked. Present only once that happens. |
@@ -485,6 +524,15 @@ default 100; providers 16; services 32; and at most 2048 label tuples overall).
 | `evald_usage_labels_folded_total` | counter | Spans whose provider, model, service or tool label was folded into `other`. Non-zero means raise `--metrics-model-cap` or run one evald per fleet segment. |
 | `evald_tool_calls_total{gen_ai_tool_name,service_name}` | counter | Tool spans accepted. Tool names are capped at 64 and pairs at 512, past which a call counts under `other`. A call traced at two layers (a framework's tool span and the MCP span inside it) counts at each; the session rollup is the exact count. |
 | `evald_tool_call_errors_total{gen_ai_tool_name,service_name}` | counter | …of which carried an error status or an `error.type`. The ratio of the two is the tool-error rate. |
+| `evald_online_eval_considered_total` | counter | With `--online-eval`: model calls with an output that passed the spec's `only:` filter. |
+| `evald_online_eval_sampled_total{why}` | counter | …of which were picked for judging: `error`, `cost` (`always:`) or `rate`. |
+| `evald_online_eval_shed_total` | counter | Picked calls dropped because the judge queue was full. Ingest never waits; this is the cost of a judge slower than the sample. |
+| `evald_online_eval_judged_total{outcome}` | counter | (call, judge) pairs handled: `scored`, `failed` (the call failed), `unscorable` (the rail needs a field the call lacks), `budget` (the day's token cap was spent), `paused`. |
+| `evald_online_eval_tokens_total` | counter | Tokens the online judge calls spent. |
+| `evald_online_eval_tokens_today` / `evald_online_eval_daily_token_cap` | gauge | Spend so far this UTC day, and the cap. |
+| `evald_online_eval_queue_depth` | gauge | Picked calls waiting for the judge. |
+| `evald_online_eval_colocated` | gauge | `1` once a production model call went to a judge endpoint's own server. |
+| `evald_online_eval_paused` | gauge | `1` while judging is paused for slow production calls on that server. |
 
 **How to read them.** Counters are *since process start* and **approximate under exporter retries**: an
 OTLP exporter that re-sends a batch it never got an ACK for is counted twice, because the store only
@@ -543,7 +591,7 @@ claude mcp add --transport http evald http://127.0.0.1:4318/mcp
 | `list_sessions`, `get_session` | The session rollups above. |
 | `cost_report` | `evald cost`: tokens and cost by model, user, session, service or provider. |
 | `latency_report` | `evald latency`: model-call percentiles by model, provider or service. |
-| `compare_runs` | `evald eval compare`: per-evaluator delta between two eval runs, with Welch's t where the runs carry statistics. |
+| `compare_runs` | `evald eval compare`: per-evaluator delta between two eval runs, with a t-test where the runs carry statistics: `test` is `paired` (the same items in both runs, with `bootstrap_ci`) or `welch` (with `unpaired_because`). |
 | `failing_items` | A run's lowest per-item scores (below `below`, default 1), each with the span or trace it scored. |
 | `add_score` | Write a score onto a span, trace or session. **Only with `serve --mcp-allow-writes`**; otherwise it is not listed and a call is refused. |
 

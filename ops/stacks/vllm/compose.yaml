@@ -1,0 +1,101 @@
+# evald + vLLM + an OpenTelemetry Collector + Prometheus + Grafana, on one GPU host.
+#
+#   docker compose up -d --build        # needs an NVIDIA GPU and the container toolkit
+#   open http://localhost:3000/d/evald-vllm   (Grafana)   http://localhost:4320/   (evald)
+#
+# Apps send OTLP to the collector (localhost:4317 gRPC, :4318 HTTP), which forwards to evald;
+# vLLM sends its request spans there too. Propagate `traceparent` on the app's calls to vLLM
+# (localhost:8000/v1) and vLLM's spans land under the app's: docs/INFERENCE-SERVERS.md.
+# Prometheus scrapes evald and vLLM, and the board puts the two side by side.
+#
+# evald is built from this checkout with the judge backend, so `eval run` and online evals
+# can use the served model as a judge. Everything is published on 127.0.0.1 only.
+name: evald-vllm
+
+services:
+  vllm:
+    image: docker.io/vllm/vllm-openai:${VLLM_VERSION:-v0.32.0}
+    command:
+      - --model=${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      - --served-model-name=${VLLM_SERVED_NAME:-Qwen2.5-7B-Instruct}
+      - --otlp-traces-endpoint=grpc://otel-collector:4317
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      OTEL_SERVICE_NAME: vllm
+      OTEL_EXPORTER_OTLP_TRACES_INSECURE: "true"
+    ipc: host
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+
+  otel-collector:
+    image: docker.io/otel/opentelemetry-collector:${OTELCOL_VERSION:-0.163.2}
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      - evald
+    restart: unless-stopped
+
+  evald:
+    image: ${EVALD_IMAGE:-evald:judge}
+    build:
+      context: ../../..
+      args:
+        FEATURES: judge
+    ports:
+      # The collector has 4317/4318 on the host; evald's UI and API are on 4320.
+      - "127.0.0.1:4320:4318"
+    volumes:
+      - evald-data:/data
+      - ./:/stack:ro
+    environment:
+      EVALD_AUTH_TOKEN: ${EVALD_AUTH_TOKEN:-}
+      EVALD_ONLINE_EVAL: ${EVALD_ONLINE_EVAL:-}
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  prometheus:
+    image: docker.io/prom/prometheus:${PROMETHEUS_VERSION:-v3.15.1}
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: docker.io/grafana/grafana:${GRAFANA_VERSION:-13.2.4}
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # No calls home: the stack runs as well with no internet as with it.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  hf-cache: {}
+  evald-data: {}
+  prometheus-data: {}

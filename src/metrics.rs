@@ -211,6 +211,11 @@ pub fn render(store: &Store) -> String {
         usage.render(&mut out);
     }
 
+    // Online sampled evals, when `--online-eval` is on.
+    if let Some(online) = store.online() {
+        online.render_metrics(&mut out);
+    }
+
     out
 }
 
@@ -221,11 +226,11 @@ fn series(out: &mut String, name: &str, help: &str, kind: &str, labels: &str, va
     let _ = writeln!(out, "{name}{labels} {}", format_value(value));
 }
 
-fn counter(out: &mut String, name: &str, help: &str, value: f64) {
+pub(crate) fn counter(out: &mut String, name: &str, help: &str, value: f64) {
     series(out, name, help, "counter", "", value);
 }
 
-fn gauge(out: &mut String, name: &str, help: &str, value: f64) {
+pub(crate) fn gauge(out: &mut String, name: &str, help: &str, value: f64) {
     series(out, name, help, "gauge", "", value);
 }
 
@@ -233,7 +238,7 @@ fn gauge(out: &mut String, name: &str, help: &str, value: f64) {
 /// and TYPE once, then a line per series — the shape a scraper expects for a labeled family.
 /// Nothing is emitted for an empty set, so a disabled feature publishes no series at all
 /// rather than a family of zeros.
-fn counter_labeled(
+pub(crate) fn counter_labeled(
     out: &mut String,
     name: &str,
     help: &str,

@@ -1,0 +1,22 @@
+evald is starting as {{ include "evald.fullname" . }} (one pod, store on a {{ .Values.persistence.size }} volume).
+
+Send telemetry from inside the cluster:
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://{{ include "evald.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.httpPort }}
+{{- if .Values.service.grpc }}
+  (OTLP/gRPC: {{ include "evald.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.service.grpcPort }})
+{{- end }}
+
+The UI and API from your machine:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "evald.fullname" . }} {{ .Values.service.httpPort }}
+  open http://localhost:{{ .Values.service.httpPort }}/
+{{- if include "evald.authSecret" . }}
+
+Auth is ON: every request needs `Authorization: Bearer <token>` (a token from Secret {{ include "evald.authSecret" . }}).
+{{- else }}
+
+Auth is OFF. That is fine inside a trusted cluster; set auth.existingSecret before exposing the Service.
+{{- end }}
+{{- if not .Values.retention }}
+
+No retention is set: evald keeps everything until the volume fills (it refuses ingest before ENOSPC). Set retention: 30d to drop old data.
+{{- end }}

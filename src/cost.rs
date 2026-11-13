@@ -163,20 +163,15 @@ pub async fn cost_command(
     Ok(())
 }
 
-/// The attribution report with every derivable cost recomputed under `table`, from the stored
-/// token counts. A span whose cost the instrumentor reported keeps that cost; a span whose cost
-/// evald derived at ingest (or that has none) is priced again. Returns the same row shape as
-/// [`cost_rows`] plus the grand total, so [`print_report`] renders either.
-pub async fn reprice(
+/// One row per distinct usage shape (attribution, model, token counts, cost, flags) among the
+/// spans `filter` selects, with `n` the spans of that shape: re-pricing reads these, so the work
+/// is bounded by the distinct shapes, not the span count.
+async fn usage_shapes(
     store: &Store,
-    dimension: Dimension,
-    limit: usize,
-    table: &crate::price::PriceTable,
-) -> anyhow::Result<(Vec<serde_json::Value>, serde_json::Value)> {
-    use crate::model::Tokens;
-    use crate::price::{detect_basis, price_tokens, Basis, COST_ATTRIBUTES};
-
-    let col = dimension.column();
+    col: &str,
+    filter: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    use crate::price::COST_ATTRIBUTES;
     // A derived cost is one evald filled in: the span has a cost and none of the attributes a
     // reported cost is read from (the normalizer keeps every attribute, so a reported cost always
     // carries its key). Nothing per span says "derived" — that is the point of not stamping it.
@@ -200,13 +195,64 @@ pub async fn reprice(
                              THEN 1 ELSE 0 END AS cache_excl,
                         CASE WHEN raw_attributes_json LIKE '%"evald.cost.basis":"%reasoning_add%'
                              THEN 1 ELSE 0 END AS reasoning_add
-                 FROM spans)
+                 FROM spans WHERE {filter})
            GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12"#
     );
     let resp = crate::sql::query(store, &sql, REPRICE_MAX_GROUPS).await?;
     if resp.truncated {
         anyhow::bail!("more than {REPRICE_MAX_GROUPS} distinct usage shapes; cannot re-price");
     }
+    Ok(resp.rows)
+}
+
+/// The token counts of a usage-shape row.
+fn shape_tokens(r: &serde_json::Value) -> crate::model::Tokens {
+    let opt = |k: &str| r[k].as_u64().or_else(|| r[k].as_i64().map(|v| v as u64));
+    crate::model::Tokens {
+        prompt: opt("prompt_tokens"),
+        completion: opt("completion_tokens"),
+        total: opt("total_tokens"),
+        cache_read: opt("cache_read_tokens"),
+        cache_write: opt("cache_write_tokens"),
+        reasoning: opt("reasoning_tokens"),
+    }
+}
+
+/// How a shape's counts are to be read: the basis evald recorded when it priced the span at
+/// ingest, else worked out from the counts.
+fn shape_basis(
+    r: &serde_json::Value,
+    tokens: &crate::model::Tokens,
+    derived: bool,
+) -> crate::price::Basis {
+    use crate::price::{detect_basis, Basis};
+    if derived {
+        return Basis {
+            cache_excl: json_i64(&r["cache_excl"]) == 1,
+            reasoning_add: json_i64(&r["reasoning_add"]) == 1,
+        };
+    }
+    // Legacy span: only the stored total is left to read the counts by, and the normalizer
+    // synthesises that column as prompt + completion when the instrumentor reported no total
+    // (which `price::reported_total` avoids at ingest by reading the raw attribute). A
+    // synthesized total is not evidence: it makes `extra` zero, which would silence the "cache
+    // larger than the whole prompt" rule and price a cached span inclusively. Drop it and let
+    // the arithmetic decide.
+    let synthesized = tokens.prompt.zip(tokens.completion).map(|(p, c)| p + c);
+    detect_basis(tokens, tokens.total.filter(|t| Some(*t) != synthesized))
+}
+
+/// The attribution report with every derivable cost recomputed under `table`, from the stored
+/// token counts. A span whose cost the instrumentor reported keeps that cost; a span whose cost
+/// evald derived at ingest (or that has none) is priced again. Returns the same row shape as
+/// [`cost_rows`] plus the grand total, so [`print_report`] renders either.
+pub async fn reprice(
+    store: &Store,
+    dimension: Dimension,
+    limit: usize,
+    table: &crate::price::PriceTable,
+) -> anyhow::Result<(Vec<serde_json::Value>, serde_json::Value)> {
+    use crate::price::price_tokens;
 
     #[derive(Default)]
     struct Acc {
@@ -217,21 +263,13 @@ pub async fn reprice(
     }
     let mut groups: std::collections::BTreeMap<String, Acc> = Default::default();
     let mut all = Acc::default();
-    for r in &resp.rows {
+    for r in &usage_shapes(store, dimension.column(), "TRUE").await? {
         let n = json_i64(&r["n"]);
         let key = r["attribution"]
             .as_str()
             .unwrap_or("(untagged)")
             .to_string();
-        let opt = |k: &str| r[k].as_u64().or_else(|| r[k].as_i64().map(|v| v as u64));
-        let tokens = Tokens {
-            prompt: opt("prompt_tokens"),
-            completion: opt("completion_tokens"),
-            total: opt("total_tokens"),
-            cache_read: opt("cache_read_tokens"),
-            cache_write: opt("cache_write_tokens"),
-            reasoning: opt("reasoning_tokens"),
-        };
+        let tokens = shape_tokens(r);
         let derived = json_i64(&r["derived"]) == 1;
         let stored = r["cost_usd"].as_f64();
         let per_span: Option<f64> = match stored {
@@ -243,23 +281,11 @@ pub async fn reprice(
                     return None;
                 }
                 let (_, price) = table.lookup(m)?;
-                let basis = if derived {
-                    Basis {
-                        cache_excl: json_i64(&r["cache_excl"]) == 1,
-                        reasoning_add: json_i64(&r["reasoning_add"]) == 1,
-                    }
-                } else {
-                    // Legacy span: only the stored total is left to read the counts by, and the
-                    // normalizer synthesises that column as prompt + completion when the
-                    // instrumentor reported no total (which `price::reported_total` avoids at
-                    // ingest by reading the raw attribute). A synthesized total is not evidence:
-                    // it makes `extra` zero, which would silence the "cache larger than the whole
-                    // prompt" rule and price a cached span inclusively. Drop it and let the
-                    // arithmetic decide.
-                    let synthesized = tokens.prompt.zip(tokens.completion).map(|(p, c)| p + c);
-                    detect_basis(&tokens, tokens.total.filter(|t| Some(*t) != synthesized))
-                };
-                Some(price_tokens(price, &tokens, basis))
+                Some(price_tokens(
+                    price,
+                    &tokens,
+                    shape_basis(r, &tokens, derived),
+                ))
             }),
         };
         let toks = tokens.total.unwrap_or(0) as i64 * n;
@@ -291,6 +317,558 @@ pub async fn reprice(
     total["groups"] = serde_json::json!(groups.len());
     rows.truncate(limit);
     Ok((rows, total))
+}
+
+/// `models` as a SQL `IN (…)` list, quoted.
+fn sql_in(models: &[String]) -> String {
+    models
+        .iter()
+        .map(|m| format!("'{}'", m.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One row of [`reprice_as`]: a group's model calls, what they cost as stored, and what the same
+/// tokens cost at the hosted model's list price.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AsHostedRow {
+    pub attribution: String,
+    pub calls: i64,
+    pub tokens: i64,
+    /// The stored cost, where the calls had one (`None`: none did).
+    pub cost_usd: Option<f64>,
+    /// Calls with no stored cost.
+    pub missing_cost: i64,
+    pub as_hosted_usd: f64,
+    /// Calls with no token counts, so they could not be re-priced.
+    pub no_tokens: i64,
+}
+
+/// What this traffic would have cost at `hosted`'s list price: every model call (of `models`,
+/// when given) priced from its own token counts under the hosted model's rates, beside the cost
+/// stored for it. Groups by `dimension`; the last row is the total.
+pub async fn reprice_as(
+    store: &Store,
+    dimension: Dimension,
+    limit: usize,
+    table: &crate::price::PriceTable,
+    hosted: &str,
+    models: &[String],
+) -> anyhow::Result<Vec<AsHostedRow>> {
+    use crate::price::price_tokens;
+    let (_, price) = table.lookup(hosted).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{hosted:?} is not in the price table — name a model it prices (`evald cost --by \
+             model` shows what is priced), or add it with --price-table"
+        )
+    })?;
+    let mut filter = crate::latency::LLM_PREDICATE.to_string();
+    if !models.is_empty() {
+        filter = format!("{filter} AND model IN ({})", sql_in(models));
+    }
+    let mut groups: std::collections::BTreeMap<String, AsHostedRow> = Default::default();
+    let blank = |k: &str| AsHostedRow {
+        attribution: k.to_string(),
+        calls: 0,
+        tokens: 0,
+        cost_usd: None,
+        missing_cost: 0,
+        as_hosted_usd: 0.0,
+        no_tokens: 0,
+    };
+    let mut total = blank("TOTAL");
+    for r in &usage_shapes(store, dimension.column(), &filter).await? {
+        let n = json_i64(&r["n"]);
+        let key = r["attribution"]
+            .as_str()
+            .unwrap_or("(untagged)")
+            .to_string();
+        let tokens = shape_tokens(r);
+        let derived = json_i64(&r["derived"]) == 1;
+        let priced = (tokens.prompt.is_some() || tokens.completion.is_some())
+            .then(|| price_tokens(price, &tokens, shape_basis(r, &tokens, derived)));
+        let entry = groups.entry(key.clone()).or_insert_with(|| blank(&key));
+        for a in [entry, &mut total] {
+            a.calls += n;
+            a.tokens += tokens.total.unwrap_or(0) as i64 * n;
+            match r["cost_usd"].as_f64() {
+                Some(c) => *a.cost_usd.get_or_insert(0.0) += c * n as f64,
+                None => a.missing_cost += n,
+            }
+            match priced {
+                Some(c) => a.as_hosted_usd += c * n as f64,
+                None => a.no_tokens += n,
+            }
+        }
+    }
+    let mut rows: Vec<AsHostedRow> = groups.into_values().collect();
+    rows.sort_by(|a, b| {
+        b.as_hosted_usd
+            .total_cmp(&a.as_hosted_usd)
+            .then(b.calls.cmp(&a.calls))
+    });
+    rows.truncate(limit);
+    rows.push(total);
+    Ok(rows)
+}
+
+fn print_as_hosted(dimension: Dimension, hosted: &str, price: (f64, f64), rows: &[AsHostedRow]) {
+    let col = format!("as {}", truncate(hosted, 20));
+    println!(
+        "\nevald cost — model calls by {}, priced as {hosted} (${:.2} / ${:.2} per 1M input / output)",
+        dimension.label(),
+        price.0 * 1e6,
+        price.1 * 1e6
+    );
+    println!(
+        "{:<28} {:>10} {:>16} {:>13} {:>16}",
+        dimension.label(),
+        "calls",
+        "tokens",
+        "cost_usd",
+        col
+    );
+    for r in rows {
+        let stored = match r.cost_usd {
+            Some(c) if r.missing_cost > 0 => format!("${c:.4}*"),
+            Some(c) => format!("${c:.4}"),
+            None => "(no price)".to_string(),
+        };
+        let hosted = if r.no_tokens > 0 {
+            format!("${:.4}*", r.as_hosted_usd)
+        } else {
+            format!("${:.4}", r.as_hosted_usd)
+        };
+        println!(
+            "{:<28} {:>10} {:>16} {:>13} {:>16}",
+            truncate(&r.attribution, 28),
+            r.calls,
+            r.tokens,
+            stored,
+            hosted
+        );
+    }
+    let total = rows.last().expect("the total row");
+    if total.missing_cost > 0 {
+        println!(
+            "\nnote: {} call(s) have no stored cost (`*` where some of a row's calls do, \
+             `(no price)` where none do): a self-hosted model is unpriced until it is in \
+             --price-table, and `evald cost gpu-rate` derives a rate for it.",
+            total.missing_cost
+        );
+    }
+    if total.no_tokens > 0 {
+        println!(
+            "note: `*` in the last column: {} call(s) carry no token counts, so they are not in it.",
+            total.no_tokens
+        );
+    }
+}
+
+/// The amortised rate of a self-hosted model: what its GPUs cost over a window, spread over the
+/// tokens the traffic evald saw used.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuRate {
+    pub models: Vec<String>,
+    pub window_hours: f64,
+    pub gpus: u32,
+    pub gpu_hour_usd: f64,
+    /// `gpus × window_hours × gpu_hour_usd`.
+    pub gpu_cost_usd: f64,
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// The first call's start and the last call's end in the window (unix ns).
+    pub first_unix_nano: Option<u64>,
+    pub last_unix_nano: Option<u64>,
+    /// How much of the window the calls span, in `[0, 1]`.
+    pub coverage: f64,
+    /// An output token costs this many input tokens' worth of GPU time.
+    pub output_ratio: f64,
+    pub input_per_token: f64,
+    pub output_per_token: f64,
+}
+
+/// [`GpuRate`] for `models` over the `window` ending at `now_unix_nano`.
+#[allow(clippy::too_many_arguments)]
+pub async fn gpu_rate(
+    store: &Store,
+    models: &[String],
+    window: std::time::Duration,
+    now_unix_nano: u64,
+    gpus: u32,
+    gpu_hour_usd: f64,
+    output_ratio: f64,
+) -> anyhow::Result<GpuRate> {
+    anyhow::ensure!(
+        !models.is_empty(),
+        "name the model(s) these GPUs serve with --model"
+    );
+    anyhow::ensure!(gpus > 0, "--gpus must be at least 1");
+    anyhow::ensure!(
+        gpu_hour_usd.is_finite() && gpu_hour_usd > 0.0,
+        "--gpu-hour-usd must be a positive amount"
+    );
+    anyhow::ensure!(
+        output_ratio.is_finite() && output_ratio > 0.0,
+        "--output-ratio must be positive"
+    );
+    let window_ns = window.as_nanos().min(u64::MAX as u128) as u64;
+    anyhow::ensure!(window_ns > 0, "--since must be a positive window");
+    let cutoff = now_unix_nano.saturating_sub(window_ns);
+    let sql = format!(
+        "SELECT COUNT(*) AS calls, SUM(prompt_tokens) AS input, SUM(completion_tokens) AS output, \
+                MIN(start_unix_nano) AS first, MAX(end_unix_nano) AS last \
+         FROM spans WHERE {} AND model IN ({}) AND start_unix_nano >= {cutoff}",
+        crate::latency::LLM_PREDICATE,
+        sql_in(models)
+    );
+    let row = crate::sql::query(store, &sql, 1)
+        .await?
+        .rows
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let u = |k: &str| {
+        row[k]
+            .as_u64()
+            .or_else(|| row[k].as_i64().map(|v| v.max(0) as u64))
+    };
+    let (calls, input, output) = (
+        u("calls").unwrap_or(0),
+        u("input").unwrap_or(0),
+        u("output").unwrap_or(0),
+    );
+    let weighted = input as f64 + output_ratio * output as f64;
+    anyhow::ensure!(
+        weighted > 0.0,
+        "no tokens from {} in the last {:.1} h: nothing to spread the GPU cost over (check the \
+         model names with `evald cost --by model`)",
+        models.join(", "),
+        window.as_secs_f64() / 3600.0
+    );
+    let window_hours = window.as_secs_f64() / 3600.0;
+    let gpu_cost_usd = f64::from(gpus) * window_hours * gpu_hour_usd;
+    let input_per_token = gpu_cost_usd / weighted;
+    let (first, last) = (u("first"), u("last"));
+    let coverage = match (first, last) {
+        (Some(a), Some(b)) if b > a => ((b - a) as f64 / window_ns as f64).min(1.0),
+        _ => 0.0,
+    };
+    Ok(GpuRate {
+        models: models.to_vec(),
+        window_hours,
+        gpus,
+        gpu_hour_usd,
+        gpu_cost_usd,
+        calls,
+        input_tokens: input,
+        output_tokens: output,
+        first_unix_nano: first,
+        last_unix_nano: last,
+        coverage,
+        output_ratio,
+        input_per_token,
+        output_per_token: input_per_token * output_ratio,
+    })
+}
+
+/// A price-table overlay entry for each model, at the derived rate.
+pub fn gpu_rate_overlay(r: &GpuRate) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for m in &r.models {
+        out.insert(
+            m.clone(),
+            serde_json::json!({
+                "input_cost_per_token": r.input_per_token,
+                "output_cost_per_token": r.output_per_token,
+            }),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+fn utc(ns: Option<u64>) -> String {
+    ns.and_then(|n| chrono::DateTime::from_timestamp((n / 1_000_000_000) as i64, 0))
+        .map_or_else(
+            || "-".to_string(),
+            |t| t.format("%Y-%m-%d %H:%M UTC").to_string(),
+        )
+}
+
+/// One row of [`language_tax`]: a model's answers in one language, and how many tokens each
+/// character of them took.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaxRow {
+    /// [`crate::lang::Detected::code`]: ISO 639-1 where there is one.
+    pub language: String,
+    pub language_name: String,
+    pub model: String,
+    pub answers: usize,
+    pub chars: u64,
+    pub tokens: u64,
+    /// This model's tokens per character here over its own in English, when it answered in
+    /// English too.
+    pub vs_english: Option<f64>,
+}
+
+impl TaxRow {
+    pub fn tokens_per_char(&self) -> f64 {
+        self.tokens as f64 / self.chars.max(1) as f64
+    }
+}
+
+/// The language tax over `(model, answer text, completion tokens)` samples: per language and
+/// model, the characters and tokens of the answers the detector could place (the rest are
+/// counted, not guessed). Sorted by language, then cheapest model first.
+pub fn tax_rows<'a>(
+    samples: impl IntoIterator<Item = (&'a str, &'a str, u64)>,
+) -> (Vec<TaxRow>, usize) {
+    let mut by: std::collections::BTreeMap<(String, String), TaxRow> = Default::default();
+    let mut undetected = 0usize;
+    for (model, text, tokens) in samples {
+        let Some(d) = crate::lang::detect(text).filter(|d| d.reliable) else {
+            undetected += 1;
+            continue;
+        };
+        let row = by
+            .entry((d.code.to_string(), model.to_string()))
+            .or_insert_with(|| TaxRow {
+                language: d.code.to_string(),
+                language_name: d.name.to_string(),
+                model: model.to_string(),
+                answers: 0,
+                chars: 0,
+                tokens: 0,
+                vs_english: None,
+            });
+        row.answers += 1;
+        row.chars += text.chars().count() as u64;
+        row.tokens += tokens;
+    }
+    let english: std::collections::BTreeMap<String, f64> = by
+        .values()
+        .filter(|r| r.language == "en")
+        .map(|r| (r.model.clone(), r.tokens_per_char()))
+        .collect();
+    let mut rows: Vec<TaxRow> = by.into_values().collect();
+    for r in &mut rows {
+        r.vs_english = english
+            .get(&r.model)
+            .filter(|en| **en > 0.0)
+            .map(|en| r.tokens_per_char() / en);
+    }
+    rows.sort_by(|a, b| {
+        a.language
+            .cmp(&b.language)
+            .then(a.tokens_per_char().total_cmp(&b.tokens_per_char()))
+    });
+    (rows, undetected)
+}
+
+/// The language tax from the store: the most recent `limit` model calls in `window` (of
+/// `models`, when given) that recorded an answer and its completion tokens.
+pub async fn language_tax(
+    store: &Store,
+    window: std::time::Duration,
+    now_unix_nano: u64,
+    models: &[String],
+    limit: usize,
+) -> anyhow::Result<(Vec<TaxRow>, usize, usize)> {
+    let since = now_unix_nano.saturating_sub(window.as_nanos() as u64);
+    let mut filter = format!(
+        "{} AND output_value IS NOT NULL AND completion_tokens > 0 AND start_unix_nano >= {since}",
+        crate::latency::LLM_PREDICATE
+    );
+    if !models.is_empty() {
+        filter = format!("{filter} AND model IN ({})", sql_in(models));
+    }
+    let sql = format!(
+        "SELECT model, output_value, completion_tokens FROM spans WHERE {filter} \
+         ORDER BY start_unix_nano DESC"
+    );
+    let resp = crate::sql::query(store, &sql, limit).await?;
+    let mut samples: Vec<(String, String, u64)> = Vec::with_capacity(resp.rows.len());
+    for r in &resp.rows {
+        let (Some(text), Some(tokens)) =
+            (r["output_value"].as_str(), r["completion_tokens"].as_u64())
+        else {
+            continue;
+        };
+        // An answer offloaded to the blob store is read back; one that is gone is left out.
+        let text = if text.starts_with(crate::blob::BLOB_REF_PREFIX) {
+            match store
+                .get_blob(text)
+                .ok()
+                .flatten()
+                .and_then(|b| String::from_utf8(b).ok())
+            {
+                Some(t) => t,
+                None => continue,
+            }
+        } else {
+            text.to_string()
+        };
+        let model = r["model"].as_str().unwrap_or("(unknown)").to_string();
+        samples.push((model, text, tokens));
+    }
+    let scanned = samples.len();
+    let (rows, undetected) = tax_rows(samples.iter().map(|(m, t, n)| (m.as_str(), t.as_str(), *n)));
+    Ok((rows, undetected, scanned))
+}
+
+/// `evald cost language-tax`: print tokens per character by language and model.
+pub async fn language_tax_command(
+    data_dir: &Path,
+    window: std::time::Duration,
+    models: &[String],
+    limit: usize,
+) -> anyhow::Result<()> {
+    let store = Store::open(
+        data_dir,
+        StoreConfig {
+            compact_interval: None,
+            ..StoreConfig::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("opening store at {}: {e}", data_dir.display()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let (rows, undetected, scanned) = language_tax(&store, window, now, models, limit).await?;
+    println!(
+        "evald cost language-tax — tokens per character of model answers, the last {:.1} d",
+        window.as_secs_f64() / 86_400.0
+    );
+    println!(
+        "{:<9} {:<18} {:<28} {:>8} {:>9} {:>9} {:>9} {:>7}",
+        "language", "name", "model", "answers", "chars", "tokens", "tok/char", "vs en"
+    );
+    for r in &rows {
+        println!(
+            "{:<9} {:<18} {:<28} {:>8} {:>9} {:>9} {:>9.3} {:>7}",
+            r.language,
+            truncate(&r.language_name, 18),
+            truncate(&r.model, 28),
+            r.answers,
+            r.chars,
+            r.tokens,
+            r.tokens_per_char(),
+            r.vs_english.map_or("-".to_string(), |x| format!("{x:.2}×"))
+        );
+    }
+    println!(
+        "\n{scanned} answer(s) read, {undetected} too short or mixed to place. A character carries \
+         more in some scripts than others (a Han character is often a word), so compare models \
+         within a language; `vs en` is what the same model charges here per character against \
+         English."
+    );
+    Ok(())
+}
+
+/// `evald cost gpu-rate`: print the derived rate and the overlay to paste.
+pub async fn gpu_rate_command(
+    data_dir: &Path,
+    models: &[String],
+    window: std::time::Duration,
+    gpus: u32,
+    gpu_hour_usd: f64,
+    output_ratio: f64,
+) -> anyhow::Result<()> {
+    let store = Store::open(
+        data_dir,
+        StoreConfig {
+            compact_interval: None,
+            ..StoreConfig::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("opening store at {}: {e}", data_dir.display()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let r = gpu_rate(
+        &store,
+        models,
+        window,
+        now,
+        gpus,
+        gpu_hour_usd,
+        output_ratio,
+    )
+    .await?;
+    println!(
+        "\nevald cost gpu-rate — {} over the last {:.1} h",
+        r.models.join(", "),
+        r.window_hours
+    );
+    println!(
+        "  GPUs          : {} × ${:.2}/h × {:.1} h = ${:.2}",
+        r.gpus, r.gpu_hour_usd, r.window_hours, r.gpu_cost_usd
+    );
+    println!(
+        "  calls         : {} (first {}, last {}; {:.0}% of the window)",
+        r.calls,
+        utc(r.first_unix_nano),
+        utc(r.last_unix_nano),
+        r.coverage * 100.0
+    );
+    println!(
+        "  tokens served : {} input, {} output",
+        r.input_tokens, r.output_tokens
+    );
+    println!(
+        "  rate          : ${:.4} / ${:.4} per 1M input / output (an output token costs {} input \
+         tokens' worth)",
+        r.input_per_token * 1e6,
+        r.output_per_token * 1e6,
+        r.output_ratio
+    );
+    if r.coverage < 0.9 {
+        println!(
+            "\nnote: the calls span {:.0}% of the window. The GPUs were paid for all of it, so if \
+             evald missed traffic (it started later, or retention dropped it) this rate is too \
+             high: use a --since evald saw in full.",
+            r.coverage * 100.0
+        );
+    }
+    println!(
+        "\nThe GPUs cost the same idle or busy: this is the rate at this traffic, and more \
+         traffic lowers it. Add it to your --price-table overlay:\n{}",
+        serde_json::to_string_pretty(&gpu_rate_overlay(&r))?
+    );
+    Ok(())
+}
+
+/// `evald cost --reprice-as`: open the store and print what the traffic would have cost hosted.
+pub async fn reprice_as_command(
+    dimension: Dimension,
+    data_dir: &Path,
+    limit: usize,
+    price_table: Option<&Path>,
+    hosted: &str,
+    models: &[String],
+) -> anyhow::Result<()> {
+    let store = Store::open(
+        data_dir,
+        StoreConfig {
+            compact_interval: None,
+            ..StoreConfig::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("opening store at {}: {e}", data_dir.display()))?;
+    let table = match price_table {
+        Some(p) => std::sync::Arc::new(crate::price::PriceTable::load_over_baseline(p)?),
+        None => crate::price::PriceTable::baseline(),
+    };
+    crate::price::warn_if_stale(&table);
+    let rows = reprice_as(&store, dimension, limit, &table, hosted, models).await?;
+    let price = table
+        .lookup(hosted)
+        .expect("checked by reprice_as")
+        .1
+        .base_rates();
+    print_as_hosted(dimension, hosted, price, &rows);
+    Ok(())
 }
 
 fn print_report(dimension: Dimension, rows: &[serde_json::Value], total: &serde_json::Value) {
@@ -393,6 +971,48 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_language_tax_is_tokens_per_character_by_language_and_model() {
+        let en = "The clinic opens at nine in the morning on Saturdays and closes at noon.";
+        let ms =
+            "Klinik dibuka pada pukul sembilan pagi setiap hari Sabtu dan ditutup tengah hari.";
+        let th = "คลินิกเปิดเวลาเก้าโมงเช้าทุกวันเสาร์และปิดตอนเที่ยง";
+        let n = |s: &str| s.chars().count() as u64;
+        // Model a: 1 token per 4 characters in English, 1 per 3 in Malay, 1 per character in
+        // Thai. Model b: 1 per 2 characters in Thai, and no English answers.
+        let samples = [
+            ("a", en, n(en) / 4),
+            ("a", ms, n(ms) / 3),
+            ("a", th, n(th)),
+            ("b", th, n(th) / 2),
+            ("a", "ok", 1),
+        ];
+        let (rows, undetected) = super::tax_rows(samples);
+        assert_eq!(undetected, 1, "too short to place");
+        let row = |lang: &str, model: &str| {
+            rows.iter()
+                .find(|r| r.language == lang && r.model == model)
+                .unwrap_or_else(|| panic!("no {lang}/{model} in {rows:#?}"))
+        };
+        assert!((row("en", "a").tokens_per_char() - 0.25).abs() < 0.02);
+        let thai_a = row("th", "a");
+        assert_eq!(thai_a.answers, 1);
+        assert!((thai_a.vs_english.unwrap() - 4.0).abs() < 0.3, "{thai_a:?}");
+        assert!(row("ms", "a").vs_english.unwrap() > 1.0);
+        assert_eq!(
+            row("th", "b").vs_english,
+            None,
+            "b never answered in English"
+        );
+        // Within a language, the cheaper tokenizer first.
+        let thai: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.language == "th")
+            .map(|r| r.model.as_str())
+            .collect();
+        assert_eq!(thai, ["b", "a"]);
+    }
+
     use super::*;
     use crate::store::test_span;
 
@@ -661,5 +1281,177 @@ mod tests {
         assert_eq!(Dimension::parse("model").unwrap(), Dimension::Model);
         assert_eq!(Dimension::parse("USER").unwrap(), Dimension::User);
         assert!(Dimension::parse("team").is_err());
+    }
+
+    const HOUR_NS: u64 = 3_600_000_000_000;
+
+    /// A model call of `model` at `ts` with `prompt` / `completion` tokens.
+    fn call(id: &str, model: &str, ts: u64, prompt: u64, completion: u64) -> crate::NormalizedSpan {
+        let mut s = test_span("t", id, ts);
+        s.oi_kind = Some("LLM".into());
+        s.model = Some(model.into());
+        s.tokens.prompt = Some(prompt);
+        s.tokens.completion = Some(completion);
+        s.tokens.total = Some(prompt + completion);
+        s.end_unix_nano = ts + 1_000_000;
+        s
+    }
+
+    async fn store_with(spans: Vec<crate::NormalizedSpan>) -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            dir.path(),
+            StoreConfig {
+                compact_interval: None,
+                ..StoreConfig::default()
+            },
+        )
+        .unwrap();
+        store.ingest_batch(spans, &[]).await.unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn the_language_tax_reads_the_stored_answers() {
+        let now = 1_000 * HOUR_NS;
+        let answer = |id: &str, model: &str, text: &str, tokens: u64, at: u64| {
+            let mut s = call(id, model, at, 10, tokens);
+            s.output_value = Some(text.into());
+            s
+        };
+        let th = "คลินิกเปิดเวลาเก้าโมงเช้าทุกวันเสาร์และปิดตอนเที่ยง";
+        let en = "The clinic opens at nine in the morning on Saturdays and closes at noon.";
+        let mut tool = answer("tool", "m", en, 999, now - HOUR_NS);
+        tool.oi_kind = Some("TOOL".into()); // not a model's answer
+        let (_d, store) = store_with(vec![
+            answer("a", "m", en, 18, now - HOUR_NS),
+            answer("b", "m", th, 50, now - HOUR_NS),
+            answer("c", "other", th, 25, now - HOUR_NS),
+            answer("old", "m", th, 9_999, now - 40 * 24 * HOUR_NS), // before the window
+            tool,
+        ])
+        .await;
+        let window = std::time::Duration::from_secs(30 * 24 * 3600);
+        let (rows, undetected, scanned) =
+            language_tax(&store, window, now, &[], 100).await.unwrap();
+        assert_eq!((scanned, undetected), (3, 0));
+        let thai: Vec<(&str, u64)> = rows
+            .iter()
+            .filter(|r| r.language == "th")
+            .map(|r| (r.model.as_str(), r.tokens))
+            .collect();
+        assert_eq!(
+            thai,
+            [("other", 25), ("m", 50)],
+            "cheapest first, old and tool calls out"
+        );
+        let only_m = language_tax(&store, window, now, &["m".into()], 100)
+            .await
+            .unwrap();
+        assert!(only_m.0.iter().all(|r| r.model == "m"));
+    }
+
+    #[tokio::test]
+    async fn gpu_rate_spreads_what_the_gpus_cost_over_the_tokens_served() {
+        let now = 1_000 * HOUR_NS;
+        let mut agent = call("agent", "local-qwen", now - HOUR_NS, 9_000, 9_000);
+        agent.oi_kind = Some("AGENT".into()); // its usage is its calls': not counted again
+        let (_d, store) = store_with(vec![
+            call("a", "local-qwen", now - 20 * HOUR_NS, 1_000, 250),
+            call("b", "local-qwen", now - 10 * HOUR_NS, 1_000, 250),
+            call("c", "local-qwen", now - HOUR_NS, 1_000, 250),
+            call("old", "local-qwen", now - 30 * HOUR_NS, 50_000, 50_000), // before the window
+            call("other", "gpt-4.1-mini", now - HOUR_NS, 7_000, 7_000),
+            agent,
+        ])
+        .await;
+        let window = std::time::Duration::from_secs(24 * 3600);
+        let r = gpu_rate(&store, &["local-qwen".into()], window, now, 2, 2.0, 3.0)
+            .await
+            .unwrap();
+        assert_eq!((r.calls, r.input_tokens, r.output_tokens), (3, 3_000, 750));
+        // 2 GPUs × $2/h × 24 h = $96, over 3000 + 3 × 750 = 5250 input-token equivalents.
+        assert!((r.gpu_cost_usd - 96.0).abs() < 1e-9);
+        assert!((r.input_per_token - 96.0 / 5250.0).abs() < 1e-12);
+        assert!((r.output_per_token - 3.0 * 96.0 / 5250.0).abs() < 1e-12);
+        // The calls span 19 of the 24 hours.
+        assert!((r.coverage - (19.0 * 3600.0 + 0.001) / (24.0 * 3600.0)).abs() < 1e-6);
+        let overlay = gpu_rate_overlay(&r);
+        assert_eq!(
+            overlay["local-qwen"]["output_cost_per_token"].as_f64(),
+            Some(r.output_per_token)
+        );
+        // The overlay is a price table evald loads, and it prices the model at the rate.
+        let table = crate::price::PriceTable::from_json(&overlay.to_string()).unwrap();
+        assert_eq!(
+            table.lookup("local-qwen").unwrap().1.base_rates(),
+            (r.input_per_token, r.output_per_token)
+        );
+
+        let none = gpu_rate(&store, &["nobody".into()], window, now, 1, 1.0, 1.0).await;
+        assert!(none
+            .unwrap_err()
+            .to_string()
+            .contains("no tokens from nobody"));
+        assert!(gpu_rate(&store, &[], window, now, 1, 1.0, 1.0)
+            .await
+            .is_err());
+        assert!(
+            gpu_rate(&store, &["local-qwen".into()], window, now, 0, 1.0, 1.0)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reprice_as_prices_the_same_tokens_at_a_hosted_list_price() {
+        let mut priced = call("p", "gpt-4.1-mini", 10, 1_000_000, 100_000);
+        priced.cost_usd = Some(0.56);
+        let (_d, store) = store_with(vec![
+            call("a", "local-qwen", 10, 1_000_000, 100_000),
+            call("b", "local-qwen", 11, 2_000_000, 200_000),
+            priced,
+        ])
+        .await;
+        let table = crate::price::PriceTable::from_json(
+            r#"{"hosted-x": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.000008}}"#,
+        )
+        .unwrap();
+        let rows = reprice_as(&store, Dimension::Model, 10, &table, "hosted-x", &[])
+            .await
+            .unwrap();
+        let get = |k: &str| rows.iter().find(|r| r.attribution == k).unwrap().clone();
+        let local = get("local-qwen");
+        // 3M input × $2/M + 300k output × $8/M = $6 + $2.40.
+        assert_eq!(local.calls, 2);
+        assert!((local.as_hosted_usd - 8.4).abs() < 1e-9, "{local:?}");
+        assert_eq!((local.cost_usd, local.missing_cost), (None, 2));
+        let hosted = get("gpt-4.1-mini");
+        assert_eq!(hosted.cost_usd, Some(0.56));
+        assert!((hosted.as_hosted_usd - 2.8).abs() < 1e-9);
+        let total = rows.last().unwrap();
+        assert_eq!(total.attribution, "TOTAL");
+        assert_eq!(total.calls, 3);
+        assert!((total.as_hosted_usd - 11.2).abs() < 1e-9);
+
+        // Only the self-hosted model's calls.
+        let only = reprice_as(
+            &store,
+            Dimension::Model,
+            10,
+            &table,
+            "hosted-x",
+            &["local-qwen".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(only.len(), 2, "one model and the total");
+        assert!(
+            reprice_as(&store, Dimension::Model, 10, &table, "unpriced", &[])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not in the price table")
+        );
     }
 }

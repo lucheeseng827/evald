@@ -9,7 +9,7 @@ panic = "unwind"
 
 [package]
 name = "evald"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "evald — embedded OTel-native trace + eval store for LLM apps (single binary). PoC: OTLP/HTTP receiver."
@@ -112,6 +112,9 @@ sha2 = "0.10"
 # Eval runner (PoC step 6)
 serde_yaml = "0.9"                                   # eval run config (dataset + evaluators + thresholds)
 regex = "1"                                          # the `regex` Tier-1 evaluator
+whatlang = "0.18"                                    # language_match + the language tax: an embedded trigram detector (MIT), no model files
+unicode-normalization = "0.1"                        # NFKC for `normalize: true` matching; already in the tree via url/idna
+futures = "0.3"                                      # a judge's in-flight cap (`buffered`); already in the tree via DataFusion
 # `json_schema` Tier-1 evaluator. `default-features=false` drops the HTTP/file `$ref`
 # resolvers (and their reqwest pull-in) — inline, self-contained schemas only, so the
 # validator stays fully offline / air-gapped like the rest of the deterministic set.
@@ -165,6 +168,7 @@ judge = ["dep:reqwest"]
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }    # ServiceExt::oneshot — drive the router in tests, no socket
 tempfile = "3"                                       # isolated WAL dirs for store/recovery tests
+rcgen = "0.14"                                       # throwaway TLS certificates for the judge client tests (a key file would trip the mirror's key scan)
 flate2 = "1"                                         # gzip a body to test the decompressed-size limit
 h2 = "0.4"                                           # a raw gRPC client: tonic's own is compiled out
 http = "1"

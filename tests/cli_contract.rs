@@ -112,6 +112,36 @@ fn evald_that_cannot_run_exits_2_not_1() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// `serve --online-eval` in a build with no judge backend refuses to start, and says why,
+/// rather than serving without the judging it was asked for.
+#[cfg(not(feature = "judge"))]
+#[test]
+fn online_eval_without_the_judge_backend_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = write(
+        dir.path(),
+        "online.yaml",
+        "judges: []\ndaily_token_cap: 1\n",
+    );
+    let out = evald()
+        .args([
+            "serve",
+            "--otlp-http",
+            "127.0.0.1:0",
+            "--otlp-grpc",
+            "",
+            "--data-dir",
+        ])
+        .arg(dir.path().join("d"))
+        .arg("--online-eval")
+        .arg(spec)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--features judge"), "{stderr}");
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_drains_and_exits_0() {

@@ -64,6 +64,76 @@ pub struct SqlResponse {
     pub truncated: bool,
 }
 
+/// `attr(raw_attributes_json, 'key')`: any span attribute, by the key it was sent with — no
+/// vendor prefix, no mapping, no rename. A string comes back as it is; a number or boolean as
+/// its text (`CAST(attr(…) AS DOUBLE)` to compare it); an array or map as its JSON; an absent
+/// key as NULL. Every attribute a span carried is in `raw_attributes_json`, so every attribute
+/// is queryable this way (docs/API.md § Any attribute is queryable).
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct AttrUdf {
+    signature: datafusion::logical_expr::Signature,
+}
+
+impl AttrUdf {
+    fn new() -> Self {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::{Signature, Volatility};
+        AttrUdf {
+            // `uniform` coerces a Utf8View (how Parquet strings may arrive) to Utf8.
+            signature: Signature::uniform(2, vec![DataType::Utf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl datafusion::logical_expr::ScalarUDFImpl for AttrUdf {
+    fn name(&self) -> &str {
+        "attr"
+    }
+    fn signature(&self) -> &datafusion::logical_expr::Signature {
+        &self.signature
+    }
+    fn return_type(
+        &self,
+        _args: &[datafusion::arrow::datatypes::DataType],
+    ) -> datafusion::error::Result<datafusion::arrow::datatypes::DataType> {
+        Ok(datafusion::arrow::datatypes::DataType::Utf8)
+    }
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> datafusion::error::Result<datafusion::logical_expr::ColumnarValue> {
+        use datafusion::arrow::array::{Array, StringArray};
+        use datafusion::arrow::compute::cast;
+        use datafusion::arrow::datatypes::DataType;
+        let arrays = datafusion::logical_expr::ColumnarValue::values_to_arrays(&args.args)?;
+        let as_strings =
+            |a: &datafusion::arrow::array::ArrayRef| -> datafusion::error::Result<StringArray> {
+                let a = cast(a, &DataType::Utf8)?;
+                Ok(a.as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("cast to Utf8")
+                    .clone())
+            };
+        let (json, keys) = (as_strings(&arrays[0])?, as_strings(&arrays[1])?);
+        let out: StringArray = (0..json.len())
+            .map(|i| {
+                if json.is_null(i) || keys.is_null(i) {
+                    return None;
+                }
+                let v: serde_json::Value = serde_json::from_str(json.value(i)).ok()?;
+                match v.get(keys.value(i))? {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    other => Some(other.to_string()),
+                }
+            })
+            .collect();
+        Ok(datafusion::logical_expr::ColumnarValue::Array(
+            std::sync::Arc::new(out),
+        ))
+    }
+}
+
 /// Run a read-only SQL query against the store, capping the result at `row_limit` rows.
 ///
 /// Registers `spans` (hot ∪ cold, deduped) and `scores`, then executes `sql`. Rejects any
@@ -75,6 +145,9 @@ pub async fn query(store: &Store, sql: &str, row_limit: usize) -> anyhow::Result
     bound_open_files(&ctx);
     register_spans(&ctx, store).await?;
     register_scores(&ctx, store)?;
+    ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(
+        AttrUdf::new(),
+    ));
 
     let df = ctx.sql(sql).await?;
     // Column names come from the logical plan schema (correct even for a 0-row result).

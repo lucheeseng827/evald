@@ -1,0 +1,11 @@
+apiVersion: v2
+name: evald
+description: evald on one node — the OTLP receiver, durable store, query API and UI in one pod, with its store on a persistent volume.
+type: application
+# The chart's own version; appVersion is the evald image it deploys by default.
+version: 0.5.0
+appVersion: "0.5.0"
+home: https://github.com/lucheeseng827/evald
+sources:
+  - https://github.com/lucheeseng827/evald
+keywords: [opentelemetry, otlp, llm, evals, observability]

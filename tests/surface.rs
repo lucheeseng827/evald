@@ -1,0 +1,248 @@
+//! The 1.0 surface freeze (ROADMAP-0.4-0.6.md 6.6, docs/STABILITY.md): every CLI command, flag
+//! and argument, and every HTTP route, is recorded under tests/fixtures/surface/.
+//!
+//! - **CLI** (`cli.txt`): read from the binary's own `--help`, command by command. A command or
+//!   flag that disappears fails here: removing one breaks a script that uses it. A new one fails
+//!   too, until it is recorded on purpose:
+//!   `EVALD_REGEN_SURFACE=1 cargo test --test surface`, then review the diff.
+//!   Each command's line also names the `EVALD_*` variables its flags read.
+//! - **HTTP** (`http.txt`): each route listed must answer, with neither a 404 from the fallback
+//!   nor a 405. A route is added to the list when it is added to the router.
+//! - **SQL** (`sql.txt`): the columns of the `spans` and `scores` tables a query names. A column
+//!   removed or renamed fails, as a CLI flag does; one added is recorded the same way.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::process::Command;
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/surface")
+}
+
+fn help(path: &[String]) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_evald"));
+    for (k, _) in std::env::vars() {
+        if k.starts_with("EVALD_") {
+            cmd.env_remove(k);
+        }
+    }
+    let out = cmd.args(path).arg("--help").output().unwrap();
+    assert!(out.status.success(), "{path:?} --help failed");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// A help page's subcommands, and its flags and positional arguments.
+fn parse(page: &str) -> (Vec<String>, BTreeSet<String>) {
+    let (mut commands, mut items) = (Vec::new(), BTreeSet::new());
+    let mut section = "";
+    for line in page.lines() {
+        if !line.starts_with(' ') && line.ends_with(':') {
+            section = line.trim_end_matches(':');
+            continue;
+        }
+        let t = line.trim_start();
+        match section {
+            "Commands" if line.starts_with("  ") && !line.starts_with("   ") => {
+                let name = t.split_whitespace().next().unwrap_or_default();
+                if !name.is_empty() && name != "help" {
+                    commands.push(name.to_string());
+                }
+            }
+            "Options" if t.starts_with('-') => {
+                let flag = t
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .find(|w| w.starts_with("--"))
+                    .unwrap_or_default();
+                if !flag.is_empty() && flag != "--help" && flag != "--version" {
+                    items.insert(flag.to_string());
+                }
+                // The variable that sets it is part of the surface too.
+                if let Some(env) = t.split("[env: ").nth(1).and_then(|e| e.split('=').next()) {
+                    items.insert(format!("${env}"));
+                }
+            }
+            "Arguments" if t.starts_with('<') || t.starts_with('[') => {
+                let arg = t.split_whitespace().next().unwrap_or_default();
+                items.insert(arg.to_string());
+            }
+            _ => {}
+        }
+    }
+    (commands, items)
+}
+
+/// Every command path under `evald`, and what it takes.
+fn cli_surface() -> BTreeMap<String, BTreeSet<String>> {
+    let mut out = BTreeMap::new();
+    let mut todo = vec![Vec::<String>::new()];
+    while let Some(path) = todo.pop() {
+        let (commands, items) = parse(&help(&path));
+        out.insert(
+            std::iter::once("evald".to_string())
+                .chain(path.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" "),
+            items,
+        );
+        for c in commands {
+            let mut next = path.clone();
+            next.push(c);
+            todo.push(next);
+        }
+    }
+    out
+}
+
+fn render(surface: &BTreeMap<String, BTreeSet<String>>) -> String {
+    surface
+        .iter()
+        .map(|(cmd, items)| {
+            let items: Vec<&str> = items.iter().map(String::as_str).collect();
+            format!("{cmd}: {}\n", items.join(" "))
+        })
+        .collect()
+}
+
+fn read_golden(text: &str) -> BTreeMap<String, BTreeSet<String>> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (cmd, items) = l.split_once(':').unwrap_or((l, ""));
+            (
+                cmd.trim().to_string(),
+                items.split_whitespace().map(String::from).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_cli_surface_is_what_1_0_freezes() {
+    let path = fixtures().join("cli.txt");
+    let current = cli_surface();
+    if std::env::var_os("EVALD_REGEN_SURFACE").is_some() {
+        let head = "# The CLI surface 1.0 freezes: every command path, and the flags and arguments it takes.\n\
+                    # Generated by tests/surface.rs from the binary's --help; a change here is a reviewed change.\n";
+        std::fs::write(&path, format!("{head}{}", render(&current))).unwrap();
+        return;
+    }
+    let golden = read_golden(&std::fs::read_to_string(&path).unwrap());
+    let mut problems = Vec::new();
+    for (cmd, items) in &golden {
+        match current.get(cmd) {
+            None => problems.push(format!("removed command `{cmd}`")),
+            Some(now) => {
+                for i in items.difference(now) {
+                    problems.push(format!("removed `{cmd} {i}`"));
+                }
+            }
+        }
+    }
+    for (cmd, items) in &current {
+        match golden.get(cmd) {
+            None => problems.push(format!("new command `{cmd}` is not recorded")),
+            Some(then) => {
+                for i in items.difference(then) {
+                    problems.push(format!("new `{cmd} {i}` is not recorded"));
+                }
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "the CLI surface changed:\n  {}\n\nA removal breaks scripts that use it (docs/STABILITY.md). An addition \
+         is recorded with EVALD_REGEN_SURFACE=1 cargo test --test surface.",
+        problems.join("\n  ")
+    );
+}
+
+#[tokio::test]
+async fn every_recorded_http_route_answers() {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = evald::Store::open(
+        dir.path(),
+        evald::StoreConfig {
+            compact_interval: None,
+            ..evald::StoreConfig::default()
+        },
+    )
+    .unwrap();
+    let app = evald::ingest::router(store);
+    let text = std::fs::read_to_string(fixtures().join("http.txt")).unwrap();
+    let routes: Vec<(&str, &str)> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| l.split_once(' ').unwrap())
+        .collect();
+    assert!(routes.len() > 15, "{routes:?}");
+    for (method, route) in routes {
+        let path = route
+            .replace("{trace_id}", "0123456789abcdef0123456789abcdef")
+            .replace("{session_id}", "s-1")
+            .replace("{id}", "x")
+            .replace("{key}", "x");
+        let req = Request::builder()
+            .method(Method::from_bytes(method.as_bytes()).unwrap())
+            .uri(&path)
+            .header("content-type", "application/json")
+            .body(Body::from(if method == "POST" { "{}" } else { "" }))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {route}");
+        assert!(
+            !body.contains("no such endpoint"),
+            "{method} {route} is not routed: {status} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_sql_tables_keep_their_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = evald::Store::open(
+        dir.path(),
+        evald::StoreConfig {
+            compact_interval: None,
+            ..evald::StoreConfig::default()
+        },
+    )
+    .unwrap();
+    let mut current = BTreeMap::new();
+    for table in ["spans", "scores"] {
+        let r = evald::sql::query(&store, &format!("SELECT * FROM {table} LIMIT 0"), 1)
+            .await
+            .unwrap();
+        current.insert(
+            table.to_string(),
+            r.columns.into_iter().collect::<BTreeSet<_>>(),
+        );
+    }
+    let path = fixtures().join("sql.txt");
+    if std::env::var_os("EVALD_REGEN_SURFACE").is_some() {
+        let head = "# The SQL columns 1.0 freezes: what `evald query` and POST /v1/sql name.\n\
+                    # Generated by tests/surface.rs; a change here is a reviewed change.\n";
+        std::fs::write(&path, format!("{head}{}", render(&current))).unwrap();
+        return;
+    }
+    let golden = read_golden(&std::fs::read_to_string(&path).unwrap());
+    for (table, cols) in &golden {
+        let now = &current[table];
+        let removed: Vec<&String> = cols.difference(now).collect();
+        let added: Vec<&String> = now.difference(cols).collect();
+        assert!(
+            removed.is_empty() && added.is_empty(),
+            "table {table}: removed {removed:?} (breaks queries), added {added:?} (record with \
+             EVALD_REGEN_SURFACE=1)"
+        );
+    }
+}

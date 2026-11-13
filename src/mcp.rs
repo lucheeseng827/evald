@@ -212,12 +212,16 @@ fn tools(access: Access) -> Vec<Json> {
             "compare_runs",
             "Compare two eval runs",
             "Per evaluator: run A's and run B's mean, the delta (B - A), and where both runs \
-             carry statistics a Welch's t-test (p-value, confidence interval on the delta). A \
-             negative delta is a regression.",
+             carry statistics a t-test (p-value, confidence interval on the delta): paired on \
+             the per-item differences when both runs scored the same items (with a bootstrap \
+             interval), else Welch's, with why. A negative delta is a regression. With a \
+             `margin`, also a one-sided paired non-inferiority verdict per evaluator and per \
+             slice: is B no worse than A by more than the margin.",
             json!({
                 "run_a": { "type": "string", "description": "baseline run id" },
                 "run_b": { "type": "string", "description": "candidate run id" },
                 "alpha": { "type": "number", "description": "significance level, default 0.05" },
+                "margin": { "type": "number", "description": "non-inferiority margin (e.g. 0.02); omit for none" },
             }),
             &["run_a", "run_b"],
             true,
@@ -359,12 +363,21 @@ async fn run(store: &Store, name: &str, args: &Json) -> anyhow::Result<Json> {
         "compare_runs" => {
             let alpha = args.get("alpha").and_then(Json::as_f64).unwrap_or(0.05);
             anyhow::ensure!(alpha > 0.0 && alpha < 1.0, "`alpha` is between 0 and 1");
-            let r = crate::eval::compare_runs(
-                store,
-                arg_str(args, "run_a")?,
-                arg_str(args, "run_b")?,
-                alpha,
-            )?;
+            let (run_a, run_b) = (arg_str(args, "run_a")?, arg_str(args, "run_b")?);
+            let r = crate::eval::compare_runs(store, run_a, run_b, alpha)?;
+            let margin = args.get("margin").and_then(Json::as_f64);
+            if let Some(m) = margin {
+                anyhow::ensure!(m.is_finite() && m > 0.0, "`margin` is a positive number");
+            }
+            let non_inferiority: Option<Vec<Json>> = match margin {
+                Some(m) => Some(
+                    crate::eval::non_inferiority_rows(store, run_a, run_b, m, alpha)?
+                        .iter()
+                        .map(crate::eval::NonInferiorRow::to_json)
+                        .collect(),
+                ),
+                None => None,
+            };
             let rows: Vec<Json> = r
                 .rows
                 .iter()
@@ -379,10 +392,26 @@ async fn run(store: &Store, name: &str, args: &Json) -> anyhow::Result<Json> {
                         "p_value": row.signif.map(|s| s.p_two_sided),
                         "ci_low": row.signif.map(|s| s.ci_low),
                         "ci_high": row.signif.map(|s| s.ci_high),
+                        "test": row.test.as_ref().map(crate::eval::TestUsed::name),
+                        "unpaired_because": match &row.test {
+                            Some(crate::eval::TestUsed::Welch { why }) => Some(why.as_str()),
+                            _ => None,
+                        },
+                        "bootstrap_ci": row.bootstrap_ci.map(|(lo, hi)| [lo, hi]),
                     })
                 })
                 .collect();
-            Ok(json!({ "run_a": r.run_a, "run_b": r.run_b, "alpha": alpha, "rows": rows }))
+            Ok(json!({
+                "run_a": r.run_a,
+                "run_b": r.run_b,
+                "alpha": alpha,
+                "rows": rows,
+                "judge_changes": r.judge_changes,
+                "replay_a": r.replay_a,
+                "replay_b": r.replay_b,
+                "margin": margin,
+                "non_inferiority": non_inferiority,
+            }))
         }
         "failing_items" => {
             let run = arg_str(args, "run_id")?;
@@ -766,6 +795,40 @@ mod tests {
         )
         .await;
         assert_eq!(cmp["structuredContent"]["rows"][0]["delta"], -0.5);
+        assert!(
+            cmp["structuredContent"]["non_inferiority"].is_null(),
+            "no margin, no test"
+        );
+
+        // With a margin: a non-inferiority verdict on the runs' per-item values.
+        let values = |run: &str, v: [f64; 2]| {
+            Score {
+            id: format!("{run}:items:exact_match"),
+            target: ScoreTarget::Run(run.into()),
+            name: crate::eval::ITEMS_NAME.into(),
+            num_value: None,
+            str_value: Some(
+                json!({"evaluator": "exact_match", "items": [["q0", v[0]], ["q1", v[1]]], "unkeyed": 0})
+                    .to_string(),
+            ),
+            data_type: DataType::Text,
+            ..item(run, "exact_match", 0, 0.0)
+        }
+        };
+        store
+            .put_scores(&[values("run_a", [1.0, 1.0]), values("run_b", [1.0, 0.0])])
+            .unwrap();
+        let ni = tool_call(
+            &store,
+            a,
+            "compare_runs",
+            json!({ "run_a": "run_a", "run_b": "run_b", "margin": 0.1 }),
+        )
+        .await;
+        let rows = &ni["structuredContent"]["non_inferiority"];
+        assert_eq!(rows[0]["verdict"], "inconclusive", "{ni}");
+        assert_eq!(rows[0]["pairs"], 2);
+        assert_eq!(ni["structuredContent"]["margin"], 0.1);
         let failing = tool_call(&store, a, "failing_items", json!({ "run_id": "run_b" })).await;
         let items = failing["structuredContent"]["items"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{failing}");

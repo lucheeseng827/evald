@@ -32,21 +32,25 @@ use crate::{Store, StoreConfig};
 ///   (milliseconds; measured from the end of the user's audio, so it is a *response* latency for
 ///   a voice turn rather than from request issuance).
 ///
+/// * `gen_ai.latency.time_to_first_token` — vLLM's own request span (seconds, measured from
+///   the request's arrival at the server; [`crate::vllm`]).
+///
 /// Projects that emit it only as a metric (OpenLLMetry) leave nothing on the span to read.
-pub const TTFT_ATTRS: [(&str, f64); 4] = [
+pub const TTFT_ATTRS: [(&str, f64); 5] = [
     ("gen_ai.response.time_to_first_chunk", 1.0),
     ("ai.response.msToFirstChunk", 1e-3),
     ("ai.stream.msToFirstChunk", 1e-3),
     ("time_to_first_token_ms", 1e-3),
+    ("gen_ai.latency.time_to_first_token", 1.0),
 ];
 
 /// The time to first token of a span in seconds, if it carries a usable one. A non-numeric,
 /// negative or non-finite value counts as absent.
 pub fn ttft_seconds(attrs: &BTreeMap<String, serde_json::Value>) -> Option<f64> {
     // One pass over the attributes rather than a lookup per name. This is called for every LLM
-    // span the writer commits, and the common span carries none of these names: four
-    // `BTreeMap::get`s then cost four tree descents, each comparing whole strings, where one pass
-    // compares each attribute against four names and an unequal length settles almost all of it.
+    // span the writer commits, and the common span carries none of these names: five
+    // `BTreeMap::get`s then cost five tree descents, each comparing whole strings, where one pass
+    // compares each attribute against five names and an unequal length settles almost all of it.
     // The name earliest in `TTFT_ATTRS` still wins, so a span carrying two is read the same way.
     let mut best: Option<(usize, f64)> = None;
     for (key, raw) in attrs {
@@ -72,7 +76,7 @@ pub fn ttft_seconds(attrs: &BTreeMap<String, serde_json::Value>) -> Option<f64> 
 /// SQL predicate for "this span is an LLM span"; mirrors [`crate::NormalizedSpan::is_llm_span`]
 /// (a test holds the two together). `strpos` rather than `LIKE`, because `_` is a `LIKE`
 /// wildcard and these keys are full of them.
-const LLM_PREDICATE: &str = "(upper(oi_kind) = 'LLM' \
+pub(crate) const LLM_PREDICATE: &str = "(upper(oi_kind) = 'LLM' \
      OR ((oi_kind IS NULL OR upper(oi_kind) NOT IN ('AGENT', 'CHAIN', 'TOOL')) \
          AND (model IS NOT NULL \
               OR strpos(raw_attributes_json, '\"gen_ai.request.') > 0 \
@@ -273,6 +277,138 @@ pub async fn latency_rows(
     Ok(rows)
 }
 
+/// Where an inference server says a model's calls spent their time ([`crate::vllm`]): p50 and
+/// p95 (ms) of each phase, and of the client's own duration minus the server's (network,
+/// proxies, the client library) for the calls whose client span is the server span's parent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerRow {
+    /// The client span's model, else the server span's, else `(unknown)`.
+    pub model: String,
+    pub calls: u64,
+    /// Calls whose client span is in the store (the server span's parent).
+    pub parented: u64,
+    /// `(phase, p50_ms, p95_ms)` in [`crate::vllm::PHASES`] order; `None` when no call carried it.
+    pub phases: Vec<(&'static str, Option<f64>, Option<f64>)>,
+    pub outside_p50_ms: Option<f64>,
+    pub outside_p95_ms: Option<f64>,
+}
+
+/// Most vLLM request spans the breakdown reads (only numbers cross into this process).
+const SERVER_ROW_CAP: usize = 10_000_000;
+
+/// The server-side breakdown over vLLM's request spans, by model. Empty when there are none.
+pub async fn server_rows(store: &Store) -> anyhow::Result<Vec<ServerRow>> {
+    use crate::vllm::{PHASES, SERVER_KEY, VLLM};
+    let number = "-?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?";
+    // One column per phase: the number only, or NULL when the attribute is absent or not a
+    // number (`regexp_replace` would otherwise hand back the whole attribute JSON).
+    let cols: Vec<String> = PHASES
+        .iter()
+        .map(|(name, key)| {
+            let re = key.replace('.', "\\.");
+            format!(
+                "CASE WHEN regexp_like(s.raw_attributes_json, '(?s)\"{re}\"\\s*:\\s*{number}') \
+                 THEN regexp_replace(s.raw_attributes_json, \
+                   '(?s)^.*\"{re}\"\\s*:\\s*({number}).*$', '$1') END AS {name}"
+            )
+        })
+        .collect();
+    let sql = format!(
+        "SELECT COALESCE(c.model, s.model) AS model, \
+                c.end_unix_nano - c.start_unix_nano AS client_ns, {} \
+         FROM spans s LEFT JOIN spans c \
+           ON c.trace_id = s.trace_id AND c.span_id = s.parent_span_id \
+         WHERE strpos(s.raw_attributes_json, '\"{SERVER_KEY}\":\"{VLLM}\"') > 0",
+        cols.join(", ")
+    );
+    let found = crate::sql::query(store, &sql, SERVER_ROW_CAP).await?;
+    anyhow::ensure!(
+        !found.truncated,
+        "more than {SERVER_ROW_CAP} vLLM request spans; the breakdown would be computed from a \
+         truncated set, so none is reported"
+    );
+    #[derive(Default)]
+    struct Acc {
+        calls: u64,
+        parented: u64,
+        phases: Vec<Vec<f64>>,
+        outside: Vec<f64>,
+    }
+    let mut by_model: BTreeMap<String, Acc> = BTreeMap::new();
+    for r in &found.rows {
+        let model = r["model"].as_str().unwrap_or("(unknown)").to_string();
+        let acc = by_model.entry(model).or_insert_with(|| Acc {
+            phases: vec![Vec::new(); PHASES.len()],
+            ..Acc::default()
+        });
+        acc.calls += 1;
+        let secs: Vec<Option<f64>> = PHASES
+            .iter()
+            .map(|(name, _)| num(&r[*name]).filter(|v| v.is_finite() && *v >= 0.0))
+            .collect();
+        for (i, v) in secs.iter().enumerate() {
+            if let Some(v) = v {
+                acc.phases[i].push(v * 1e3);
+            }
+        }
+        if let Some(client_ns) = num(&r["client_ns"]) {
+            acc.parented += 1;
+            if let Some(server_s) = secs[PHASES.len() - 1] {
+                acc.outside
+                    .push((client_ns / 1e6 - server_s * 1e3).max(0.0));
+            }
+        }
+    }
+    Ok(by_model
+        .into_iter()
+        .map(|(model, mut a)| {
+            for v in a.phases.iter_mut().chain([&mut a.outside]) {
+                v.sort_by(f64::total_cmp);
+            }
+            ServerRow {
+                model,
+                calls: a.calls,
+                parented: a.parented,
+                phases: PHASES
+                    .iter()
+                    .zip(&a.phases)
+                    .map(|((name, _), v)| (*name, nearest_rank(v, 0.50), nearest_rank(v, 0.95)))
+                    .collect(),
+                outside_p50_ms: nearest_rank(&a.outside, 0.50),
+                outside_p95_ms: nearest_rank(&a.outside, 0.95),
+            }
+        })
+        .collect())
+}
+
+fn print_server(rows: &[ServerRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!(
+        "
+server time — vLLM request spans, by model (p50 / p95, ms)"
+    );
+    let pair = |p50: Option<f64>, p95: Option<f64>| format!("{} / {}", ms_cell(p50), ms_cell(p95));
+    print!("{:<28} {:>7} {:>8}", "model", "calls", "parented");
+    for (name, _) in crate::vllm::PHASES {
+        print!(" {name:>17}");
+    }
+    println!(" {:>17}", "client - server");
+    for r in rows {
+        print!("{:<28} {:>7} {:>8}", r.model, r.calls, r.parented);
+        for (_, p50, p95) in &r.phases {
+            print!(" {:>17}", pair(*p50, *p95));
+        }
+        println!(" {:>17}", pair(r.outside_p50_ms, r.outside_p95_ms));
+    }
+    println!(
+        "
+note: `client - server` is the app's own span of the call minus vLLM's end-to-end time \
+         (network, proxies, the client library), over the calls whose app span is the parent."
+    );
+}
+
 /// `evald latency` — open the store, compute the report, print it.
 pub async fn latency_command(
     dimension: Dimension,
@@ -289,6 +425,7 @@ pub async fn latency_command(
     .map_err(|e| anyhow::anyhow!("opening store at {}: {e}", data_dir.display()))?;
     let rows = latency_rows(&store, dimension, limit).await?;
     print_report(dimension, &rows);
+    print_server(&server_rows(&store).await?);
     Ok(())
 }
 
@@ -570,5 +707,129 @@ mod tests {
         assert_eq!(Dimension::parse("SERVICE").unwrap(), Dimension::Service);
         assert!(Dimension::parse("user").is_err());
         assert!(Dimension::parse("session").is_err());
+    }
+
+    /// An app's model call to vLLM and vLLM's own span of it, with `traceparent` propagated.
+    fn call_through_vllm(server_parented: bool) -> Vec<crate::NormalizedSpan> {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{any_value::Value, AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        let kv = |k: &str, v: Value| KeyValue {
+            key: k.into(),
+            value: Some(AnyValue { value: Some(v) }),
+            ..Default::default()
+        };
+        let client = Span {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            name: "chat Qwen2.5-7B".into(),
+            kind: 3,
+            start_time_unix_nano: 1_000_000_000,
+            end_time_unix_nano: 2_000_000_000, // 1000 ms, as the app saw it
+            attributes: vec![
+                kv("gen_ai.operation.name", Value::StringValue("chat".into())),
+                kv(
+                    "gen_ai.request.model",
+                    Value::StringValue("Qwen2.5-7B".into()),
+                ),
+                kv("gen_ai.usage.input_tokens", Value::IntValue(512)),
+                kv("gen_ai.usage.output_tokens", Value::IntValue(64)),
+            ],
+            ..Default::default()
+        };
+        let server = Span {
+            trace_id: vec![1; 16],
+            span_id: vec![3; 8],
+            parent_span_id: if server_parented { vec![2; 8] } else { vec![] },
+            name: "llm_request".into(),
+            kind: 2,
+            start_time_unix_nano: 1_050_000_000,
+            end_time_unix_nano: 1_950_000_000,
+            attributes: vec![
+                kv("gen_ai.latency.e2e", Value::DoubleValue(0.9)),
+                kv("gen_ai.latency.time_in_queue", Value::DoubleValue(0.12)),
+                kv(
+                    "gen_ai.latency.time_in_model_prefill",
+                    Value::DoubleValue(0.19),
+                ),
+                kv(
+                    "gen_ai.latency.time_in_model_decode",
+                    Value::DoubleValue(0.59),
+                ),
+                kv(
+                    "gen_ai.latency.time_to_first_token",
+                    Value::DoubleValue(0.31),
+                ),
+                kv("gen_ai.usage.prompt_tokens", Value::IntValue(512)),
+                kv("gen_ai.usage.completion_tokens", Value::IntValue(64)),
+            ],
+            ..Default::default()
+        };
+        let scope = |spans| ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::normalize::normalize_request(&ExportTraceServiceRequest {
+            resource_spans: vec![scope(vec![client]), scope(vec![server])],
+        })
+    }
+
+    #[tokio::test]
+    async fn a_call_traced_at_both_ends_counts_once_and_shows_where_the_time_went() {
+        let (_d, store) = open();
+        store
+            .ingest_batch(call_through_vllm(true), &[])
+            .await
+            .unwrap();
+
+        // One model call, the app's: its tokens once, not twice.
+        let cost = crate::cost::cost_rows(&store, crate::cost::Dimension::Model, 10)
+            .await
+            .unwrap();
+        let tokens: i64 = cost.iter().map(|r| r["tokens"].as_i64().unwrap_or(0)).sum();
+        assert_eq!(tokens, 576, "{cost:#?}");
+        let lat = latency_rows(&store, Dimension::Model, 10).await.unwrap();
+        assert_eq!(lat.len(), 1);
+        assert_eq!(lat[0].attribution, "Qwen2.5-7B");
+        assert_eq!(lat[0].spans, 1);
+
+        // The server's view, under the app's model, with what the server did not account for.
+        let rows = server_rows(&store).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        let r = &rows[0];
+        assert_eq!(
+            (r.model.as_str(), r.calls, r.parented),
+            ("Qwen2.5-7B", 1, 1)
+        );
+        let phase = |n: &str| r.phases.iter().find(|p| p.0 == n).unwrap().1.unwrap();
+        assert!((phase("queue") - 120.0).abs() < 1e-6);
+        assert!((phase("prefill") - 190.0).abs() < 1e-6);
+        assert!((phase("decode") - 590.0).abs() < 1e-6);
+        assert!((phase("server") - 900.0).abs() < 1e-6);
+        assert!(
+            (r.outside_p50_ms.unwrap() - 100.0).abs() < 1e-6,
+            "1000 ms seen, 900 served"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparented_server_span_is_the_only_record_of_its_call() {
+        let (_d, store) = open();
+        let spans: Vec<_> = call_through_vllm(false)
+            .into_iter()
+            .filter(|s| s.name == "llm_request")
+            .collect();
+        store.ingest_batch(spans, &[]).await.unwrap();
+        let lat = latency_rows(&store, Dimension::Model, 10).await.unwrap();
+        assert_eq!(lat[0].spans, 1, "it is a model call");
+        assert_eq!(lat[0].ttft_known, 1, "with vLLM's time to first token");
+        assert!((lat[0].ttft_p50_ms.unwrap() - 310.0).abs() < 1e-6);
+        let rows = server_rows(&store).await.unwrap();
+        assert_eq!((rows[0].model.as_str(), rows[0].parented), ("(unknown)", 0));
+        assert_eq!(rows[0].outside_p50_ms, None);
+        assert!(server_rows(&open().1).await.unwrap().is_empty());
     }
 }

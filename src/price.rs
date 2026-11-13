@@ -95,6 +95,12 @@ pub struct Price {
 }
 
 impl Price {
+    /// The base `(input, output)` USD per token, before any tier: what a report shows as "the"
+    /// price of a model.
+    pub fn base_rates(&self) -> (f64, f64) {
+        (self.base.input, self.base.output)
+    }
+
     /// The rates in force for a request whose total input is `total_in` tokens: the base rates,
     /// overlaid by every tier whose threshold the request exceeds (a tier that omits a field
     /// leaves the lower tier's rate in place).

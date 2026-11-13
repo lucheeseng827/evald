@@ -137,6 +137,9 @@ fn build_router(store: Store, body_limit: usize, auth: Auth) -> Router {
     } else {
         router
     };
+    // Outermost of all: an OTLP export's error reply, whoever produced it (the gate, the body
+    // limit, the decompressor, a handler), is shaped the way the OTLP/HTTP spec says.
+    let router = router.layer(axum::middleware::from_fn(otlp_error_envelope));
     // MERGED AFTER the gate, so the probes are never behind it. `Router::layer` wraps only
     // the routes already present, so anything merged afterwards is unlayered — which is what
     // a probe needs: a kubelet sends no Authorization header, and a liveness probe that 401s
@@ -187,7 +190,8 @@ async fn require_bearer(State(auth): State<Auth>, req: Request, next: Next) -> R
 /// `Some`, the OTLP/gRPC receiver on that address — until Ctrl-C. Both listeners share one
 /// [`Store`] (so one ingest core, one durability path), one graceful-shutdown signal, and one
 /// bearer-token [`Auth`] gate (a [`disabled`](Auth::disabled) gate leaves both listeners
-/// open, the default local posture).
+/// open, the default local posture). With `online_eval`, a sample of the model calls ingested
+/// is judged in the background ([`crate::online`]).
 pub async fn serve(
     addr: SocketAddr,
     grpc_addr: Option<SocketAddr>,
@@ -195,9 +199,13 @@ pub async fn serve(
     config: StoreConfig,
     auth: Auth,
     mcp: crate::mcp::Access,
+    online_eval: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let store = Store::open(&data_dir, config)
         .map_err(|e| anyhow::anyhow!("failed to open store at {}: {e}", data_dir.display()))?;
+    if let Some(spec) = &online_eval {
+        crate::online::attach(&store, spec, &data_dir)?;
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -394,6 +402,77 @@ async fn export_logs(State(store): State<Store>, headers: HeaderMap, body: Bytes
         Ok(_) => success_response::<ExportLogsServiceResponse>(is_json),
         Err(err) => store_error_response(err, count),
     }
+}
+
+/// The paths an OTLP/HTTP exporter posts to. `/v1/metrics` is not served, but an exporter
+/// configured for every signal sends there too, and is owed an OTLP-shaped refusal.
+const OTLP_PATHS: [&str; 3] = ["/v1/traces", "/v1/logs", "/v1/metrics"];
+
+/// `google.rpc.Status`: the body OTLP/HTTP prescribes for every 4xx and 5xx reply.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RpcStatus {
+    /// A `google.rpc.Code`. The spec does not have clients act on it; it is for the record.
+    #[prost(int32, tag = "1")]
+    pub code: i32,
+    /// A developer-facing message: what evald said.
+    #[prost(string, tag = "2")]
+    pub message: String,
+}
+
+/// The `google.rpc.Code` closest to an HTTP status.
+fn rpc_code(status: StatusCode) -> i32 {
+    match status.as_u16() {
+        400 | 413 | 415 => 3, // INVALID_ARGUMENT
+        401 => 16,            // UNAUTHENTICATED
+        403 => 7,             // PERMISSION_DENIED
+        404 | 405 => 12,      // UNIMPLEMENTED: this endpoint does not take that
+        429 => 8,             // RESOURCE_EXHAUSTED
+        500 => 13,            // INTERNAL
+        502..=504 => 14,      // UNAVAILABLE
+        _ => 2,               // UNKNOWN
+    }
+}
+
+/// OTLP/HTTP: "The response body for all HTTP 4xx and HTTP 5xx responses MUST be a
+/// Protobuf-encoded Status message", and "the server MUST use the same Content-Type in the
+/// response as it received in the request" (protobuf, or its JSON mapping). A reply in another
+/// format breaks the strict exporters (Java, .NET, PHP) that decode it. Every error on an OTLP
+/// path is rewritten here, keeping its status code and headers (`Retry-After`, `WWW-Authenticate`)
+/// and carrying its text as the Status message.
+async fn otlp_error_envelope(req: Request, next: axum::middleware::Next) -> Response {
+    let otlp = OTLP_PATHS.contains(&req.uri().path());
+    let is_json = is_json_request(req.headers());
+    let resp = next.run(req).await;
+    let status = resp.status();
+    if !otlp || !(status.is_client_error() || status.is_server_error()) {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let message = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .unwrap_or_default();
+    let message = if message.is_empty() {
+        status.canonical_reason().unwrap_or("error").to_string()
+    } else {
+        message
+    };
+    let reply = RpcStatus {
+        code: rpc_code(status),
+        message,
+    };
+    let (content_type, bytes) = if is_json {
+        let json = serde_json::json!({ "code": reply.code, "message": reply.message });
+        (CT_JSON, serde_json::to_vec(&json).unwrap_or_default())
+    } else {
+        (CT_PROTOBUF, reply.encode_to_vec())
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(content_type),
+    );
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 
 fn is_json_request(headers: &HeaderMap) -> bool {
@@ -687,6 +766,8 @@ async fn get_meta() -> Response {
         // The price table deriving `cost_usd` right now (`--price-table` lays a file over the
         // built-in baseline). Per span, nothing records it; per block, `evald.price_tables` does.
         "price_table": crate::price::current().version.clone(),
+        // The semantic-conventions release the span mapping is written against.
+        "semconv": crate::normalize::SEMCONV_VERSION,
     }))
     .into_response()
 }
@@ -1406,8 +1487,9 @@ pub fn coerce_otlp_json_ints(value: &mut Json2) {
 fn success_response<R: Message + Default + serde::Serialize>(is_json: bool) -> Response {
     let reply = R::default();
     if is_json {
-        let body = serde_json::to_vec(&reply).unwrap_or_else(|_| b"{}".to_vec());
-        ([(header::CONTENT_TYPE, CT_JSON)], body).into_response()
+        // The JSON mapping of an empty reply is `{}`: an unset field is omitted, not `null`
+        // (serde would write `{"partialSuccess":null}`).
+        ([(header::CONTENT_TYPE, CT_JSON)], &b"{}"[..]).into_response()
     } else {
         ([(header::CONTENT_TYPE, CT_PROTOBUF)], reply.encode_to_vec()).into_response()
     }
@@ -3220,6 +3302,52 @@ mod tests {
             "default must not rewrite"
         );
         assert!(!crate::metrics::render(&store).contains("evald_redactions_total"));
+    }
+
+    #[tokio::test]
+    async fn a_shed_export_keeps_its_retry_after_inside_the_otlp_envelope() {
+        // Any refusal on an OTLP path, whoever produced it: here a stand-in for the 429 a full
+        // ingest channel answers.
+        let app = Router::new()
+            .route(
+                "/v1/traces",
+                post(|| async {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "1")],
+                        "evald: overloaded, retry shortly\n",
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(otlp_error_envelope));
+        let resp = app
+            .clone()
+            .oneshot(post_traces(CT_PROTOBUF, Vec::<u8>::new()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            CT_PROTOBUF
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status = RpcStatus::decode(body).unwrap();
+        assert_eq!(status.code, 8, "RESOURCE_EXHAUSTED");
+        assert_eq!(status.message, "evald: overloaded, retry shortly");
+
+        let resp = app.oneshot(post_traces(CT_JSON, "{}")).await.unwrap();
+        assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), CT_JSON);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            (v["code"].as_i64(), v["message"].as_str()),
+            (Some(8), Some("evald: overloaded, retry shortly"))
+        );
     }
 
     /// A disk-floor refusal must be distinguishable from a backlog shed, on the wire.

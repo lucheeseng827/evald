@@ -27,33 +27,34 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
 
 use crate::model::AggStats;
-use crate::stats::{welch_t_test, WelchResult};
+use crate::stats::{bootstrap_mean_ci, paired_t_test, welch_t_test, WelchResult};
 use crate::{DataType, Score, ScoreSource, ScoreTarget, Store, StoreConfig};
 
 /// One dataset row (JSONL). `output` is the actual text to score; `expected_output` is
 /// the reference for comparison evaluators; `span_id`/`trace_id` (optional) say where to
 /// attach the per-item score so it surfaces on the trace.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DatasetItem {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
     pub output: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_output: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
     /// Retrieved context passages (RAG) — the grounding for `faithfulness` / `hallucination`
     /// judge rails. Absent for non-RAG datasets.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -68,6 +69,14 @@ impl DatasetItem {
         } else {
             ScoreTarget::Run(run_id.to_string())
         }
+    }
+
+    /// What identifies this item across runs, so two runs' scores on it can be paired: its
+    /// `id`, else its span, else its trace. `None` for an item with none of them.
+    pub fn key(&self) -> Option<&str> {
+        [&self.id, &self.span_id, &self.trace_id]
+            .into_iter()
+            .find_map(|k| k.as_deref().filter(|k| !k.is_empty()))
     }
 
     /// True if this item points at a concrete span/trace to attach scores to.
@@ -94,8 +103,10 @@ pub fn load_dataset(path: &Path) -> anyhow::Result<Vec<DatasetItem>> {
     Ok(items)
 }
 
-/// The eval run config (YAML): which dataset, which evaluators, and the pass thresholds.
+/// The eval run config (YAML): which dataset, which evaluators, and the pass thresholds. An
+/// unknown top-level key is an error rather than silently ignored.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalConfig {
     #[serde(default)]
     pub name: Option<String>,
@@ -104,12 +115,33 @@ pub struct EvalConfig {
     /// Tier-1 deterministic evaluators (default empty so a judges-only config is valid).
     #[serde(default)]
     pub evaluators: Vec<EvaluatorSpec>,
+    /// Where judges' model calls go: hosted providers or the team's own OpenAI-compatible
+    /// servers, each declared once by name ([`crate::endpoint`]).
+    #[serde(default)]
+    pub endpoints: Vec<crate::endpoint::EndpointSpec>,
     /// Tier-3 LLM-as-judge evaluators (BYO-key; requires building with `--features judge`).
     #[serde(default)]
     pub judges: Vec<crate::judge::JudgeSpec>,
     /// Per-evaluator minimum mean score for the run to pass (CI gate).
     #[serde(default)]
     pub thresholds: BTreeMap<String, f64>,
+    /// The item `metadata` keys a run records for slicing (`eval compare --non-inferior` gives
+    /// a verdict per value). Unset: `language`, `route` and `task`.
+    #[serde(default)]
+    pub slice_by: Option<Vec<String>>,
+}
+
+/// The `metadata` keys a run slices by when the config names none.
+pub const DEFAULT_SLICE_KEYS: [&str; 3] = ["language", "route", "task"];
+
+impl EvalConfig {
+    /// The `metadata` keys this run records for slicing.
+    pub fn slice_keys(&self) -> Vec<String> {
+        match &self.slice_by {
+            Some(keys) => keys.clone(),
+            None => DEFAULT_SLICE_KEYS.map(String::from).to_vec(),
+        }
+    }
 }
 
 /// Parse an [`EvalConfig`] from a YAML file.
@@ -125,8 +157,12 @@ pub fn load_config(path: &Path) -> anyhow::Result<EvalConfig> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EvaluatorSpec {
-    /// `output == expected_output` (trimmed).
-    ExactMatch,
+    /// `output == expected_output` (trimmed). `normalize: true` compares them Unicode-normalised
+    /// (NFKC, lower-cased; [`crate::lang::normalize`]).
+    ExactMatch {
+        #[serde(default)]
+        normalize: bool,
+    },
     /// `output` contains `substring` (or, if unset, `expected_output`).
     Contains {
         #[serde(default)]
@@ -141,6 +177,9 @@ pub enum EvaluatorSpec {
     Levenshtein {
         #[serde(default = "default_levenshtein_threshold")]
         threshold: f64,
+        /// Compare Unicode-normalised, as `exact_match`'s `normalize`.
+        #[serde(default)]
+        normalize: bool,
     },
     /// `output` is non-empty after trimming whitespace — a cheap "the model produced
     /// something at all" gate.
@@ -178,6 +217,27 @@ pub enum EvaluatorSpec {
     /// Span-derived cost gate: passes when the item's recorded `cost_usd` (from `metadata`)
     /// is `<= max_usd`. Skipped when absent.
     Cost { max_usd: f64 },
+    /// `output` is in the expected language: `language` (an ISO 639 code), else the item's
+    /// `metadata.language`. Detected by an embedded detector ([`crate::lang`]); Malay and
+    /// Indonesian count as one. Skipped when no language is expected, or the detector is unsure
+    /// (too little text).
+    LanguageMatch {
+        #[serde(default)]
+        language: Option<String>,
+    },
+    /// The share of `output`'s letters in the expected script: `script` (`Latin`, `Thai`,
+    /// `Tamil`, `Han`, `Jawi`, …), else the script(s) of the item's `metadata.language`. Passes
+    /// at `>= min`. Skipped when neither says, or the output has no letters.
+    Script {
+        #[serde(default)]
+        script: Option<String>,
+        #[serde(default = "default_script_min")]
+        min: f64,
+    },
+}
+
+fn default_script_min() -> f64 {
+    0.8
 }
 
 fn default_levenshtein_threshold() -> f64 {
@@ -188,7 +248,7 @@ impl EvaluatorSpec {
     /// The evaluator's stable name (also its threshold key).
     pub fn name(&self) -> &'static str {
         match self {
-            EvaluatorSpec::ExactMatch => "exact_match",
+            EvaluatorSpec::ExactMatch { .. } => "exact_match",
             EvaluatorSpec::Contains { .. } => "contains",
             EvaluatorSpec::Regex { .. } => "regex",
             EvaluatorSpec::JsonValid => "json_valid",
@@ -202,6 +262,8 @@ impl EvaluatorSpec {
             EvaluatorSpec::JsonSchema { .. } => "json_schema",
             EvaluatorSpec::Latency { .. } => "latency",
             EvaluatorSpec::Cost { .. } => "cost",
+            EvaluatorSpec::LanguageMatch { .. } => "language_match",
+            EvaluatorSpec::Script { .. } => "script",
         }
     }
 
@@ -212,7 +274,9 @@ impl EvaluatorSpec {
     /// of scoring drift; a single interface avoids it by construction).
     pub fn compile(&self) -> anyhow::Result<Box<dyn Evaluator>> {
         Ok(match self {
-            EvaluatorSpec::ExactMatch => Box::new(ExactMatch),
+            EvaluatorSpec::ExactMatch { normalize } => Box::new(ExactMatch {
+                normalize: *normalize,
+            }),
             EvaluatorSpec::Contains { substring } => Box::new(Contains {
                 substring: substring.clone(),
             }),
@@ -221,9 +285,42 @@ impl EvaluatorSpec {
                     .map_err(|e| anyhow::anyhow!("invalid regex {pattern:?}: {e}"))?,
             }),
             EvaluatorSpec::JsonValid => Box::new(JsonValid),
-            EvaluatorSpec::Levenshtein { threshold } => Box::new(Levenshtein {
+            EvaluatorSpec::Levenshtein {
+                threshold,
+                normalize,
+            } => Box::new(Levenshtein {
                 threshold: *threshold,
+                normalize: *normalize,
             }),
+            EvaluatorSpec::LanguageMatch { language } => Box::new(LanguageMatch {
+                language: language.clone(),
+            }),
+            EvaluatorSpec::Script { script, min } => {
+                anyhow::ensure!(
+                    min.is_finite() && (0.0..=1.0).contains(min),
+                    "script: `min` is a share of the letters, between 0 and 1"
+                );
+                let expected = match script {
+                    Some(names) => Some(
+                        names
+                            .split(',')
+                            .map(|n| {
+                                crate::lang::Script::parse(n).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "script: unknown script {n:?} (Latin, Thai, Tamil, Han, \
+                                         Arabic or Jawi, Devanagari, …)"
+                                    )
+                                })
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                    ),
+                    None => None,
+                };
+                Box::new(ScriptEval {
+                    expected,
+                    min: *min,
+                })
+            }
             EvaluatorSpec::NonEmpty => Box::new(NonEmpty),
             EvaluatorSpec::ContainsAll { substrings } => {
                 anyhow::ensure!(
@@ -313,14 +410,20 @@ pub trait Evaluator {
     fn score(&self, item: &DatasetItem) -> Option<ItemScore>;
 }
 
-struct ExactMatch;
+struct ExactMatch {
+    normalize: bool,
+}
 impl Evaluator for ExactMatch {
     fn name(&self) -> &str {
         "exact_match"
     }
     fn score(&self, item: &DatasetItem) -> Option<ItemScore> {
         let expected = item.expected_output.as_deref()?;
-        let pass = item.output.trim() == expected.trim();
+        let pass = if self.normalize {
+            crate::lang::normalize(&item.output) == crate::lang::normalize(expected)
+        } else {
+            item.output.trim() == expected.trim()
+        };
         Some(ItemScore {
             value: pass as u8 as f64,
             passed: pass,
@@ -388,6 +491,7 @@ impl Evaluator for JsonValid {
 
 struct Levenshtein {
     threshold: f64,
+    normalize: bool,
 }
 impl Evaluator for Levenshtein {
     fn name(&self) -> &str {
@@ -395,11 +499,82 @@ impl Evaluator for Levenshtein {
     }
     fn score(&self, item: &DatasetItem) -> Option<ItemScore> {
         let expected = item.expected_output.as_deref()?;
-        let value = levenshtein_similarity(&item.output, expected);
+        let value = if self.normalize {
+            levenshtein_similarity(
+                &crate::lang::normalize(&item.output),
+                &crate::lang::normalize(expected),
+            )
+        } else {
+            levenshtein_similarity(&item.output, expected)
+        };
         Some(ItemScore {
             passed: value >= self.threshold,
             value,
             comment: None,
+        })
+    }
+}
+
+/// The item's expected language: the evaluator's own, else `metadata.language`.
+fn expected_language<'a>(own: Option<&'a str>, item: &'a DatasetItem) -> Option<&'a str> {
+    own.or_else(|| {
+        item.metadata
+            .as_ref()?
+            .get("language")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+    })
+}
+
+struct LanguageMatch {
+    language: Option<String>,
+}
+impl Evaluator for LanguageMatch {
+    fn name(&self) -> &str {
+        "language_match"
+    }
+    fn score(&self, item: &DatasetItem) -> Option<ItemScore> {
+        let expected = expected_language(self.language.as_deref(), item)?;
+        // Unsure is not wrong: too little text to tell is skipped, not failed.
+        let found = crate::lang::detect(&item.output).filter(|d| d.reliable)?;
+        let pass = crate::lang::same_language(expected, &found);
+        Some(ItemScore {
+            value: pass as u8 as f64,
+            passed: pass,
+            comment: Some(format!(
+                "expected {expected}, detected {} ({}, confidence {:.2})",
+                found.code, found.name, found.confidence
+            )),
+        })
+    }
+}
+
+struct ScriptEval {
+    expected: Option<Vec<crate::lang::Script>>,
+    min: f64,
+}
+impl Evaluator for ScriptEval {
+    fn name(&self) -> &str {
+        "script"
+    }
+    fn score(&self, item: &DatasetItem) -> Option<ItemScore> {
+        let expected: &[crate::lang::Script] = match &self.expected {
+            Some(s) => s,
+            None => crate::lang::scripts_for(expected_language(None, item)?)?,
+        };
+        let share = crate::lang::script_share(&item.output, expected)?;
+        Some(ItemScore {
+            value: share,
+            passed: share >= self.min,
+            comment: Some(format!(
+                "{:.0}% of the letters in {}",
+                share * 100.0,
+                expected
+                    .iter()
+                    .map(|s| s.name())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            )),
         })
     }
 }
@@ -677,6 +852,8 @@ pub struct RunReport {
     pub name: Option<String>,
     pub item_count: usize,
     pub aggregates: Vec<EvaluatorAggregate>,
+    /// Each evaluator's mean by slice ([`slice_means`]); empty until the run is stored.
+    pub slices: Vec<SliceMean>,
 }
 
 impl RunReport {
@@ -738,6 +915,7 @@ pub fn run_eval(
             name: config.name.clone(),
             item_count: dataset.len(),
             aggregates,
+            slices: Vec::new(),
         },
         scores,
     ))
@@ -761,12 +939,20 @@ pub(crate) fn finalize_evaluator(
 ) -> EvaluatorAggregate {
     let mut values: Vec<f64> = Vec::new();
     let mut passes = 0usize;
+    let mut per_item = ItemValues {
+        evaluator: name.to_string(),
+        ..ItemValues::default()
+    };
 
     for (idx, (item, outcome)) in dataset.iter().zip(outcomes).enumerate() {
         let Some(outcome) = outcome else {
             continue; // skipped — missing required field, judge parse failure, etc.
         };
         values.push(outcome.value);
+        match item.key() {
+            Some(k) => per_item.items.push((k.to_string(), outcome.value)),
+            None => per_item.unkeyed += 1,
+        }
         if outcome.passed {
             passes += 1;
         }
@@ -810,6 +996,10 @@ pub(crate) fn finalize_evaluator(
     // fabricated 0.0 mean; it surfaces as fully skipped in the report instead.
     let threshold_met = scored == 0 || threshold.is_none_or(|t| mean >= t);
 
+    // Every scored item's value under its key, for a paired comparison and a repeat-stability
+    // check: one run-targeted Score per evaluator, whatever the items attach to.
+    scores.push(per_item.score(run_id, ts_unix_nano));
+
     // The aggregate IS a Score targeting the run — what `eval compare` reads back, with the
     // sufficient statistics for the Welch's-t significance test.
     scores.push(Score {
@@ -848,19 +1038,22 @@ pub(crate) fn finalize_evaluator(
 /// report, and return whether every threshold was met (the caller maps `false` to a
 /// non-zero exit code for CI).
 pub async fn run_command(config_path: &Path, data_dir: &Path) -> anyhow::Result<bool> {
-    run_command_junit(config_path, data_dir, None).await
+    run_command_junit(config_path, data_dir, None, None, false).await
 }
 
 /// [`run_command`] that also writes a JUnit XML report to `junit` (see [`crate::junit`]). The
 /// report is written whether the gate passes, fails, or the run errors; the returned gate
 /// verdict is exactly what [`run_command`] would have returned.
+/// `fresh` judges every item again instead of serving cached judge scores (`--no-cache`).
 pub async fn run_command_junit(
     config_path: &Path,
     data_dir: &Path,
     junit: Option<&Path>,
+    report_json: Option<&Path>,
+    fresh: bool,
 ) -> anyhow::Result<bool> {
     let started = std::time::Instant::now();
-    let result = run_report(config_path, data_dir).await;
+    let result = run_report(config_path, data_dir, fresh).await;
     crate::junit::write_after(
         junit,
         &result,
@@ -869,11 +1062,12 @@ pub async fn run_command_junit(
         "evald.eval.run",
         started.elapsed().as_secs_f64(),
     )?;
+    crate::report::write_after(report_json, &result, crate::report::run, "eval_run")?;
     result.map(|report| report.passed())
 }
 
 /// The body of `eval run`: evaluate, persist, print, and hand back the report.
-async fn run_report(config_path: &Path, data_dir: &Path) -> anyhow::Result<RunReport> {
+async fn run_report(config_path: &Path, data_dir: &Path, fresh: bool) -> anyhow::Result<RunReport> {
     let config = load_config(config_path)?;
     let dataset_path = resolve_relative(config_path, &config.dataset);
     let dataset = load_dataset(&dataset_path)?;
@@ -882,9 +1076,20 @@ async fn run_report(config_path: &Path, data_dir: &Path) -> anyhow::Result<RunRe
         "dataset {} has no items",
         dataset_path.display()
     );
+    check_names(&config)?;
+    let run = RunInputs {
+        config: &config,
+        config_path,
+        dataset_path: &dataset_path,
+        dataset: &dataset,
+        run_id: uuid::Uuid::new_v4().to_string(),
+    };
+    evaluate_and_store(run, data_dir, fresh, Extra::default()).await
+}
 
-    // Every Tier-1 evaluator name + judge name shares one space (scores + thresholds key by
-    // name). Reject collisions UP FRONT — before any judge makes a paid LLM call.
+/// Every Tier-1 evaluator name + judge name shares one space (scores + thresholds key by
+/// name). Rejected UP FRONT — before any judge (or replay) makes a paid LLM call.
+fn check_names(config: &EvalConfig) -> anyhow::Result<()> {
     {
         let mut seen = BTreeSet::new();
         for name in config
@@ -899,26 +1104,90 @@ async fn run_report(config_path: &Path, data_dir: &Path) -> anyhow::Result<RunRe
             );
         }
     }
+    Ok(())
+}
 
-    let run_id = uuid::Uuid::new_v4().to_string();
+/// What one run evaluates: the config, its dataset (as loaded, or as replayed), and its id.
+struct RunInputs<'a> {
+    config: &'a EvalConfig,
+    config_path: &'a Path,
+    dataset_path: &'a Path,
+    dataset: &'a [DatasetItem],
+    run_id: String,
+}
+
+/// What a run stores beyond its scores: a replay's spans (and egress) and its summary.
+#[derive(Default)]
+struct Extra {
+    spans: Vec<crate::model::NormalizedSpan>,
+    replay: Option<crate::replay::ReplaySummary>,
+}
+
+/// Score `run.dataset` with the config's evaluators and judges, persist the scores, the
+/// manifest, the slice labels and every span, print the report, and hand it back.
+async fn evaluate_and_store(
+    run: RunInputs<'_>,
+    data_dir: &Path,
+    fresh: bool,
+    extra: Extra,
+) -> anyhow::Result<RunReport> {
+    let RunInputs {
+        config,
+        config_path,
+        dataset_path,
+        dataset,
+        run_id,
+    } = run;
+    let run_id = run_id.as_str();
     let ts = now_unix_nano();
-    let (mut report, mut scores) = run_eval(&config, &dataset, &run_id, ts)?;
+    let (mut report, mut scores) = run_eval(config, dataset, run_id, ts)?;
 
     // Tier-3 judges (BYO-key, off by default) append to the SAME report + scores, so they flow
     // through the threshold gate, persistence, and `eval compare` significance like Tier-1.
+    let mut judged = crate::judge::JudgeOutput::default();
     if !config.judges.is_empty() {
-        let judge_aggs = crate::judge::run_all_judges(
+        let endpoints = crate::endpoint::resolve_all(&config.endpoints, &config_dir(config_path))?;
+        judged = match crate::judge::run_all_judges(
             &config.judges,
-            &dataset,
-            &run_id,
+            &endpoints,
+            dataset,
+            run_id,
             ts,
             data_dir,
             &config.thresholds,
             &mut scores,
+            fresh,
         )
-        .await?;
-        report.aggregates.extend(judge_aggs);
+        .await
+        {
+            Ok(j) => j,
+            Err(e) => {
+                // The calls made (or refused) before the failure still go in the ledger.
+                if let Some(failed) = e.downcast_ref::<crate::judge::FailedRun>() {
+                    record_egress(data_dir, &failed.egress, run_id).await;
+                }
+                return Err(e);
+            }
+        };
+        report.aggregates.append(&mut judged.aggregates);
     }
+    // Each judge call as an `evald.judge` span, every outbound request as an `evald.egress`
+    // one, and what decided this run's scores.
+    let mut judge_spans = crate::judge::call_spans(run_id, &judged.judges);
+    judge_spans.extend(crate::egress::spans(&judged.egress, run_id));
+    judge_spans.extend(extra.spans);
+    scores.push(manifest_score(
+        config,
+        dataset_path,
+        dataset.len(),
+        run_id,
+        ts,
+        &judged.judges,
+        extra.replay.as_ref(),
+    ));
+    // The items' slice labels, for `eval compare --non-inferior` to give a verdict per slice.
+    let slices = RunSlices::from_items(&config.slice_keys(), dataset);
+    scores.extend(slices.score(run_id, ts));
 
     // Open the store embedded (no background compactor for a short-lived CLI) and persist.
     // Note: this takes the data-dir's redb lock, so it can't run against a live `serve`
@@ -930,11 +1199,364 @@ async fn run_report(config_path: &Path, data_dir: &Path) -> anyhow::Result<RunRe
     let store = Store::open(data_dir, store_config)
         .map_err(|e| anyhow::anyhow!("opening store at {}: {e}", data_dir.display()))?;
     store
-        .put_scores(&scores)
+        .ingest_batch(judge_spans, &scores)
+        .await
         .map_err(|e| anyhow::anyhow!("persisting scores: {e}"))?;
 
-    print_report(&report, &dataset_path);
+    report.slices = slice_means(&scores, &slices);
+    print_report(&report, dataset_path);
+    print_slice_means(&report.slices);
     Ok(report)
+}
+
+/// One evaluator's mean over the items of one slice value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SliceMean {
+    pub key: String,
+    pub value: String,
+    pub evaluator: String,
+    pub n: usize,
+    pub mean: f64,
+}
+
+/// Each evaluator's mean per slice value, from a run's per-item values and its slice labels,
+/// for every slice key with at least two values (one value says nothing a run's mean does not).
+pub fn slice_means(scores: &[Score], slices: &RunSlices) -> Vec<SliceMean> {
+    let values: Vec<ItemValues> = scores
+        .iter()
+        .filter(|s| s.name == ITEMS_NAME)
+        .filter_map(|s| serde_json::from_str(s.str_value.as_deref()?).ok())
+        .collect();
+    let mut out = Vec::new();
+    for (key, labels) in &slices.by {
+        let distinct: BTreeSet<&String> = labels.values().collect();
+        if distinct.len() < 2 {
+            continue;
+        }
+        for v in &values {
+            let mut by: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
+            for (item, x) in &v.items {
+                if let Some(label) = labels.get(item) {
+                    let e = by.entry(label.as_str()).or_default();
+                    e.0 += 1;
+                    e.1 += x;
+                }
+            }
+            out.extend(by.into_iter().map(|(value, (n, sum))| SliceMean {
+                key: key.clone(),
+                value: value.to_string(),
+                evaluator: v.evaluator.clone(),
+                n,
+                mean: sum / n as f64,
+            }));
+        }
+    }
+    out
+}
+
+/// The run's means by slice, under its report.
+fn print_slice_means(rows: &[SliceMean]) {
+    let mut key = None;
+    for r in rows {
+        if key != Some(&r.key) {
+            println!(
+                "\nby {:<18} {:<22} {:>6} {:>7}",
+                r.key, "evaluator", "items", "mean"
+            );
+            key = Some(&r.key);
+        }
+        println!(
+            "   {:<18} {:<22} {:>6} {:>7.3}",
+            r.value, r.evaluator, r.n, r.mean
+        );
+    }
+}
+
+/// Where `evald replay` sends the dataset: an endpoint the config declares, or a server named
+/// on the command line.
+#[derive(Debug, Clone)]
+pub enum ReplayTarget {
+    /// A name from the config's `endpoints:` (or `openai` / `anthropic`, the implicit ones).
+    Named(String),
+    /// A server given by its URL, the API it speaks and the variable holding its key.
+    Url {
+        base_url: String,
+        api: String,
+        api_key_env: Option<String>,
+    },
+}
+
+/// The [`crate::endpoint::Endpoint`] a [`ReplayTarget`] names.
+pub fn replay_endpoint(
+    config: &EvalConfig,
+    config_path: &Path,
+    target: &ReplayTarget,
+) -> anyhow::Result<crate::endpoint::Endpoint> {
+    use crate::endpoint::{Api, Endpoint, EndpointSpec, IMPLICIT_ANTHROPIC, IMPLICIT_OPENAI};
+    match target {
+        ReplayTarget::Named(name) if name == IMPLICIT_OPENAI => Endpoint::implicit(Api::OpenaiChat),
+        ReplayTarget::Named(name) if name == IMPLICIT_ANTHROPIC => {
+            Endpoint::implicit(Api::AnthropicMessages)
+        }
+        ReplayTarget::Named(name) => {
+            let mut endpoints =
+                crate::endpoint::resolve_all(&config.endpoints, &config_dir(config_path))?;
+            endpoints.remove(name).with_context(|| {
+                format!(
+                    "{} declares no endpoint named {name:?} (it has: {})",
+                    config_path.display(),
+                    endpoints.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })
+        }
+        ReplayTarget::Url {
+            base_url,
+            api,
+            api_key_env,
+        } => {
+            let spec: EndpointSpec = serde_json::from_value(serde_json::json!({
+                "name": "replay",
+                "api": api,
+                "base_url": base_url,
+                "api_key_env": api_key_env,
+            }))?;
+            spec.resolve(Path::new("."))
+        }
+    }
+}
+
+/// `evald replay` — send the config's dataset prompts to `model` on `target`, and score the
+/// answers with the config's evaluators and judges as a run of their own: the candidate run of
+/// a migration gate. Returns whether its thresholds passed, as `eval run` does. `out` also
+/// writes the candidate dataset (the items with the replay's answers) as JSONL.
+pub async fn replay_command(
+    config_path: &Path,
+    target: &ReplayTarget,
+    model: &str,
+    data_dir: &Path,
+    fresh: bool,
+    out: Option<&Path>,
+) -> anyhow::Result<bool> {
+    let config = load_config(config_path)?;
+    let dataset_path = resolve_relative(config_path, &config.dataset);
+    let dataset = load_dataset(&dataset_path)?;
+    check_names(&config)?;
+    crate::replay::check_items(&dataset)
+        .with_context(|| format!("dataset {}", dataset_path.display()))?;
+    let ep = replay_endpoint(&config, config_path, target)?;
+
+    #[cfg(not(feature = "judge"))]
+    {
+        let _ = (model, data_dir, fresh, out, ep);
+        anyhow::bail!(
+            "this build has no HTTP client — rebuild with `--features judge` to replay a dataset \
+             against an endpoint"
+        );
+    }
+
+    #[cfg(feature = "judge")]
+    {
+        use crate::judge::JudgeBackend;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let backend = crate::judge::replay_backend();
+        let provenance = match backend.provenance(&ep, model).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(endpoint = %ep.name, error = %format!("{e:#}"), "replay: could not read the endpoint's model list");
+                None
+            }
+        };
+        let calls = match crate::replay::replay_items(&backend, &ep, model, &dataset).await {
+            Ok(calls) => calls,
+            Err(e) => {
+                // The calls made (or refused) before the failure still go in the ledger.
+                record_egress(data_dir, &backend.drain_egress(), &run_id).await;
+                return Err(e);
+            }
+        };
+        let mut spans = crate::replay::spans(&run_id, &ep, model, &calls);
+        let summary = crate::replay::summary(&ep, model, provenance, &spans);
+        spans.extend(crate::egress::spans(&backend.drain_egress(), &run_id));
+        let candidates = crate::replay::candidates(&dataset, &calls, &run_id);
+        if let Some(out) = out {
+            let mut jsonl = String::new();
+            for item in &candidates {
+                jsonl.push_str(&serde_json::to_string(item)?);
+                jsonl.push('\n');
+            }
+            std::fs::write(out, jsonl)
+                .with_context(|| format!("writing the candidate dataset to {}", out.display()))?;
+        }
+        let run = RunInputs {
+            config: &config,
+            config_path,
+            dataset_path: &dataset_path,
+            dataset: &candidates,
+            run_id,
+        };
+        let extra = Extra {
+            spans,
+            replay: Some(summary.clone()),
+        };
+        let report = evaluate_and_store(run, data_dir, fresh, extra).await?;
+        crate::replay::print_summary(&summary);
+        Ok(report.passed())
+    }
+}
+
+/// What `judge probe --config` (and `doctor --judge-config`) probes: each endpoint the config's
+/// judges call, once, with the first of its judges' models. `only` keeps one endpoint.
+pub fn judge_probe_targets(
+    config_path: &Path,
+    only: Option<&str>,
+) -> anyhow::Result<Vec<(crate::endpoint::Endpoint, String)>> {
+    let config = load_config(config_path)?;
+    let endpoints = crate::endpoint::resolve_all(&config.endpoints, &config_dir(config_path))?;
+    let mut out: Vec<(crate::endpoint::Endpoint, String)> = Vec::new();
+    for judge in &config.judges {
+        judge.validate()?;
+        let ep = judge.resolve_endpoint(&endpoints)?;
+        if only.is_some_and(|name| name != ep.name) || out.iter().any(|(e, _)| e.name == ep.name) {
+            continue;
+        }
+        out.push((ep, judge.model.clone()));
+    }
+    if let Some(name) = only {
+        anyhow::ensure!(
+            !out.is_empty(),
+            "no judge in {} calls an endpoint named {name:?}",
+            config_path.display()
+        );
+    }
+    anyhow::ensure!(
+        !out.is_empty(),
+        "{} has no judges, so no endpoint to probe",
+        config_path.display()
+    );
+    Ok(out)
+}
+
+/// The score name of a run's manifest.
+pub const MANIFEST_NAME: &str = "evald.run.manifest";
+
+/// The run manifest: one text score on the run (`{run_id}:manifest`) recording what decided its
+/// scores, so a score can be traced to the evaluators, the judge endpoints and the weights they
+/// reported, and the evald that ran them. Every per-item score's id starts with the run id.
+fn manifest_score(
+    config: &EvalConfig,
+    dataset: &Path,
+    items: usize,
+    run_id: &str,
+    ts_unix_nano: u64,
+    judges: &[crate::judge::JudgeSummary],
+    replay: Option<&crate::replay::ReplaySummary>,
+) -> Score {
+    let manifest = serde_json::json!({
+        "manifest_version": 1,
+        "evald_version": env!("CARGO_PKG_VERSION"),
+        "run_id": run_id,
+        "name": config.name,
+        "dataset": dataset.display().to_string(),
+        "items": items,
+        "evaluators": config.evaluators.iter().map(|e| e.name().to_string()).collect::<Vec<_>>(),
+        "judges": judges.iter().map(crate::judge::JudgeSummary::manifest_entry).collect::<Vec<_>>(),
+        // A replay run's outputs came from this endpoint, not from the dataset.
+        "replay": replay,
+    });
+    Score {
+        id: format!("{run_id}:manifest"),
+        target: ScoreTarget::Run(run_id.to_string()),
+        name: MANIFEST_NAME.to_string(),
+        num_value: None,
+        str_value: Some(manifest.to_string()),
+        data_type: crate::model::DataType::Text,
+        source: crate::model::ScoreSource::Eval,
+        comment: None,
+        config_id: None,
+        agg_stats: None,
+        ts_unix_nano,
+    }
+}
+
+/// A run's manifest ([`manifest_score`]), or `None` for a run written before manifests were.
+pub fn run_manifest(store: &Store, run_id: &str) -> anyhow::Result<Option<serde_json::Value>> {
+    let id = format!("{run_id}:manifest");
+    let scores = store
+        .scores_for_target(&ScoreTarget::Run(run_id.to_string()))
+        .map_err(|e| anyhow::anyhow!("reading scores for run {run_id}: {e}"))?;
+    let Some(json) = scores
+        .into_iter()
+        .find(|s| s.id == id && s.name == MANIFEST_NAME)
+        .and_then(|s| s.str_value)
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("run {run_id}: unreadable {MANIFEST_NAME} score: {e}"))
+}
+
+/// Something that decided a judge's scores and differs between two runs: its weights, the model
+/// name it asked for, where it was served, or evald's judge prompts. A judge that changed makes
+/// a delta the judge's as much as the system's.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct JudgeChange {
+    pub judge: String,
+    /// `weights`, `quantization`, `model`, `base_url` or `judge_version`.
+    pub what: &'static str,
+    pub a: Option<String>,
+    pub b: Option<String>,
+}
+
+/// What changed about each judge the two manifests share. A judge in only one run is already a
+/// `new` or `gone` row; a run without a manifest has nothing to compare.
+pub fn judge_changes(a: &serde_json::Value, b: &serde_json::Value) -> Vec<JudgeChange> {
+    let judges = |m: &serde_json::Value| -> BTreeMap<String, serde_json::Value> {
+        m.get("judges")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|j| Some((j.get("name")?.as_str()?.to_string(), j.clone())))
+            .collect()
+    };
+    let text = |v: Option<&serde_json::Value>| match v {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Null) | None => None,
+        Some(v) => Some(v.to_string()),
+    };
+    // The weights: the digest where the server gave one, else what it listed the model as.
+    let weights = |j: &serde_json::Value| {
+        text(j.pointer("/provenance/digest")).or_else(|| text(j.get("server_model")))
+    };
+    let (ja, jb) = (judges(a), judges(b));
+    let mut out = Vec::new();
+    for (name, x) in &ja {
+        let Some(y) = jb.get(name) else { continue };
+        let mut push = |what: &'static str, a: Option<String>, b: Option<String>| {
+            if a != b {
+                out.push(JudgeChange {
+                    judge: name.clone(),
+                    what,
+                    a,
+                    b,
+                });
+            }
+        };
+        push("weights", weights(x), weights(y));
+        push(
+            "quantization",
+            text(x.pointer("/provenance/quantization")),
+            text(y.pointer("/provenance/quantization")),
+        );
+        push("model", text(x.get("model")), text(y.get("model")));
+        push("base_url", text(x.get("base_url")), text(y.get("base_url")));
+        push(
+            "judge_version",
+            text(x.get("judge_version")),
+            text(y.get("judge_version")),
+        );
+    }
+    out
 }
 
 /// `evald eval run --estimate` — preview the judge token usage + cost for this config WITHOUT
@@ -947,7 +1569,8 @@ pub fn estimate_command(config_path: &Path, data_dir: &Path) -> anyhow::Result<(
         println!("No judges configured — Tier-1 evaluators are zero-cost, nothing to estimate.");
         return Ok(());
     }
-    let estimates = crate::judge::estimate_judges(&config.judges, &dataset, data_dir)?;
+    let endpoints = crate::endpoint::resolve_all(&config.endpoints, &config_dir(config_path))?;
+    let estimates = crate::judge::estimate_judges(&config.judges, &endpoints, &dataset, data_dir)?;
     print_estimate(&estimates, dataset.len());
     Ok(())
 }
@@ -956,8 +1579,8 @@ pub fn estimate_command(config_path: &Path, data_dir: &Path) -> anyhow::Result<(
 fn print_estimate(estimates: &[crate::judge::JudgeEstimate], item_count: usize) {
     println!("\nevald eval — judge cost estimate ({item_count} item(s))");
     println!(
-        "{:<22} {:>8} {:>8} {:>12} {:>12} {:>12}",
-        "judge", "to_call", "cached", "in_tokens", "out_tokens", "est_cost"
+        "{:<22} {:<14} {:>8} {:>8} {:>12} {:>12} {:>12}",
+        "judge", "endpoint", "to_call", "cached", "in_tokens", "out_tokens", "est_cost"
     );
     let (mut total, mut any_cost, mut any_unknown) = (0.0f64, false, false);
     for e in estimates {
@@ -973,8 +1596,8 @@ fn print_estimate(estimates: &[crate::judge::JudgeEstimate], item_count: usize) 
             }
         };
         println!(
-            "{:<22} {:>8} {:>8} {:>12} {:>12} {:>12}",
-            e.name, e.calls, e.cached, e.input_tokens, e.output_tokens, cost
+            "{:<22} {:<14} {:>8} {:>8} {:>12} {:>12} {:>12}",
+            e.name, e.endpoint, e.calls, e.cached, e.input_tokens, e.output_tokens, cost
         );
     }
     if any_cost {
@@ -996,6 +1619,15 @@ fn print_estimate(estimates: &[crate::judge::JudgeEstimate], item_count: usize) 
 }
 
 /// Resolve `dataset` relative to the config file's directory (absolute paths unchanged).
+/// The directory a config's relative paths (dataset, an endpoint's certificate files) resolve
+/// against.
+fn config_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
 pub(crate) fn resolve_relative(config_path: &Path, dataset: &Path) -> PathBuf {
     if dataset.is_absolute() {
         return dataset.to_path_buf();
@@ -1055,6 +1687,228 @@ fn print_report(report: &RunReport, dataset_path: &Path) {
     }
 }
 
+/// Store egress records of a run that did not finish, best-effort: the run's own error is what
+/// the caller reports.
+async fn record_egress(data_dir: &Path, records: &[crate::egress::Record], run_id: &str) {
+    if records.is_empty() {
+        return;
+    }
+    let store_config = StoreConfig {
+        compact_interval: None,
+        ..StoreConfig::default()
+    };
+    match Store::open(data_dir, store_config) {
+        Ok(store) => {
+            if let Err(e) = store
+                .ingest_batch(crate::egress::spans(records, run_id), &[])
+                .await
+            {
+                tracing::warn!(error = %e, "could not record the run's egress");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "could not open the store to record the run's egress"),
+    }
+}
+
+/// The score name of a run's per-item values, one per evaluator (id `{run_id}:items:{name}`).
+pub const ITEMS_NAME: &str = "evald.run.items";
+
+/// One evaluator's per-item values in one run, as persisted: what `eval compare` pairs and
+/// `eval calibrate --runs` measures stability over.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ItemValues {
+    pub evaluator: String,
+    /// `(item key, value)` for each scored item that has a key ([`DatasetItem::key`]), in
+    /// dataset order.
+    pub items: Vec<(String, f64)>,
+    /// Scored items with no id, span or trace: counted, never paired.
+    pub unkeyed: usize,
+}
+
+impl ItemValues {
+    fn score(&self, run_id: &str, ts_unix_nano: u64) -> Score {
+        Score {
+            id: format!("{run_id}:items:{}", self.evaluator),
+            target: ScoreTarget::Run(run_id.to_string()),
+            name: ITEMS_NAME.to_string(),
+            num_value: None,
+            str_value: Some(serde_json::to_string(self).expect("plain data serializes")),
+            data_type: DataType::Text,
+            source: ScoreSource::Eval,
+            comment: Some(format!(
+                "per-item values of {} ({} keyed, {} without an id)",
+                self.evaluator,
+                self.items.len(),
+                self.unkeyed
+            )),
+            config_id: None,
+            agg_stats: None,
+            ts_unix_nano,
+        }
+    }
+
+    /// The values by key, or why they cannot be matched to another run's.
+    pub fn by_key(&self) -> Result<BTreeMap<&str, f64>, String> {
+        if self.unkeyed > 0 {
+            return Err(format!(
+                "{} item(s) have no id (give dataset items an `id` to pair runs)",
+                self.unkeyed
+            ));
+        }
+        let map: BTreeMap<&str, f64> = self.items.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        if map.len() != self.items.len() {
+            return Err("item ids repeat within a run".to_string());
+        }
+        Ok(map)
+    }
+}
+
+/// A run's per-item values by evaluator. Empty for a run written before they were recorded.
+pub fn run_items(store: &Store, run_id: &str) -> anyhow::Result<BTreeMap<String, ItemValues>> {
+    let prefix = format!("{run_id}:items:");
+    let scores = store
+        .scores_for_target(&ScoreTarget::Run(run_id.to_string()))
+        .map_err(|e| anyhow::anyhow!("reading scores for run {run_id}: {e}"))?;
+    let mut out = BTreeMap::new();
+    for s in scores {
+        if !s.id.starts_with(&prefix) || s.name != ITEMS_NAME {
+            continue;
+        }
+        let Some(json) = s.str_value.as_deref() else {
+            continue;
+        };
+        let v: ItemValues = serde_json::from_str(json).map_err(|e| {
+            anyhow::anyhow!("run {run_id}: unreadable {ITEMS_NAME} score {}: {e}", s.id)
+        })?;
+        out.insert(v.evaluator.clone(), v);
+    }
+    Ok(out)
+}
+
+/// The per-item differences `b − a` when two runs scored exactly the same items, in key order;
+/// otherwise why they cannot be paired.
+pub fn paired_differences(
+    a: Option<&ItemValues>,
+    b: Option<&ItemValues>,
+) -> Result<Vec<f64>, String> {
+    let (Some(a), Some(b)) = (a, b) else {
+        return Err("a run predates per-item values".to_string());
+    };
+    let (ka, kb) = (a.by_key()?, b.by_key()?);
+    if ka.len() != kb.len() || ka.keys().any(|k| !kb.contains_key(k)) {
+        let shared = ka.keys().filter(|k| kb.contains_key(*k)).count();
+        return Err(format!(
+            "the runs scored different items ({shared} shared of {} and {})",
+            ka.len(),
+            kb.len()
+        ));
+    }
+    Ok(ka.iter().map(|(k, va)| kb[k] - va).collect())
+}
+
+/// [`paired_differences`] with each difference's item key, in key order.
+pub fn paired_keyed<'v>(
+    a: Option<&'v ItemValues>,
+    b: Option<&'v ItemValues>,
+) -> Result<Vec<(&'v str, f64)>, String> {
+    let diffs = paired_differences(a, b)?;
+    // Paired, so both are present and keyed alike; `by_key` iterates in the same order.
+    let keys = a.expect("paired").by_key()?.into_keys();
+    Ok(keys.zip(diffs).collect())
+}
+
+/// The score name of a run's slice labels (id `{run_id}:slices`).
+pub const SLICES_NAME: &str = "evald.run.slices";
+
+/// Each keyed item's label under each slice key a run recorded: `by[key][item] = value`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunSlices {
+    pub by: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl RunSlices {
+    /// The labels of `keys` in the dataset's item metadata. A string is taken as it is, a
+    /// number or boolean as its text; anything else, or no key, leaves the item unlabelled.
+    pub fn from_items(keys: &[String], dataset: &[DatasetItem]) -> RunSlices {
+        let mut by: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for item in dataset {
+            let (Some(key), Some(meta)) = (item.key(), item.metadata.as_ref()) else {
+                continue;
+            };
+            for k in keys {
+                let label = match meta.get(k) {
+                    Some(serde_json::Value::String(v)) if !v.is_empty() => v.clone(),
+                    Some(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => {
+                        v.to_string()
+                    }
+                    _ => continue,
+                };
+                by.entry(k.clone())
+                    .or_default()
+                    .insert(key.to_string(), label);
+            }
+        }
+        RunSlices { by }
+    }
+
+    fn score(&self, run_id: &str, ts_unix_nano: u64) -> Option<Score> {
+        (!self.by.is_empty()).then(|| Score {
+            id: format!("{run_id}:slices"),
+            target: ScoreTarget::Run(run_id.to_string()),
+            name: SLICES_NAME.to_string(),
+            num_value: None,
+            str_value: Some(serde_json::to_string(self).expect("plain data serializes")),
+            data_type: DataType::Text,
+            source: ScoreSource::Eval,
+            comment: Some(format!(
+                "item labels by {}",
+                self.by.keys().cloned().collect::<Vec<_>>().join(", ")
+            )),
+            config_id: None,
+            agg_stats: None,
+            ts_unix_nano,
+        })
+    }
+}
+
+/// A run's slice labels; empty for a run that recorded none.
+pub fn run_slices(store: &Store, run_id: &str) -> anyhow::Result<RunSlices> {
+    let id = format!("{run_id}:slices");
+    let scores = store
+        .scores_for_target(&ScoreTarget::Run(run_id.to_string()))
+        .map_err(|e| anyhow::anyhow!("reading scores for run {run_id}: {e}"))?;
+    match scores
+        .into_iter()
+        .find(|s| s.id == id && s.name == SLICES_NAME)
+        .and_then(|s| s.str_value)
+    {
+        Some(json) => serde_json::from_str(&json)
+            .map_err(|e| anyhow::anyhow!("run {run_id}: unreadable {SLICES_NAME} score: {e}")),
+        None => Ok(RunSlices::default()),
+    }
+}
+
+/// Which test a compare row's significance came from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TestUsed {
+    /// The paired t-test on this many items scored in both runs.
+    Paired { pairs: usize },
+    /// Welch's two-sample test, and why the runs could not be paired.
+    Welch { why: String },
+}
+
+impl TestUsed {
+    pub fn name(&self) -> &'static str {
+        match self {
+            TestUsed::Paired { .. } => "paired",
+            TestUsed::Welch { .. } => "welch",
+        }
+    }
+}
+
+/// The bootstrap's seed: fixed, so the same two runs always print the same interval.
+const BOOTSTRAP_SEED: u64 = 0x0e7a_1d5e_ed00_0001;
+
 // ---------------------------------------------------------------------------
 // `evald eval compare` — run-vs-run aggregate diff (PoC build step 7).
 //
@@ -1079,8 +1933,13 @@ pub struct CompareRow {
     /// Sample sizes (scored items) per side, when known.
     pub n_a: Option<u64>,
     pub n_b: Option<u64>,
-    /// Welch's-t result: the p-value and the `(1 − alpha)` CI on `delta`.
+    /// The t-test result: the p-value and the `(1 − alpha)` CI on `delta`.
     pub signif: Option<WelchResult>,
+    /// Which test that was (set whenever both sides carried statistics).
+    pub test: Option<TestUsed>,
+    /// With the paired test, a percentile bootstrap `(1 − alpha)` CI on `delta`: the
+    /// distribution-free check on the t interval.
+    pub bootstrap_ci: Option<(f64, f64)>,
 }
 
 impl CompareRow {
@@ -1120,6 +1979,125 @@ pub struct CompareReport {
     pub run_a: String,
     pub run_b: String,
     pub rows: Vec<CompareRow>,
+    /// What changed about the judges between the runs ([`judge_changes`]).
+    pub judge_changes: Vec<JudgeChange>,
+    /// Each run's replay, when it was one ([`crate::replay::ReplaySummary`]): its cost and
+    /// latency, set side by side.
+    pub replay_a: Option<crate::replay::ReplaySummary>,
+    pub replay_b: Option<crate::replay::ReplaySummary>,
+    /// `--non-inferior`'s margin, and its verdicts ([`non_inferiority_rows`]).
+    pub margin: Option<f64>,
+    pub non_inferiority: Vec<NonInferiorRow>,
+}
+
+/// One `eval compare --non-inferior` verdict: an evaluator over every paired item, or over one
+/// slice of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NonInferiorRow {
+    pub evaluator: String,
+    /// `None`: every paired item. `Some((key, value))`: the items labelled `value` under `key`.
+    pub slice: Option<(String, String)>,
+    /// The test, or why it could not run.
+    pub result: Result<crate::stats::NonInferiority, String>,
+}
+
+impl NonInferiorRow {
+    pub fn non_inferior(&self) -> bool {
+        matches!(&self.result, Ok(r) if r.verdict == crate::stats::NonInferiorVerdict::NonInferior)
+    }
+
+    /// `non-inferior`, `inferior`, `inconclusive`, or `untestable`.
+    pub fn verdict(&self) -> &'static str {
+        match &self.result {
+            Ok(r) => r.verdict.as_str(),
+            Err(_) => "untestable",
+        }
+    }
+
+    pub fn slice_label(&self) -> String {
+        match &self.slice {
+            None => "all".to_string(),
+            Some((k, v)) => format!("{k}={v}"),
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let r = self.result.as_ref().ok();
+        serde_json::json!({
+            "evaluator": self.evaluator,
+            "slice": self.slice.as_ref().map(|(k, v)| serde_json::json!({"key": k, "value": v})),
+            "verdict": self.verdict(),
+            "pairs": r.map(|r| r.pairs),
+            "mean_delta": r.map(|r| r.mean),
+            "lower_bound": r.map(|r| r.lower),
+            "upper_bound": r.map(|r| r.upper),
+            "p_value": r.map(|r| r.p),
+            "why": self.result.as_ref().err(),
+        })
+    }
+}
+
+/// Is run B no worse than run A by more than `margin`, evaluator by evaluator? A one-sided
+/// paired test on the items both runs scored ([`crate::stats::non_inferiority`] at level
+/// `alpha`), over every item and then over each slice the runs recorded ([`RunSlices`]; run A's
+/// labels, else run B's). Only evaluators in both runs are tested: one in a single run is
+/// already a `new` or `gone` row.
+pub fn non_inferiority_rows(
+    store: &Store,
+    run_a: &str,
+    run_b: &str,
+    margin: f64,
+    alpha: f64,
+) -> anyhow::Result<Vec<NonInferiorRow>> {
+    use crate::stats::non_inferiority;
+    let (items_a, items_b) = (run_items(store, run_a)?, run_items(store, run_b)?);
+    let mut slices = run_slices(store, run_b)?;
+    for (k, labels) in run_slices(store, run_a)?.by {
+        slices.by.entry(k).or_default().extend(labels);
+    }
+    let test = |diffs: &[f64]| {
+        non_inferiority(diffs, margin, alpha).ok_or_else(|| match diffs.len() {
+            0 | 1 => format!("{} paired item(s), too few to test", diffs.len()),
+            n => format!("all {n} items moved by the same amount: no variance to test"),
+        })
+    };
+    let mut out = Vec::new();
+    for (name, a) in &items_a {
+        let Some(b) = items_b.get(name) else { continue };
+        let keyed = match paired_keyed(Some(a), Some(b)) {
+            Ok(k) => k,
+            Err(why) => {
+                out.push(NonInferiorRow {
+                    evaluator: name.clone(),
+                    slice: None,
+                    result: Err(format!("needs the same items in both runs: {why}")),
+                });
+                continue;
+            }
+        };
+        let diffs: Vec<f64> = keyed.iter().map(|(_, d)| *d).collect();
+        out.push(NonInferiorRow {
+            evaluator: name.clone(),
+            slice: None,
+            result: test(&diffs),
+        });
+        for (key, labels) in &slices.by {
+            let mut by_value: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+            for (item, d) in &keyed {
+                if let Some(v) = labels.get(*item) {
+                    by_value.entry(v.as_str()).or_default().push(*d);
+                }
+            }
+            for (value, diffs) in by_value {
+                out.push(NonInferiorRow {
+                    evaluator: name.clone(),
+                    slice: Some((key.clone(), value.to_string())),
+                    result: test(&diffs),
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl CompareReport {
@@ -1127,6 +2105,18 @@ impl CompareReport {
     /// `--fail-on-regression` is set (raw-delta, no significance test).
     pub fn has_regression(&self, tolerance: f64) -> bool {
         self.rows.iter().any(|r| r.is_regression(tolerance))
+    }
+
+    /// The `--non-inferior` gate: every shared evaluator, over all its paired items, shown no
+    /// worse than run A by more than the margin. Slices are reported, not gated. False when no
+    /// evaluator could be tested at all.
+    pub fn non_inferior(&self) -> bool {
+        let overall: Vec<&NonInferiorRow> = self
+            .non_inferiority
+            .iter()
+            .filter(|r| r.slice.is_none())
+            .collect();
+        !overall.is_empty() && overall.iter().all(|r| r.non_inferior())
     }
 
     /// True if any beyond-`tolerance` regression is not provably noise — the significance-mode
@@ -1185,6 +2175,8 @@ pub fn compare_runs(
 ) -> anyhow::Result<CompareReport> {
     let agg_a = run_aggregates(store, run_a)?;
     let agg_b = run_aggregates(store, run_b)?;
+    let items_a = run_items(store, run_a)?;
+    let items_b = run_items(store, run_b)?;
     anyhow::ensure!(
         !agg_a.is_empty(),
         "no aggregate scores found for run {run_a} — unknown run id, or its scores were never persisted"
@@ -1208,18 +2200,39 @@ pub fn compare_runs(
             };
             let n_a = ea.and_then(|e| e.stats).map(|s| s.n);
             let n_b = eb.and_then(|e| e.stats).map(|s| s.n);
-            let signif = match (ea.and_then(|e| e.stats), eb.and_then(|e| e.stats)) {
-                (Some(sa), Some(sb)) => welch_t_test(
-                    sa.mean,
-                    sa.variance,
-                    sa.n,
-                    sb.mean,
-                    sb.variance,
-                    sb.n,
-                    alpha,
-                ),
-                _ => None,
-            };
+            // The same items in both runs: test the per-item differences, where the items'
+            // own spread cancels. Otherwise Welch on the two runs' statistics, and say why.
+            let (signif, test, bootstrap_ci) =
+                match (ea.and_then(|e| e.stats), eb.and_then(|e| e.stats)) {
+                    (Some(sa), Some(sb)) => {
+                        match paired_differences(items_a.get(name), items_b.get(name)) {
+                            Ok(diffs) => (
+                                paired_t_test(&diffs, alpha),
+                                Some(TestUsed::Paired { pairs: diffs.len() }),
+                                bootstrap_mean_ci(
+                                    &diffs,
+                                    alpha,
+                                    crate::stats::BOOTSTRAP_RESAMPLES,
+                                    BOOTSTRAP_SEED,
+                                ),
+                            ),
+                            Err(why) => (
+                                welch_t_test(
+                                    sa.mean,
+                                    sa.variance,
+                                    sa.n,
+                                    sb.mean,
+                                    sb.variance,
+                                    sb.n,
+                                    alpha,
+                                ),
+                                Some(TestUsed::Welch { why }),
+                                None,
+                            ),
+                        }
+                    }
+                    _ => (None, None, None),
+                };
             CompareRow {
                 evaluator: name.clone(),
                 a,
@@ -1228,14 +2241,32 @@ pub fn compare_runs(
                 n_a,
                 n_b,
                 signif,
+                test,
+                bootstrap_ci,
             }
         })
         .collect();
 
+    let (manifest_a, manifest_b) = (run_manifest(store, run_a)?, run_manifest(store, run_b)?);
+    let judge_changes = match (&manifest_a, &manifest_b) {
+        (Some(a), Some(b)) => judge_changes(a, b),
+        _ => Vec::new(),
+    };
+    let replay = |m: &Option<serde_json::Value>| {
+        m.as_ref()
+            .and_then(|m| m.get("replay"))
+            .filter(|r| !r.is_null())
+            .and_then(|r| serde_json::from_value(r.clone()).ok())
+    };
     Ok(CompareReport {
         run_a: run_a.to_string(),
         run_b: run_b.to_string(),
         rows,
+        judge_changes,
+        replay_a: replay(&manifest_a),
+        replay_b: replay(&manifest_b),
+        margin: None,
+        non_inferiority: Vec::new(),
     })
 }
 
@@ -1258,8 +2289,10 @@ pub async fn compare_command(
         tolerance,
         significance,
         alpha,
+        non_inferior_margin: None,
+        reprice: false,
     };
-    compare_command_junit(run_a, run_b, data_dir, opts, None).await
+    compare_command_junit(run_a, run_b, data_dir, opts, None, None).await
 }
 
 /// The gate settings of `eval compare`.
@@ -1269,6 +2302,12 @@ pub struct CompareOpts {
     pub tolerance: f64,
     pub significance: bool,
     pub alpha: f64,
+    /// `--non-inferior --margin δ`: fail unless every shared evaluator is shown no worse than
+    /// run A by more than δ.
+    pub non_inferior_margin: Option<f64>,
+    /// Price both runs' replays at the process price table (`--price-table`) rather than at
+    /// what each replay recorded.
+    pub reprice: bool,
 }
 
 /// [`compare_command`] that also writes a JUnit XML report to `junit` (see [`crate::junit`]),
@@ -1280,6 +2319,7 @@ pub async fn compare_command_junit(
     data_dir: &Path,
     opts: CompareOpts,
     junit: Option<&Path>,
+    report_json: Option<&Path>,
 ) -> anyhow::Result<bool> {
     let started = std::time::Instant::now();
     let result = compare_report(run_a, run_b, data_dir, opts).await;
@@ -1299,6 +2339,12 @@ pub async fn compare_command_junit(
         "evald.eval.compare",
         started.elapsed().as_secs_f64(),
     )?;
+    crate::report::write_after(
+        report_json,
+        &result,
+        |(report, passed)| crate::report::compare(report, &opts, *passed),
+        "eval_compare",
+    )?;
     result.map(|(_, passed)| passed)
 }
 
@@ -1314,6 +2360,8 @@ async fn compare_report(
         tolerance,
         significance,
         alpha,
+        non_inferior_margin,
+        reprice,
     } = opts;
     let store_config = StoreConfig {
         compact_interval: None,
@@ -1321,7 +2369,20 @@ async fn compare_report(
     };
     let store = Store::open(data_dir, store_config)
         .map_err(|e| anyhow::anyhow!("opening store at {}: {e}", data_dir.display()))?;
-    let report = compare_runs(&store, run_a, run_b, alpha)?;
+    let mut report = compare_runs(&store, run_a, run_b, alpha)?;
+    if reprice {
+        let table = crate::price::current();
+        for r in [&mut report.replay_a, &mut report.replay_b]
+            .into_iter()
+            .flatten()
+        {
+            r.reprice(&table);
+        }
+    }
+    if let Some(margin) = non_inferior_margin {
+        report.margin = Some(margin);
+        report.non_inferiority = non_inferiority_rows(&store, run_a, run_b, margin, alpha)?;
+    }
     print_compare(&report, tolerance, significance, alpha);
 
     let regressed = if significance {
@@ -1329,11 +2390,127 @@ async fn compare_report(
     } else {
         report.has_regression(tolerance)
     };
-    let gate_fails = fail_on_regression && regressed;
-    if gate_fails {
+    let regression_fails = fail_on_regression && regressed;
+    if regression_fails {
         println!("--fail-on-regression set — exiting non-zero.");
     }
-    Ok((report, !gate_fails))
+    let inferiority_fails = report.margin.is_some() && !report.non_inferior();
+    if inferiority_fails {
+        println!("--non-inferior set — exiting non-zero.");
+    }
+    Ok((report, !(regression_fails || inferiority_fails)))
+}
+
+/// The two runs' replays side by side: where they ran, what they cost, how long they took.
+fn print_replays(report: &CompareReport) {
+    use crate::replay::ReplaySummary;
+    let (a, b) = (report.replay_a.as_ref(), report.replay_b.as_ref());
+    if a.is_none() && b.is_none() {
+        return;
+    }
+    let cell = |r: Option<&ReplaySummary>, f: fn(&ReplaySummary) -> String| {
+        r.map(f).unwrap_or_else(|| "- (not a replay)".to_string())
+    };
+    let row = |name: &str, f: fn(&ReplaySummary) -> String, delta: String| {
+        let line = format!("{name:<14} {:<30} {:<30} {delta}", cell(a, f), cell(b, f));
+        println!("{}", line.trim_end());
+    };
+    let both = |f: fn(&ReplaySummary) -> Option<f64>| a.and_then(f).zip(b.and_then(f));
+    let priced = |r: &ReplaySummary| r.cost_usd.filter(|_| r.unpriced_calls == 0);
+    let ms_delta = |f: fn(&ReplaySummary) -> Option<f64>| {
+        both(f).map_or("-".to_string(), |(x, y)| format!("{:+.0} ms", y - x))
+    };
+
+    println!("\n{:<14} {:<30} {:<30} delta", "replay", "run_a", "run_b");
+    row(
+        "endpoint",
+        |r| format!("{} ({})", r.endpoint, r.model),
+        String::new(),
+    );
+    row(
+        "jurisdiction",
+        |r| r.jurisdiction.clone().unwrap_or_else(|| "-".into()),
+        String::new(),
+    );
+    row("calls", |r| r.calls.to_string(), String::new());
+    row(
+        "tokens in/out",
+        |r| format!("{} / {}", r.input_tokens, r.output_tokens),
+        String::new(),
+    );
+    row(
+        "cost",
+        |r| match r.cost_usd {
+            Some(c) if r.unpriced_calls == 0 => format!("${c:.4}"),
+            Some(c) => format!("${c:.4} +{} unpriced", r.unpriced_calls),
+            None => "unpriced".to_string(),
+        },
+        both(priced).map_or("-".to_string(), |(x, y)| format!("{:+.4} $", y - x)),
+    );
+    row(
+        "latency p50",
+        |r| format!("{:.0} ms", r.latency_ms_p50),
+        ms_delta(|r| Some(r.latency_ms_p50)),
+    );
+    row(
+        "latency p95",
+        |r| format!("{:.0} ms", r.latency_ms_p95),
+        ms_delta(|r| Some(r.latency_ms_p95)),
+    );
+}
+
+/// `--non-inferior`'s verdicts, every evaluator over all its items and then by slice.
+fn print_non_inferiority(report: &CompareReport, alpha: f64) {
+    let Some(margin) = report.margin else { return };
+    println!(
+        "\nnon-inferiority: is run B no worse than run A by more than {margin}? (paired, one-sided \
+         {}% lower bound)",
+        format!("{:.1}", (1.0 - alpha) * 100.0).trim_end_matches(".0")
+    );
+    println!(
+        "{:<22} {:<20} {:>6} {:>9} {:>12}  verdict",
+        "evaluator", "slice", "pairs", "mean Δ", "lower bound"
+    );
+    for r in &report.non_inferiority {
+        match &r.result {
+            Ok(t) => println!(
+                "{:<22} {:<20} {:>6} {:>+9.3} {:>+12.4}  {}",
+                r.evaluator,
+                r.slice_label(),
+                t.pairs,
+                t.mean,
+                t.lower,
+                r.verdict()
+            ),
+            Err(why) => println!(
+                "{:<22} {:<20} {:>6} {:>9} {:>12}  untestable: {why}",
+                r.evaluator,
+                r.slice_label(),
+                "-",
+                "-",
+                "-"
+            ),
+        }
+    }
+    let failing: Vec<String> = report
+        .non_inferiority
+        .iter()
+        .filter(|r| r.slice.is_none() && !r.non_inferior())
+        .map(|r| format!("{} ({})", r.evaluator, r.verdict()))
+        .collect();
+    if report.non_inferior() {
+        println!(
+            "NON-INFERIOR — every evaluator is shown no worse than run A by more than {margin}."
+        );
+    } else if failing.is_empty() {
+        println!("NOT SHOWN NON-INFERIOR — no evaluator was scored in both runs.");
+    } else {
+        println!(
+            "NOT SHOWN NON-INFERIOR — {}. Inconclusive is not a pass: more items, or a wider \
+             margin you can defend, decide it.",
+            failing.join(", ")
+        );
+    }
 }
 
 /// Print the run-vs-run diff to stdout (the report; logs go to stderr so CI can parse it).
@@ -1412,6 +2589,53 @@ fn print_compare(report: &CompareReport, tolerance: f64, significance: bool, alp
             );
         }
     }
+
+    // Which test each verdict came from: detail under the table, not a column in it.
+    if any_stats {
+        println!();
+        for r in &report.rows {
+            let Some(test) = &r.test else { continue };
+            let detail = match (test, r.signif, r.bootstrap_ci) {
+                (TestUsed::Paired { pairs }, Some(_), Some((lo, hi))) => format!(
+                    "paired t on {pairs} items scored in both runs; bootstrap {conf:.0}% CI \
+                     [{lo:+.3},{hi:+.3}]"
+                ),
+                (TestUsed::Paired { pairs }, None, _) if *pairs >= 2 => format!(
+                    "paired: all {pairs} items moved by the same amount, so there is no \
+                     variance to test; the raw delta gates"
+                ),
+                (TestUsed::Paired { pairs }, _, _) => {
+                    format!("paired: {pairs} item(s), too few to test")
+                }
+                (TestUsed::Welch { why }, _, _) => format!("Welch (unpaired): {why}"),
+            };
+            println!("  {:<14} {detail}", r.evaluator);
+        }
+    }
+
+    if !report.judge_changes.is_empty() {
+        println!(
+            "\nwarning: a judge changed between the runs, so its deltas are the judge's as much as \
+             the system's:"
+        );
+        let show = |v: &Option<String>| match v.as_deref() {
+            Some(d) if d.starts_with("sha256:") && d.len() > 19 => format!("{}…", &d[..19]),
+            Some(v) => v.to_string(),
+            None => "-".to_string(),
+        };
+        for c in &report.judge_changes {
+            println!(
+                "  {:<14} {:<13} {} -> {}",
+                c.judge,
+                c.what,
+                show(&c.a),
+                show(&c.b)
+            );
+        }
+    }
+
+    print_replays(report);
+    print_non_inferiority(report, alpha);
 
     // Footer reflects the ACTIVE gate (significance vs raw-delta).
     if significance {
@@ -1502,7 +2726,8 @@ mod tests {
         // not covered here, the match in a maintained list won't catch it, but the intent is that
         // NO variant is silently broken across the batch/per-item paths.
         let specs = vec![
-            ExactMatch,
+            ExactMatch { normalize: false },
+            ExactMatch { normalize: true },
             Contains {
                 substring: Some("Par".into()),
             },
@@ -1510,7 +2735,10 @@ mod tests {
                 pattern: "P.*s".into(),
             },
             JsonValid,
-            Levenshtein { threshold: 0.8 },
+            Levenshtein {
+                threshold: 0.8,
+                normalize: true,
+            },
             NonEmpty,
             ContainsAll {
                 substrings: vec!["a".into()],
@@ -1529,6 +2757,13 @@ mod tests {
             },
             Latency { max_ms: 100.0 },
             Cost { max_usd: 1.0 },
+            LanguageMatch {
+                language: Some("en".into()),
+            },
+            Script {
+                script: Some("Latin".into()),
+                min: 0.8,
+            },
         ];
         let items = vec![item("Paris", Some("Paris")), item("{\"a\":1}", Some("1"))];
         for spec in &specs {
@@ -1562,24 +2797,29 @@ mod tests {
     #[test]
     fn evaluators_score_as_expected() {
         assert_eq!(
-            ExactMatch
+            ExactMatch { normalize: false }
                 .score(&item("Paris", Some("Paris")))
                 .unwrap()
                 .value,
             1.0
         );
         assert_eq!(
-            ExactMatch
+            ExactMatch { normalize: false }
                 .score(&item(" Paris ", Some("Paris")))
                 .unwrap()
                 .value,
             1.0
         ); // trimmed
         assert_eq!(
-            ExactMatch.score(&item("4", Some("four"))).unwrap().value,
+            ExactMatch { normalize: false }
+                .score(&item("4", Some("four")))
+                .unwrap()
+                .value,
             0.0
         );
-        assert!(ExactMatch.score(&item("x", None)).is_none()); // no expected -> skipped
+        assert!(ExactMatch { normalize: false }
+            .score(&item("x", None))
+            .is_none()); // no expected -> skipped
 
         let c = Contains {
             substring: Some("Par".into()),
@@ -1610,7 +2850,10 @@ mod tests {
         );
         assert_eq!(JsonValid.score(&item("not json", None)).unwrap().value, 0.0);
 
-        let l = Levenshtein { threshold: 0.8 };
+        let l = Levenshtein {
+            threshold: 0.8,
+            normalize: false,
+        };
         let s = l.score(&item("colour", Some("color"))).unwrap();
         assert!(s.value > 0.8 && s.passed);
     }
@@ -1795,9 +3038,11 @@ mod tests {
         let config = EvalConfig {
             name: Some("t".into()),
             dataset: "d.jsonl".into(),
-            evaluators: vec![EvaluatorSpec::ExactMatch],
+            evaluators: vec![EvaluatorSpec::ExactMatch { normalize: false }],
+            endpoints: vec![],
             judges: vec![],
             thresholds: BTreeMap::from([("exact_match".to_string(), 0.9)]),
+            slice_by: None,
         };
         // 3/4 exact-match -> mean 0.75 < 0.9 -> fails the gate.
         let dataset = vec![
@@ -1812,10 +3057,22 @@ mod tests {
         assert!((agg.mean - 0.75).abs() < 1e-9);
         assert!(!agg.threshold_met);
         assert!(!report.passed());
-        // No spans on the items, so only the one aggregate score is persisted.
-        assert_eq!(scores.len(), 1);
-        assert!(matches!(scores[0].target, ScoreTarget::Run(_)));
-        assert_eq!(scores[0].num_value, Some(0.75));
+        // No spans on the items, so nothing attaches per item: the run gets the aggregate and
+        // the per-item values (none keyed, the items have no id).
+        assert_eq!(scores.len(), 2);
+        assert!(scores
+            .iter()
+            .all(|s| matches!(s.target, ScoreTarget::Run(_))));
+        let agg_score = scores
+            .iter()
+            .find(|s| s.id == "run1:agg:exact_match")
+            .unwrap();
+        assert_eq!(agg_score.num_value, Some(0.75));
+        let items = scores.iter().find(|s| s.name == ITEMS_NAME).unwrap();
+        assert_eq!(items.id, "run1:items:exact_match");
+        assert_eq!(items.num_value, None, "never mistaken for a numeric score");
+        let v: ItemValues = serde_json::from_str(items.str_value.as_deref().unwrap()).unwrap();
+        assert_eq!((v.items.len(), v.unkeyed), (0, 4));
     }
 
     #[test]
@@ -1823,15 +3080,18 @@ mod tests {
         let config = EvalConfig {
             name: None,
             dataset: "d.jsonl".into(),
-            evaluators: vec![EvaluatorSpec::ExactMatch],
+            evaluators: vec![EvaluatorSpec::ExactMatch { normalize: false }],
+            endpoints: vec![],
             judges: vec![],
             thresholds: BTreeMap::new(),
+            slice_by: None,
         };
         let mut a = item("a", Some("a"));
         a.span_id = Some("span-1".into());
         let (_report, scores) = run_eval(&config, &[a], "run2", 1).unwrap();
-        // one per-item score (targeting the span) + one aggregate (targeting the run)
-        assert_eq!(scores.len(), 2);
+        // one per-item score (targeting the span) + the per-item values and the aggregate
+        // (targeting the run)
+        assert_eq!(scores.len(), 3);
         assert!(scores
             .iter()
             .any(|s| s.target == ScoreTarget::Span("span-1".into())));
@@ -1846,8 +3106,10 @@ mod tests {
             name: None,
             dataset: "d.jsonl".into(),
             evaluators: vec![EvaluatorSpec::JsonValid],
+            endpoints: vec![],
             judges: vec![],
             thresholds: BTreeMap::new(),
+            slice_by: None,
         };
         let (report, _) = run_eval(&config, &[item("not json", None)], "r", 1).unwrap();
         assert!(report.passed()); // 0.0 mean but no threshold configured
@@ -1868,8 +3130,10 @@ mod tests {
                     substring: Some("b".into()),
                 },
             ],
+            endpoints: vec![],
             judges: vec![],
             thresholds: BTreeMap::new(),
+            slice_by: None,
         };
         let err = run_eval(&config, &[item("ab", None)], "r", 1).unwrap_err();
         assert!(err.to_string().contains("duplicate evaluator"), "{err}");
@@ -1881,9 +3145,11 @@ mod tests {
         let config = EvalConfig {
             name: None,
             dataset: "d.jsonl".into(),
-            evaluators: vec![EvaluatorSpec::ExactMatch],
+            evaluators: vec![EvaluatorSpec::ExactMatch { normalize: false }],
+            endpoints: vec![],
             judges: vec![],
             thresholds: BTreeMap::from([("exact_match".to_string(), 0.9)]),
+            slice_by: None,
         };
         let (report, scores) =
             run_eval(&config, &[item("x", None), item("y", None)], "r", 1).unwrap();
@@ -1894,8 +3160,9 @@ mod tests {
             "an all-skipped evaluator must not fail the gate on a fabricated 0.0 mean"
         );
         assert!(report.passed());
-        // The aggregate Score is still persisted (mean 0.0 over 0 items) for the record.
-        assert_eq!(scores.len(), 1);
+        // The aggregate Score is still persisted (mean 0.0 over 0 items) for the record, beside
+        // its (empty) per-item values.
+        assert_eq!(scores.len(), 2);
     }
 
     #[tokio::test]
@@ -1951,9 +3218,15 @@ mod tests {
         )
         .unwrap();
         let junit = dir.path().join("reports/eval.xml");
-        let passed = run_command_junit(&cfg_path, &dir.path().join("store"), Some(&junit))
-            .await
-            .unwrap();
+        let passed = run_command_junit(
+            &cfg_path,
+            &dir.path().join("store"),
+            Some(&junit),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(!passed, "0.5 < 0.9: the gate still fails");
         let xml = std::fs::read_to_string(&junit).unwrap();
         assert!(
@@ -1972,6 +3245,8 @@ mod tests {
             &dir.path().join("missing.yaml"),
             &dir.path().join("s"),
             Some(&junit),
+            None,
+            false,
         )
         .await
         .unwrap_err();
@@ -1994,13 +3269,13 @@ mod tests {
             let store = test_store(&data_dir);
             persist_run(
                 &store,
-                vec![EvaluatorSpec::ExactMatch],
+                vec![EvaluatorSpec::ExactMatch { normalize: false }],
                 &[item("a", Some("a")), item("b", Some("b"))],
                 "good",
             );
             persist_run(
                 &store,
-                vec![EvaluatorSpec::ExactMatch],
+                vec![EvaluatorSpec::ExactMatch { normalize: false }],
                 &[item("a", Some("a")), item("X", Some("b"))],
                 "bad",
             );
@@ -2010,11 +3285,14 @@ mod tests {
             tolerance: 0.0,
             significance: false,
             alpha: 0.05,
+            non_inferior_margin: None,
+            reprice: false,
         };
         let junit = dir.path().join("cmp.xml");
-        let passed = compare_command_junit("good", "bad", &data_dir, opts(true), Some(&junit))
-            .await
-            .unwrap();
+        let passed =
+            compare_command_junit("good", "bad", &data_dir, opts(true), Some(&junit), None)
+                .await
+                .unwrap();
         assert!(!passed);
         let xml = std::fs::read_to_string(&junit).unwrap();
         assert!(
@@ -2022,16 +3300,17 @@ mod tests {
             "{xml}"
         );
         // Informational compare: the same regression is reported but nothing fails.
-        let passed = compare_command_junit("good", "bad", &data_dir, opts(false), Some(&junit))
-            .await
-            .unwrap();
+        let passed =
+            compare_command_junit("good", "bad", &data_dir, opts(false), Some(&junit), None)
+                .await
+                .unwrap();
         assert!(passed);
         assert!(std::fs::read_to_string(&junit)
             .unwrap()
             .contains("failures=\"0\""));
         // An unknown run id is an errored report, and the error still propagates.
         assert!(
-            compare_command_junit("good", "ghost", &data_dir, opts(true), Some(&junit))
+            compare_command_junit("good", "ghost", &data_dir, opts(true), Some(&junit), None)
                 .await
                 .is_err()
         );
@@ -2061,8 +3340,10 @@ mod tests {
             name: None,
             dataset: "d.jsonl".into(),
             evaluators,
+            endpoints: vec![],
             judges: vec![],
             thresholds: BTreeMap::new(),
+            slice_by: None,
         };
         let (_report, scores) = run_eval(&config, dataset, run_id, 1).unwrap();
         store.put_scores(&scores).unwrap();
@@ -2075,13 +3356,13 @@ mod tests {
         // run A: 1/2 exact-match = 0.5; run B: 2/2 = 1.0 (an improvement)
         persist_run(
             &store,
-            vec![EvaluatorSpec::ExactMatch],
+            vec![EvaluatorSpec::ExactMatch { normalize: false }],
             &[item("a", Some("a")), item("X", Some("b"))],
             "runA",
         );
         persist_run(
             &store,
-            vec![EvaluatorSpec::ExactMatch],
+            vec![EvaluatorSpec::ExactMatch { normalize: false }],
             &[item("a", Some("a")), item("b", Some("b"))],
             "runB",
         );
@@ -2103,13 +3384,13 @@ mod tests {
         // A: 2/2 = 1.0; B: 1/2 = 0.5 -> delta -0.5
         persist_run(
             &store,
-            vec![EvaluatorSpec::ExactMatch],
+            vec![EvaluatorSpec::ExactMatch { normalize: false }],
             &[item("a", Some("a")), item("b", Some("b"))],
             "rA",
         );
         persist_run(
             &store,
-            vec![EvaluatorSpec::ExactMatch],
+            vec![EvaluatorSpec::ExactMatch { normalize: false }],
             &[item("a", Some("a")), item("X", Some("b"))],
             "rB",
         );
@@ -2129,13 +3410,16 @@ mod tests {
         // run A has two evaluators; run B only one. The diff unions both names.
         persist_run(
             &store,
-            vec![EvaluatorSpec::ExactMatch, EvaluatorSpec::JsonValid],
+            vec![
+                EvaluatorSpec::ExactMatch { normalize: false },
+                EvaluatorSpec::JsonValid,
+            ],
             &[item("{}", Some("{}"))],
             "uA",
         );
         persist_run(
             &store,
-            vec![EvaluatorSpec::ExactMatch],
+            vec![EvaluatorSpec::ExactMatch { normalize: false }],
             &[item("{}", Some("{}"))],
             "uB",
         );
@@ -2160,7 +3444,7 @@ mod tests {
         let store = test_store(dir.path());
         persist_run(
             &store,
-            vec![EvaluatorSpec::ExactMatch],
+            vec![EvaluatorSpec::ExactMatch { normalize: false }],
             &[item("a", Some("a"))],
             "known",
         );
@@ -2179,13 +3463,13 @@ mod tests {
             let store = test_store(&data_dir);
             persist_run(
                 &store,
-                vec![EvaluatorSpec::ExactMatch],
+                vec![EvaluatorSpec::ExactMatch { normalize: false }],
                 &[item("a", Some("a")), item("b", Some("b"))],
                 "good",
             );
             persist_run(
                 &store,
-                vec![EvaluatorSpec::ExactMatch],
+                vec![EvaluatorSpec::ExactMatch { normalize: false }],
                 &[item("a", Some("a")), item("X", Some("b"))],
                 "bad",
             );
@@ -2222,7 +3506,627 @@ mod tests {
             let out = if i < passes { "a" } else { "x" };
             items.push(item(out, Some("a")));
         }
-        persist_run(store, vec![EvaluatorSpec::ExactMatch], &items, run_id);
+        persist_run(
+            store,
+            vec![EvaluatorSpec::ExactMatch { normalize: false }],
+            &items,
+            run_id,
+        );
+    }
+
+    /// `(item id, passes)` per item of an exact_match run.
+    type Outcomes = Vec<(Option<String>, bool)>;
+
+    /// A run of exact_match over `outcomes`.
+    fn persist_items(store: &Store, run_id: &str, outcomes: &[(Option<String>, bool)]) {
+        let items: Vec<DatasetItem> = outcomes
+            .iter()
+            .map(|(id, pass)| DatasetItem {
+                id: id.clone(),
+                ..item(if *pass { "a" } else { "x" }, Some("a"))
+            })
+            .collect();
+        persist_run(
+            store,
+            vec![EvaluatorSpec::ExactMatch { normalize: false }],
+            &items,
+            run_id,
+        );
+    }
+
+    /// 40 items, the first 20 passing in run A; in run B five of those 20 fail. Every other
+    /// item scores the same in both runs.
+    fn five_flips(ids: bool) -> (Outcomes, Outcomes) {
+        let id = |i: usize| ids.then(|| format!("q{i}"));
+        let a = (0..40).map(|i| (id(i), i < 20)).collect();
+        let b = (0..40).map(|i| (id(i), i < 15)).collect();
+        (a, b)
+    }
+
+    #[tokio::test]
+    async fn compare_pairs_the_same_items_and_sees_what_welch_calls_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let (a, b) = five_flips(true);
+        persist_items(&store, "pA", &a);
+        persist_items(&store, "pB", &b);
+        let paired = compare_runs(&store, "pA", "pB", 0.05).unwrap();
+        let row = &paired.rows[0];
+        assert_eq!(row.test, Some(TestUsed::Paired { pairs: 40 }));
+        let s = row.signif.unwrap();
+        // By hand: d = five −1s and 35 zeros, d̄ = −0.125, s_d² = (5·0.875² + 35·0.125²) / 39,
+        // t = d̄ / (s_d / √40) ≈ −2.36 on 39 df.
+        let var = (5.0 * 0.875_f64.powi(2) + 35.0 * 0.125_f64.powi(2)) / 39.0;
+        assert!(
+            (s.t - (-0.125 / (var / 40.0).sqrt())).abs() < 1e-9,
+            "t={}",
+            s.t
+        );
+        assert_eq!(s.df, 39.0);
+        assert!(
+            s.ci_high < 0.0,
+            "paired CI excludes 0: {:?}",
+            (s.ci_low, s.ci_high)
+        );
+        let (lo, hi) = row.bootstrap_ci.unwrap();
+        assert!(lo <= -0.125 && (-0.125..0.0).contains(&hi), "({lo}, {hi})");
+        assert!(paired.has_gating_significant_regression(0.0));
+
+        // The same scores with no item ids cannot be paired: Welch, which calls it noise.
+        let (a, b) = five_flips(false);
+        persist_items(&store, "uA", &a);
+        persist_items(&store, "uB", &b);
+        let unpaired = compare_runs(&store, "uA", "uB", 0.05).unwrap();
+        let row = &unpaired.rows[0];
+        match &row.test {
+            Some(TestUsed::Welch { why }) => assert!(why.contains("no id"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        let s = row.signif.unwrap();
+        assert!(
+            s.ci_low < 0.0 && s.ci_high > 0.0,
+            "{:?}",
+            (s.ci_low, s.ci_high)
+        );
+        assert!(row.bootstrap_ci.is_none());
+        assert!(!unpaired.has_gating_significant_regression(0.0));
+        assert_eq!(row.delta, paired.rows[0].delta, "the same delta either way");
+    }
+
+    #[tokio::test]
+    async fn compare_says_why_runs_could_not_be_paired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let (a, mut b) = five_flips(true);
+        b.pop(); // run B scored one item fewer
+        persist_items(&store, "dA", &a);
+        persist_items(&store, "dB", &b);
+        let r = compare_runs(&store, "dA", "dB", 0.05).unwrap();
+        assert_eq!(
+            r.rows[0].test,
+            Some(TestUsed::Welch {
+                why: "the runs scored different items (39 shared of 40 and 39)".into()
+            })
+        );
+        // Repeated ids cannot be matched either.
+        let dup: Outcomes = (0..4).map(|i| (Some("same".to_string()), i < 2)).collect();
+        persist_items(&store, "rA", &dup);
+        persist_items(&store, "rB", &dup);
+        let r = compare_runs(&store, "rA", "rB", 0.05).unwrap();
+        assert!(matches!(&r.rows[0].test, Some(TestUsed::Welch { why }) if why.contains("repeat")));
+    }
+
+    /// 100 items, 60 labelled `en` and 40 `ms`; run A passes all of them, run B fails `ms_fails`
+    /// of the `ms` ones. Both runs record their slice labels.
+    fn persist_migration(store: &Store, ms_fails: usize) {
+        let items = |fails: usize| -> Vec<DatasetItem> {
+            (0..100)
+                .map(|i| {
+                    let ms = i >= 60;
+                    let fail = ms && i - 60 < fails;
+                    DatasetItem {
+                        id: Some(format!("q{i}")),
+                        metadata: Some(
+                            serde_json::json!({"language": if ms { "ms" } else { "en" }}),
+                        ),
+                        ..item(if fail { "x" } else { "a" }, Some("a"))
+                    }
+                })
+                .collect()
+        };
+        let keys = vec!["language".to_string()];
+        for (run, fails) in [("mA", 0), ("mB", ms_fails)] {
+            let dataset = items(fails);
+            persist_run(
+                store,
+                vec![EvaluatorSpec::ExactMatch { normalize: false }],
+                &dataset,
+                run,
+            );
+            store
+                .put_scores(&[RunSlices::from_items(&keys, &dataset)
+                    .score(run, 1)
+                    .unwrap()])
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn non_inferiority_by_slice_known_answers() {
+        use crate::stats::NonInferiorVerdict::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        persist_migration(&store, 6);
+        let verdicts = |margin: f64| -> Vec<(String, Option<crate::stats::NonInferiorVerdict>)> {
+            non_inferiority_rows(&store, "mA", "mB", margin, 0.05)
+                .unwrap()
+                .iter()
+                .map(|r| (r.slice_label(), r.result.as_ref().ok().map(|t| t.verdict)))
+                .collect()
+        };
+        // Overall: 6 of 100 items worse, mean −0.06, one-sided 95% bounds [−0.0996, −0.0204]:
+        // neither shown at a 0.05 margin. The `ms` slice: 6 of 40, mean −0.15, upper bound
+        // −0.0537, so shown worse than 0.05. `en`: unchanged on every item.
+        assert_eq!(
+            verdicts(0.05),
+            [
+                ("all".to_string(), Some(Inconclusive)),
+                ("language=en".to_string(), Some(NonInferior)),
+                ("language=ms".to_string(), Some(Inferior)),
+            ]
+        );
+        let rows = non_inferiority_rows(&store, "mA", "mB", 0.05, 0.05).unwrap();
+        let all = rows[0].result.as_ref().unwrap();
+        assert_eq!(all.pairs, 100);
+        assert!((all.mean + 0.06).abs() < 1e-12);
+        assert!((all.upper + 0.020369).abs() < 1e-5, "{all:?}");
+        let ms = rows[2].result.as_ref().unwrap();
+        assert_eq!(ms.pairs, 40);
+        assert!((ms.upper + 0.053664).abs() < 1e-5, "{ms:?}");
+        // A margin of 0.12 accepts the overall drop (lower bound −0.0996), not the ms slice's.
+        assert_eq!(verdicts(0.12)[0].1, Some(NonInferior));
+        assert_eq!(verdicts(0.12)[2].1, Some(Inconclusive));
+
+        // Runs over different items cannot be paired, and the row says so.
+        persist_items(
+            &store,
+            "other",
+            &[(Some("q0".into()), true), (Some("zz".into()), true)],
+        );
+        let r = non_inferiority_rows(&store, "mA", "other", 0.05, 0.05).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(
+            matches!(&r[0].result, Err(w) if w.contains("same items")),
+            "{r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_gates_on_non_inferiority_and_inconclusive_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("store");
+        {
+            let store = test_store(&data_dir);
+            persist_migration(&store, 6);
+        }
+        let opts = |margin: Option<f64>| CompareOpts {
+            fail_on_regression: false,
+            tolerance: 0.0,
+            significance: false,
+            alpha: 0.05,
+            non_inferior_margin: margin,
+            reprice: false,
+        };
+        let junit = dir.path().join("ni.xml");
+        // Inconclusive at 0.05: not a pass.
+        let passed =
+            compare_command_junit("mA", "mB", &data_dir, opts(Some(0.05)), Some(&junit), None)
+                .await
+                .unwrap();
+        assert!(!passed);
+        let xml = std::fs::read_to_string(&junit).unwrap();
+        assert!(xml.contains("non-inferior: exact_match"), "{xml}");
+        assert!(xml.contains("NotNonInferior"), "{xml}");
+        assert!(xml.contains("non_inferior_margin"), "{xml}");
+        // Shown non-inferior at 0.12 (the ms slice is reported, not gated).
+        let passed =
+            compare_command_junit("mA", "mB", &data_dir, opts(Some(0.12)), Some(&junit), None)
+                .await
+                .unwrap();
+        assert!(passed);
+        assert!(!std::fs::read_to_string(&junit)
+            .unwrap()
+            .contains("NotNonInferior"));
+        // Without --non-inferior nothing gates (no --fail-on-regression either).
+        assert!(
+            compare_command_junit("mA", "mB", &data_dir, opts(None), None, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Every report `--report-json` writes validates against the published v1 schema: a run,
+    /// a comparison with every section filled, and a command that could not run.
+    #[tokio::test]
+    async fn reports_validate_against_the_v1_schema() {
+        let schema: serde_json::Value = serde_json::from_str(crate::report::SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let check = |doc: &serde_json::Value| {
+            let errors: Vec<String> = validator.iter_errors(doc).map(|e| e.to_string()).collect();
+            assert!(errors.is_empty(), "{errors:#?}\n{doc:#}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("store");
+        {
+            let store = test_store(&data_dir);
+            persist_migration(&store, 6);
+            put_manifest(&store, "mA", vec![judge_entry("sha256:aaa", "Q4_K_M")]);
+            put_manifest(&store, "mB", vec![judge_entry("sha256:bbb", "Q4_K_M")]);
+        }
+        let opts = CompareOpts {
+            fail_on_regression: true,
+            tolerance: 0.0,
+            significance: true,
+            alpha: 0.05,
+            non_inferior_margin: Some(0.05),
+            reprice: false,
+        };
+        let out = dir.path().join("cmp.json");
+        let passed = compare_command_junit("mA", "mB", &data_dir, opts, None, Some(&out))
+            .await
+            .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        check(&doc);
+        assert_eq!(doc["schema"], crate::report::VERSION);
+        assert_eq!(doc["passed"], passed);
+        assert_eq!(doc["judge_changes"][0]["what"], "weights");
+        assert_eq!(doc["non_inferiority"][0]["verdict"], "inconclusive");
+        assert_eq!(doc["evaluators"][0]["test"], "paired");
+
+        // A comparison that could not run still writes a report, and it validates.
+        let missing = dir.path().join("missing.json");
+        compare_command_junit("mA", "ghost", &data_dir, opts, None, Some(&missing))
+            .await
+            .unwrap_err();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&missing).unwrap()).unwrap();
+        check(&doc);
+        assert_eq!(doc["passed"], false);
+        assert!(doc["error"].as_str().unwrap().contains("ghost"));
+
+        // An eval run, with slices.
+        let cfg = dir.path().join("eval.yaml");
+        std::fs::write(
+            dir.path().join("d.jsonl"),
+            "{\"id\":\"q1\",\"output\":\"a\",\"expected_output\":\"a\",\"metadata\":{\"language\":\"en\"}}\n\
+             {\"id\":\"q2\",\"output\":\"x\",\"expected_output\":\"a\",\"metadata\":{\"language\":\"ms\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &cfg,
+            "dataset: ./d.jsonl\nevaluators:\n  - type: exact_match\nthresholds:\n  exact_match: 0.9\n",
+        )
+        .unwrap();
+        let run_json = dir.path().join("run.json");
+        let passed = run_command_junit(&cfg, &dir.path().join("s2"), None, Some(&run_json), false)
+            .await
+            .unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&run_json).unwrap()).unwrap();
+        check(&doc);
+        assert!(!passed);
+        assert_eq!(doc["kind"], "eval_run");
+        assert_eq!(doc["evaluators"][0]["threshold_met"], false);
+        assert_eq!(doc["slices"].as_array().unwrap().len(), 2);
+
+        // And the schema has teeth: a report missing what v1 promises does not validate.
+        let mut broken = doc.clone();
+        broken.as_object_mut().unwrap().remove("evaluators");
+        assert!(!validator.is_valid(&broken));
+    }
+
+    #[test]
+    fn multilingual_evaluators_from_yaml() {
+        let specs: Vec<EvaluatorSpec> = serde_yaml::from_str(
+            "- type: exact_match\n  normalize: true\n- type: levenshtein\n  normalize: true\n\
+             - type: language_match\n- type: script\n- type: script\n  script: Jawi\n  min: 0.9\n",
+        )
+        .unwrap();
+        let ev: Vec<Box<dyn Evaluator>> = specs.iter().map(|s| s.compile().unwrap()).collect();
+        let it = |out: &str, expected: Option<&str>, lang: Option<&str>| DatasetItem {
+            metadata: lang.map(|l| serde_json::json!({"language": l})),
+            ..item(out, expected)
+        };
+        // Full-width digits and case: equal once normalised, not before.
+        let wide = it("ＫＬ２０２６", Some("kl2026"), None);
+        assert_eq!(ev[0].score(&wide).unwrap().value, 1.0);
+        assert_eq!(
+            EvaluatorSpec::ExactMatch { normalize: false }
+                .evaluate(&wide)
+                .unwrap()
+                .unwrap()
+                .value,
+            0.0
+        );
+        assert_eq!(ev[1].score(&wide).unwrap().value, 1.0);
+
+        // Asked in Malay, answered in English: the failure language_match exists for.
+        let english = it(
+            "Your order has been shipped and should arrive within three working days.",
+            None,
+            Some("ms"),
+        );
+        let s = ev[2].score(&english).unwrap();
+        assert!(!s.passed);
+        assert!(s.comment.unwrap().contains("detected en"));
+        let malay = it(
+            "Pesanan anda telah dihantar dan akan tiba dalam masa tiga hari bekerja.",
+            None,
+            Some("id"),
+        );
+        assert!(ev[2].score(&malay).unwrap().passed, "ms and id are one");
+        assert!(
+            ev[2].score(&it("OK", None, Some("ms"))).is_none(),
+            "too short: skipped"
+        );
+        assert!(
+            ev[2]
+                .score(&it("anything at all here", None, None))
+                .is_none(),
+            "no language"
+        );
+        // A configured language wins over the item's.
+        let fixed = EvaluatorSpec::LanguageMatch {
+            language: Some("en".into()),
+        };
+        assert!(fixed.evaluate(&english).unwrap().unwrap().passed);
+
+        // The script of the item's language; or one named (Jawi is Arabic script).
+        let thai = it("ราคา 39,900 บาท", None, Some("th"));
+        assert_eq!(ev[3].score(&thai).unwrap().value, 1.0);
+        let latin_for_thai = it("The price is 39,900 baht", None, Some("th"));
+        let s = ev[3].score(&latin_for_thai).unwrap();
+        assert!(!s.passed && s.value == 0.0, "{s:?}");
+        assert!(
+            ev[3].score(&it("text", None, Some("tlh"))).is_none(),
+            "no known script"
+        );
+        let jawi = it("بهاس ملايو", None, None);
+        assert!(ev[4].score(&jawi).unwrap().passed);
+        assert!(
+            !ev[4]
+                .score(&it("Bahasa Melayu", None, None))
+                .unwrap()
+                .passed
+        );
+
+        // Bad parameters are refused when the config loads.
+        for bad in [
+            "- type: script\n  script: Klingon\n",
+            "- type: script\n  min: 2\n",
+        ] {
+            let specs: Vec<EvaluatorSpec> = serde_yaml::from_str(bad).unwrap();
+            assert!(specs[0].compile().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_run_reports_each_evaluator_by_language() {
+        let dataset: Vec<DatasetItem> = [("q1", "en", "a"), ("q2", "en", "x"), ("q3", "ms", "a")]
+            .iter()
+            .map(|(id, lang, out)| DatasetItem {
+                id: Some(id.to_string()),
+                metadata: Some(serde_json::json!({"language": lang, "route": "faq"})),
+                ..item(out, Some("a"))
+            })
+            .collect();
+        let config = EvalConfig {
+            name: None,
+            dataset: "d.jsonl".into(),
+            evaluators: vec![EvaluatorSpec::ExactMatch { normalize: false }],
+            endpoints: vec![],
+            judges: vec![],
+            thresholds: BTreeMap::new(),
+            slice_by: None,
+        };
+        let (_, scores) = run_eval(&config, &dataset, "r", 1).unwrap();
+        let slices = RunSlices::from_items(&config.slice_keys(), &dataset);
+        let rows = slice_means(&scores, &slices);
+        // `route` has one value, so says nothing per slice; `language` has two.
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.key.as_str(), r.value.as_str(), r.n, r.mean))
+                .collect::<Vec<_>>(),
+            [("language", "en", 2, 0.5), ("language", "ms", 1, 1.0)]
+        );
+    }
+
+    #[test]
+    fn slice_labels_come_from_item_metadata() {
+        let it = |id: &str, meta: serde_json::Value| DatasetItem {
+            id: Some(id.into()),
+            metadata: Some(meta),
+            ..item("o", None)
+        };
+        let items = [
+            it(
+                "a",
+                serde_json::json!({"language": "ms", "route": 3, "task": ""}),
+            ),
+            it(
+                "b",
+                serde_json::json!({"language": "en", "task": {"nested": 1}}),
+            ),
+            DatasetItem {
+                metadata: Some(serde_json::json!({"language": "ms"})),
+                ..item("unkeyed", None)
+            },
+        ];
+        let keys = EvalConfig {
+            name: None,
+            dataset: "d.jsonl".into(),
+            evaluators: vec![],
+            endpoints: vec![],
+            judges: vec![],
+            thresholds: BTreeMap::new(),
+            slice_by: None,
+        }
+        .slice_keys();
+        assert_eq!(keys, ["language", "route", "task"]);
+        let s = RunSlices::from_items(&keys, &items);
+        assert_eq!(
+            s.by["language"].len(),
+            2,
+            "an unkeyed item cannot be paired"
+        );
+        assert_eq!(s.by["language"]["a"], "ms");
+        assert_eq!(s.by["route"]["a"], "3", "a number is its text");
+        assert!(
+            !s.by.contains_key("task"),
+            "empty and nested values label nothing"
+        );
+        assert!(RunSlices::from_items(&keys, &[]).score("r", 1).is_none());
+    }
+
+    /// A judge's manifest entry, as [`crate::judge::JudgeSummary::manifest_entry`] writes it.
+    fn judge_entry(digest: &str, quant: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": "judge_toxicity",
+            "judge_version": crate::judge::JUDGE_VERSION,
+            "base_url": "http://ollama:11434",
+            "model": "qwen2.5:7b",
+            "server_model": digest,
+            "provenance": {"id": "qwen2.5:7b", "digest": digest, "quantization": quant,
+                           "source": "v1/models+ollama"},
+        })
+    }
+
+    fn put_manifest(store: &Store, run_id: &str, judges: Vec<serde_json::Value>) {
+        let m = serde_json::json!({"manifest_version": 1, "run_id": run_id, "judges": judges});
+        store
+            .put_scores(&[Score {
+                id: format!("{run_id}:manifest"),
+                target: ScoreTarget::Run(run_id.to_string()),
+                name: MANIFEST_NAME.to_string(),
+                num_value: None,
+                str_value: Some(m.to_string()),
+                data_type: crate::model::DataType::Text,
+                source: crate::model::ScoreSource::Eval,
+                comment: None,
+                config_id: None,
+                agg_stats: None,
+                ts_unix_nano: 1,
+            }])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_judge_that_changed_between_runs_is_named_with_what_changed() {
+        let a = serde_json::json!({"judges": [judge_entry("sha256:aaa", "Q4_K_M")]});
+        assert!(
+            judge_changes(&a, &a).is_empty(),
+            "the same judge: nothing to say"
+        );
+
+        // Re-pulled under the same tag: new weights, new quantisation.
+        let b = serde_json::json!({"judges": [judge_entry("sha256:bbb", "Q8_0")]});
+        let c = judge_changes(&a, &b);
+        assert_eq!(
+            c.iter().map(|c| c.what).collect::<Vec<_>>(),
+            ["weights", "quantization"]
+        );
+        assert_eq!(c[0].judge, "judge_toxicity");
+        assert_eq!(
+            (c[0].a.as_deref(), c[0].b.as_deref()),
+            (Some("sha256:aaa"), Some("sha256:bbb"))
+        );
+
+        // Moved, renamed, or judged with other prompts: each is named.
+        let mut moved = judge_entry("sha256:aaa", "Q4_K_M");
+        moved["base_url"] = "http://gpu-2:8000".into();
+        moved["model"] = "qwen2.5:14b".into();
+        moved["judge_version"] = "0".into();
+        let c = judge_changes(&a, &serde_json::json!({"judges": [moved]}));
+        assert_eq!(
+            c.iter().map(|c| c.what).collect::<Vec<_>>(),
+            ["model", "base_url", "judge_version"]
+        );
+
+        // Without a digest (vLLM, a gateway), the listed model stands for the weights.
+        let listed = |id: &str| {
+            serde_json::json!({"judges": [{"name": "j", "server_model": id,
+                                           "provenance": {"id": id, "source": "v1/models"}}]})
+        };
+        let c = judge_changes(&listed("/models/a"), &listed("/models/b"));
+        assert_eq!((c.len(), c[0].what), (1, "weights"));
+
+        // A judge in only one run, or a run with no manifest judges: nothing to compare.
+        let other = serde_json::json!({"judges": [{"name": "other", "server_model": "x"}]});
+        assert!(judge_changes(&a, &other).is_empty());
+        assert!(judge_changes(&a, &serde_json::json!({})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn compare_warns_when_the_judge_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = test_store(dir.path());
+        let (a, b) = five_flips(true);
+        persist_items(&store, "jA", &a);
+        persist_items(&store, "jB", &b);
+        // No manifests (runs written before 0.5, or with no judges): no warning.
+        assert!(compare_runs(&store, "jA", "jB", 0.05)
+            .unwrap()
+            .judge_changes
+            .is_empty());
+        put_manifest(&store, "jA", vec![judge_entry("sha256:aaa", "Q4_K_M")]);
+        put_manifest(&store, "jB", vec![judge_entry("sha256:bbb", "Q4_K_M")]);
+        let r = compare_runs(&store, "jA", "jB", 0.05).unwrap();
+        assert_eq!(r.judge_changes.len(), 1, "{:?}", r.judge_changes);
+        assert_eq!(r.judge_changes[0].what, "weights");
+        assert_eq!(run_manifest(&store, "jA").unwrap().unwrap()["run_id"], "jA");
+        assert!(run_manifest(&store, "no-such-run").unwrap().is_none());
+    }
+
+    /// Every eval config docs/JUDGES.md shows, and the Ollama stack's, loads and resolves as
+    /// written: a page that tells you to paste a config must paste one evald takes.
+    #[test]
+    fn the_judges_page_and_the_stack_configs_load() {
+        let page = include_str!("../docs/JUDGES.md");
+        let mut configs: Vec<&str> = page
+            .split("```yaml\n")
+            .skip(1)
+            .map(|b| b.split("```").next().unwrap())
+            .collect();
+        assert_eq!(configs.len(), 2, "the page's two judge configs");
+        configs.push(include_str!("../ops/stacks/ollama/judge.yaml"));
+        for text in configs {
+            let cfg: EvalConfig =
+                serde_yaml::from_str(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+            let endpoints = crate::endpoint::resolve_all(&cfg.endpoints, Path::new(".")).unwrap();
+            assert!(!cfg.judges.is_empty());
+            for j in &cfg.judges {
+                j.validate().unwrap();
+                j.resolve_endpoint(&endpoints).unwrap();
+            }
+        }
+        let online: crate::online::OnlineSpec =
+            serde_yaml::from_str(include_str!("../ops/stacks/ollama/online.yaml")).unwrap();
+        crate::online::Online::new(&online, Path::new(".")).unwrap();
+    }
+
+    #[test]
+    fn an_item_is_known_by_its_id_then_its_span_then_its_trace() {
+        let mut it = item("o", None);
+        assert_eq!(it.key(), None);
+        it.trace_id = Some("t".into());
+        assert_eq!(it.key(), Some("t"));
+        it.span_id = Some("s".into());
+        assert_eq!(it.key(), Some("s"));
+        it.id = Some(String::new());
+        assert_eq!(it.key(), Some("s"), "an empty id is no id");
+        it.id = Some("q1".into());
+        assert_eq!(it.key(), Some("q1"));
     }
 
     #[tokio::test]

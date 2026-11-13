@@ -143,6 +143,154 @@ pub fn stamp(data_dir: &Path, stamped_from: Option<&str>) -> io::Result<FormatMa
     Ok(marker)
 }
 
+/// How a preflight line reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckLevel {
+    Ok,
+    /// Worth acting on before the upgrade, not a reason it cannot happen.
+    Warn,
+    /// This evald cannot take over the directory.
+    Fail,
+}
+
+/// One line of `evald migrate --check`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    pub level: CheckLevel,
+    pub name: &'static str,
+    pub detail: String,
+}
+
+/// Whether this evald can take over `data_dir`, writing nothing: the on-disk format (read),
+/// whether a running evald holds the store (a shared lock probe on the index, released at
+/// once), and the free space beside it. The upgrade preflight: run the new binary's `migrate
+/// --check` against the old one's data-dir before switching.
+pub fn preflight(data_dir: &Path) -> Vec<Check> {
+    let check = |level, name, detail: String| Check {
+        level,
+        name,
+        detail,
+    };
+    let this = env!("CARGO_PKG_VERSION");
+    let mut out = Vec::new();
+    out.push(match inspect(data_dir) {
+        Ok(FormatState::Fresh) => check(
+            CheckLevel::Ok,
+            "format",
+            format!(
+                "nothing here yet: evald {this} creates format {FORMAT_VERSION} on first start"
+            ),
+        ),
+        Ok(FormatState::Legacy) => check(
+            CheckLevel::Warn,
+            "format",
+            format!(
+                "written before the format marker (v0.2.x): stamped as format {FORMAT_VERSION} \
+                 on first start, or now with `evald migrate`; no data is rewritten"
+            ),
+        ),
+        Ok(FormatState::Marked(m)) => match check_readable(&m, data_dir) {
+            Ok(()) => check(
+                CheckLevel::Ok,
+                "format",
+                format!(
+                    "on-disk format {}, written by evald {}; evald {this} reads formats up to \
+                     {FORMAT_VERSION}",
+                    m.format, m.evald_version
+                ),
+            ),
+            Err(e) => check(CheckLevel::Fail, "format", e.to_string()),
+        },
+        Err(e) => check(CheckLevel::Fail, "format", e.to_string()),
+    });
+
+    let index = data_dir.join("index.redb");
+    out.push(match File::open(&index) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            check(CheckLevel::Ok, "in use", "no store to hold yet".into())
+        }
+        Err(e) => check(
+            CheckLevel::Fail,
+            "in use",
+            format!("cannot read {}: {e}", index.display()),
+        ),
+        Ok(f) => match f.try_lock_shared() {
+            Ok(()) => {
+                let _ = f.unlock();
+                check(
+                    CheckLevel::Ok,
+                    "in use",
+                    "no running evald holds the store".into(),
+                )
+            }
+            Err(fs::TryLockError::WouldBlock) => check(
+                CheckLevel::Warn,
+                "in use",
+                "a running evald holds the store: stop it before starting this one (an evald \
+                 refuses a store another holds)"
+                    .into(),
+            ),
+            Err(fs::TryLockError::Error(e)) => check(
+                CheckLevel::Warn,
+                "in use",
+                format!("could not probe the store's lock: {e}"),
+            ),
+        },
+    });
+
+    let size = dir_size(data_dir);
+    // A data-dir that does not exist yet will be made on the nearest one that does.
+    let existing = data_dir
+        .ancestors()
+        .find(|p| p.exists())
+        .unwrap_or(Path::new("."));
+    out.push(match crate::disk::free_bytes(existing) {
+        Some(free) if free < size => check(
+            CheckLevel::Warn,
+            "disk",
+            format!(
+                "{} free beside a {} store: compaction rewrites blocks, so keep at least the \
+                 store's size free",
+                crate::disk::human_bytes(free),
+                crate::disk::human_bytes(size)
+            ),
+        ),
+        Some(free) => check(
+            CheckLevel::Ok,
+            "disk",
+            format!(
+                "{} free, the store is {}",
+                crate::disk::human_bytes(free),
+                crate::disk::human_bytes(size)
+            ),
+        ),
+        None => check(
+            CheckLevel::Warn,
+            "disk",
+            format!(
+                "free space unknown here; the store is {}",
+                crate::disk::human_bytes(size)
+            ),
+        ),
+    });
+    out
+}
+
+/// The bytes of every file under `dir` (0 when it does not exist).
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -162,6 +310,86 @@ fn fsync_dir(_dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn the_upgrade_preflight_reads_and_writes_nothing() {
+        use super::{preflight, CheckLevel::*};
+        let level = |checks: &[super::Check], name: &str| {
+            checks
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.level)
+                .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+
+        // Empty: fine, and still empty afterwards.
+        let c = preflight(d);
+        assert_eq!(
+            (level(&c, "format"), level(&c, "in use")),
+            (Ok, Ok),
+            "{c:#?}"
+        );
+        assert_eq!(std::fs::read_dir(d).unwrap().count(), 0, "nothing written");
+
+        // A pre-marker store: a warning, and it is not stamped by the check.
+        std::fs::create_dir(d.join("wal")).unwrap();
+        std::fs::write(d.join("index.redb"), b"").unwrap();
+        assert_eq!(level(&preflight(d), "format"), Warn);
+        assert!(
+            !d.join(super::FORMAT_FILE).exists(),
+            "the check stamps nothing"
+        );
+
+        // Marked and readable.
+        super::stamp(d, None).unwrap();
+        let c = preflight(d);
+        assert_eq!(level(&c, "format"), Ok);
+        assert!(c[0].detail.contains("format 1"), "{c:#?}");
+        assert!(c.iter().any(|x| x.name == "disk"));
+
+        // Held by a running evald (here: a lock on the index, as redb takes).
+        let held = std::fs::File::open(d.join("index.redb")).unwrap();
+        held.lock().unwrap();
+        let c = preflight(d);
+        assert_eq!(level(&c, "in use"), Warn, "{c:#?}");
+        assert!(c[1].detail.contains("stop it"));
+        held.unlock().unwrap();
+        assert_eq!(
+            level(&preflight(d), "in use"),
+            Ok,
+            "the probe left no lock behind"
+        );
+
+        // And a real store, open in this process the way `serve` holds it.
+        let live_dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(
+            live_dir.path(),
+            crate::StoreConfig {
+                compact_interval: None,
+                ..crate::StoreConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            level(&preflight(live_dir.path()), "in use"),
+            Warn,
+            "redb's own lock is seen"
+        );
+        drop(store);
+        assert_eq!(level(&preflight(live_dir.path()), "in use"), Ok);
+
+        // Written by a newer evald: this one cannot take over.
+        std::fs::write(
+            d.join(super::FORMAT_FILE),
+            r#"{"format": 99, "evald_version": "9.0.0", "created_unix_ms": 1}"#,
+        )
+        .unwrap();
+        let c = preflight(d);
+        assert_eq!(level(&c, "format"), Fail);
+        assert!(c[0].detail.contains("never downgraded"), "{c:#?}");
+    }
+
     use super::*;
 
     #[test]

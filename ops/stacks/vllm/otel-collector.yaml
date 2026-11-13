@@ -1,0 +1,32 @@
+# Apps and vLLM send here; everything goes on to evald over OTLP/gRPC. Add exporters to fan out
+# to another backend as well.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlp/evald:
+    endpoint: evald:4317
+    tls:
+      insecure: true
+    # With EVALD_AUTH_TOKEN set on evald, pass it here:
+    # headers:
+    #   authorization: "Bearer ${env:EVALD_AUTH_TOKEN}"
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/evald]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/evald]

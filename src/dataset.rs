@@ -24,6 +24,9 @@ pub struct FromSpansFilter {
     pub model: Option<String>,
     /// Max spans to scan (most-recent-first).
     pub limit: usize,
+    /// Label each row's `metadata.language` with the language its prompt is in
+    /// ([`crate::lang`]), so runs on it report and compare by language.
+    pub detect_language: bool,
 }
 
 /// One dataset row, serialized to match [`crate::eval::DatasetItem`] on read-back. `output` is
@@ -45,6 +48,7 @@ struct DatasetRow {
 pub fn rows_from_spans(
     spans: &[NormalizedSpan],
     model_filter: Option<&str>,
+    detect_language: bool,
 ) -> (String, usize, usize) {
     let mut jsonl = String::new();
     let mut written = 0usize;
@@ -62,18 +66,31 @@ pub fn rows_from_spans(
                 continue;
             }
         };
+        let mut metadata = json!({
+            "model": s.model,
+            "provider": s.provider,
+            "service_name": s.service_name,
+            "session_id": s.session_id,
+            "start_unix_nano": s.start_unix_nano,
+        });
+        if detect_language {
+            // The question's language is the one the answer should be in; with no prompt
+            // recorded, the answer's own. Too little text to tell leaves it unlabelled.
+            let text = s
+                .input_value
+                .as_deref()
+                .map(crate::lang::prompt_text)
+                .unwrap_or_else(|| output.clone());
+            if let Some(d) = crate::lang::detect(&text).filter(|d| d.reliable) {
+                metadata["language"] = d.code.into();
+            }
+        }
         let row = DatasetRow {
             input: s.input_value.clone(),
             output,
             span_id: Some(s.span_id.clone()),
             trace_id: Some(s.trace_id.clone()),
-            metadata: json!({
-                "model": s.model,
-                "provider": s.provider,
-                "service_name": s.service_name,
-                "session_id": s.session_id,
-                "start_unix_nano": s.start_unix_nano,
-            }),
+            metadata,
         };
         if let Ok(line) = serde_json::to_string(&row) {
             jsonl.push_str(&line);
@@ -100,7 +117,8 @@ pub fn from_spans(
         resolve_blob_ref(store, &mut s.input_value);
         resolve_blob_ref(store, &mut s.output_value);
     }
-    let (jsonl, written, skipped) = rows_from_spans(&spans, filter.model.as_deref());
+    let (jsonl, written, skipped) =
+        rows_from_spans(&spans, filter.model.as_deref(), filter.detect_language);
     match out {
         Some(path) => std::fs::write(path, jsonl)?,
         None => {
@@ -175,7 +193,7 @@ mod tests {
             span("02", Some("gpt-4o"), Some("no output here"), None), // skipped
             span("03", Some("gpt-4o"), Some("empty"), Some("")),      // skipped (empty)
         ];
-        let (jsonl, written, skipped) = rows_from_spans(&spans, None);
+        let (jsonl, written, skipped) = rows_from_spans(&spans, None, false);
         assert_eq!(written, 1);
         assert_eq!(skipped, 2);
         // The one row is valid JSONL with the eval-runner fields.
@@ -193,11 +211,46 @@ mod tests {
             span("02", Some("claude"), Some("b"), Some("B")),
             span("03", Some("gpt-4o"), Some("c"), None), // matches filter, no output → skipped
         ];
-        let (jsonl, written, skipped) = rows_from_spans(&spans, Some("gpt-4o"));
+        let (jsonl, written, skipped) = rows_from_spans(&spans, Some("gpt-4o"), false);
         assert_eq!(written, 1); // only 01 (claude filtered out, 03 has no output)
         assert_eq!(skipped, 1); // 03; the claude span is filtered, not "skipped"
         assert!(jsonl.contains("\"span_id\":\"01\""));
         assert!(!jsonl.contains("claude"));
+    }
+
+    #[test]
+    fn detect_language_labels_each_row_by_its_prompt() {
+        let spans = vec![
+            span(
+                "01",
+                Some("m"),
+                Some(
+                    r#"[{"role":"user","content":"Boleh saya tahu waktu operasi klinik ini pada hari Sabtu?"}]"#,
+                ),
+                Some("Klinik dibuka dari pukul sembilan pagi."),
+            ),
+            span(
+                "02",
+                Some("m"),
+                Some("คลินิกเปิดทำการวันเสาร์กี่โมงถึงกี่โมงครับ"),
+                Some("Nine to five."),
+            ),
+            span("03", Some("m"), Some("ok"), Some("ok")),
+        ];
+        let (jsonl, _, _) = rows_from_spans(&spans, None, true);
+        let rows: Vec<serde_json::Value> = jsonl
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows[0]["metadata"]["language"], "ms");
+        // The prompt's language, not the answer's (which is the thing to check).
+        assert_eq!(rows[1]["metadata"]["language"], "th");
+        assert!(
+            rows[2]["metadata"].get("language").is_none(),
+            "too little to tell"
+        );
+        let (plain, _, _) = rows_from_spans(&spans, None, false);
+        assert!(!plain.contains("\"language\""));
     }
 
     #[test]
@@ -207,7 +260,7 @@ mod tests {
             span("01", Some("gpt-4o"), Some("q1"), Some("a1")),
             span("02", Some("gpt-4o"), Some("q2"), Some("a2")),
         ];
-        let (jsonl, written, _) = rows_from_spans(&spans, None);
+        let (jsonl, written, _) = rows_from_spans(&spans, None, false);
         assert_eq!(written, 2);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ds.jsonl");

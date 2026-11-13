@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evald.report/v1",
+  "title": "evald CI report, version 1",
+  "description": "What `evald eval run --report-json` and `evald eval compare --report-json` write. Within v1, fields are only added: a consumer ignores fields it does not know. A field renamed, removed or retyped is v2.",
+  "type": "object",
+  "required": ["schema", "kind", "evald_version", "passed"],
+  "properties": {
+    "schema": { "const": "evald.report/v1" },
+    "kind": { "enum": ["eval_run", "eval_compare"] },
+    "evald_version": { "type": "string" },
+    "passed": { "type": "boolean", "description": "Whether the command's gate passed; the exit code says the same." },
+    "error": { "type": "string", "description": "Present when the command could not run; nothing else is then promised." }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "kind": { "const": "eval_run" } },
+        "not": { "required": ["error"] }
+      },
+      "then": {
+        "required": ["run_id", "items", "evaluators", "slices"],
+        "properties": {
+          "run_id": { "type": "string" },
+          "name": { "type": ["string", "null"] },
+          "items": { "type": "integer", "minimum": 0 },
+          "evaluators": { "type": "array", "items": { "$ref": "#/$defs/run_evaluator" } },
+          "slices": { "type": "array", "items": { "$ref": "#/$defs/slice_mean" } }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "eval_compare" } },
+        "not": { "required": ["error"] }
+      },
+      "then": {
+        "required": ["run_a", "run_b", "alpha", "gates", "evaluators", "judge_changes", "non_inferiority", "replay"],
+        "properties": {
+          "run_a": { "type": "string" },
+          "run_b": { "type": "string" },
+          "alpha": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1 },
+          "gates": {
+            "type": "object",
+            "required": ["fail_on_regression", "tolerance", "significance", "non_inferior_margin"],
+            "properties": {
+              "fail_on_regression": { "type": "boolean" },
+              "tolerance": { "type": "number", "minimum": 0 },
+              "significance": { "type": "boolean" },
+              "non_inferior_margin": { "type": ["number", "null"] }
+            }
+          },
+          "evaluators": { "type": "array", "items": { "$ref": "#/$defs/compare_evaluator" } },
+          "judge_changes": { "type": "array", "items": { "$ref": "#/$defs/judge_change" } },
+          "non_inferiority": { "type": "array", "items": { "$ref": "#/$defs/non_inferiority" } },
+          "replay": {
+            "type": "object",
+            "required": ["a", "b"],
+            "properties": {
+              "a": { "$ref": "#/$defs/replay_or_null" },
+              "b": { "$ref": "#/$defs/replay_or_null" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "number_or_null": { "type": ["number", "null"] },
+    "run_evaluator": {
+      "type": "object",
+      "required": ["name", "mean", "pass_rate", "scored", "skipped", "threshold", "threshold_met"],
+      "properties": {
+        "name": { "type": "string" },
+        "mean": { "type": "number" },
+        "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "scored": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "threshold": { "$ref": "#/$defs/number_or_null" },
+        "threshold_met": { "type": "boolean" }
+      }
+    },
+    "slice_mean": {
+      "type": "object",
+      "required": ["key", "value", "evaluator", "items", "mean"],
+      "properties": {
+        "key": { "type": "string" },
+        "value": { "type": "string" },
+        "evaluator": { "type": "string" },
+        "items": { "type": "integer", "minimum": 0 },
+        "mean": { "type": "number" }
+      }
+    },
+    "compare_evaluator": {
+      "type": "object",
+      "required": ["name", "a", "b", "delta", "n_a", "n_b", "test", "p_value", "ci_low", "ci_high", "bootstrap_ci", "regressed"],
+      "properties": {
+        "name": { "type": "string" },
+        "a": { "$ref": "#/$defs/number_or_null" },
+        "b": { "$ref": "#/$defs/number_or_null" },
+        "delta": { "$ref": "#/$defs/number_or_null" },
+        "n_a": { "type": ["integer", "null"] },
+        "n_b": { "type": ["integer", "null"] },
+        "test": { "enum": ["paired", "welch", null] },
+        "p_value": { "$ref": "#/$defs/number_or_null" },
+        "ci_low": { "$ref": "#/$defs/number_or_null" },
+        "ci_high": { "$ref": "#/$defs/number_or_null" },
+        "bootstrap_ci": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+          ]
+        },
+        "regressed": { "type": "boolean", "description": "Dropped by more than the tolerance." }
+      }
+    },
+    "judge_change": {
+      "type": "object",
+      "required": ["judge", "what", "a", "b"],
+      "properties": {
+        "judge": { "type": "string" },
+        "what": { "enum": ["weights", "quantization", "model", "base_url", "judge_version"] },
+        "a": { "type": ["string", "null"] },
+        "b": { "type": ["string", "null"] }
+      }
+    },
+    "non_inferiority": {
+      "type": "object",
+      "required": ["evaluator", "slice", "verdict"],
+      "properties": {
+        "evaluator": { "type": "string" },
+        "slice": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["key", "value"],
+              "properties": { "key": { "type": "string" }, "value": { "type": "string" } }
+            }
+          ]
+        },
+        "verdict": { "enum": ["non-inferior", "inferior", "inconclusive", "untestable"] },
+        "pairs": { "type": ["integer", "null"] },
+        "mean_delta": { "$ref": "#/$defs/number_or_null" },
+        "lower_bound": { "$ref": "#/$defs/number_or_null" },
+        "upper_bound": { "$ref": "#/$defs/number_or_null" },
+        "p_value": { "$ref": "#/$defs/number_or_null" },
+        "why": { "type": ["string", "null"] }
+      }
+    },
+    "replay_or_null": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["endpoint", "base_url", "model", "calls", "input_tokens", "output_tokens", "cost_usd", "unpriced_calls", "latency_ms_p50", "latency_ms_p95"],
+          "properties": {
+            "endpoint": { "type": "string" },
+            "base_url": { "type": "string" },
+            "jurisdiction": { "type": ["string", "null"] },
+            "model": { "type": "string" },
+            "calls": { "type": "integer", "minimum": 0 },
+            "input_tokens": { "type": "integer", "minimum": 0 },
+            "output_tokens": { "type": "integer", "minimum": 0 },
+            "cost_usd": { "$ref": "#/$defs/number_or_null" },
+            "unpriced_calls": { "type": "integer", "minimum": 0 },
+            "latency_ms_p50": { "type": "number" },
+            "latency_ms_p95": { "type": "number" }
+          }
+        }
+      ]
+    }
+  }
+}

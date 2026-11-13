@@ -1,0 +1,14 @@
+# EVALD_ONLINE_EVAL=/stack/online.yaml: judge 5 % of the model calls evald ingests on the stack's
+# Ollama, every errored one, within 500k judge tokens a day.
+endpoints:
+  - name: ollama
+    api: openai-chat
+    base_url: http://ollama:11434/v1
+    max_in_flight: 1
+    timeout_secs: 300
+judges:
+  - rail: answer_relevancy
+    endpoint: ollama
+    model: qwen2.5:7b
+sample_rate: 0.05
+daily_token_cap: 500000

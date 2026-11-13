@@ -322,7 +322,7 @@ pub fn from_compare(
         .map(|r| {
             let stat = match r.signif {
                 Some(s) => format!(
-                    "p={:.4} ci={:.0}%[{:+.3},{:+.3}] {}",
+                    "p={:.4} ci={:.0}%[{:+.3},{:+.3}] {} test={}",
                     s.p_two_sided,
                     (1.0 - alpha) * 100.0,
                     s.ci_low,
@@ -331,7 +331,8 @@ pub fn from_compare(
                         "significant"
                     } else {
                         "within noise"
-                    }
+                    },
+                    r.test.as_ref().map_or("welch", crate::eval::TestUsed::name)
                 ),
                 None => "no significance test (missing or too-small sample)".to_string(),
             };
@@ -387,19 +388,54 @@ pub fn from_compare(
                 output: Some(format!("{numbers}{note}")),
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // `--non-inferior`: one case per evaluator over all its items, failing as the gate does.
+    let mut cases = cases;
+    if let Some(margin) = report.margin {
+        for r in report.non_inferiority.iter().filter(|r| r.slice.is_none()) {
+            let numbers = match &r.result {
+                Ok(t) => format!(
+                    "pairs={} mean_delta={:+.4} lower_bound={:+.4} p={:.4} margin={margin}",
+                    t.pairs, t.mean, t.lower, t.p
+                ),
+                Err(why) => why.clone(),
+            };
+            let outcome = if r.non_inferior() {
+                Outcome::Pass
+            } else {
+                Outcome::Fail {
+                    kind: "NotNonInferior",
+                    message: format!(
+                        "{}: {} at margin {margin} (not shown no worse than run A)",
+                        r.evaluator,
+                        r.verdict()
+                    ),
+                    detail: numbers.clone(),
+                }
+            };
+            cases.push(Case {
+                name: format!("non-inferior: {}", r.evaluator),
+                outcome,
+                output: Some(numbers),
+            });
+        }
+    }
+    let mut properties = vec![
+        ("run_a".into(), report.run_a.clone()),
+        ("run_b".into(), report.run_b.clone()),
+        ("tolerance".into(), format!("{tolerance:.3}")),
+        ("significance".into(), significance.to_string()),
+        ("alpha".into(), format!("{alpha}")),
+        ("fail_on_regression".into(), fail_on_regression.to_string()),
+    ];
+    if let Some(margin) = report.margin {
+        properties.push(("non_inferior_margin".into(), format!("{margin}")));
+    }
     Suite {
         name: format!("evald eval compare {} vs {}", report.run_a, report.run_b),
         classname: "evald.eval.compare".to_string(),
         time_secs: 0.0,
-        properties: vec![
-            ("run_a".into(), report.run_a.clone()),
-            ("run_b".into(), report.run_b.clone()),
-            ("tolerance".into(), format!("{tolerance:.3}")),
-            ("significance".into(), significance.to_string()),
-            ("alpha".into(), format!("{alpha}")),
-            ("fail_on_regression".into(), fail_on_regression.to_string()),
-        ],
+        properties,
         cases,
     }
 }
@@ -486,6 +522,7 @@ mod tests {
             name: Some("nightly".into()),
             item_count: 10,
             aggregates: aggs,
+            slices: Vec::new(),
         }
     }
 
@@ -609,6 +646,8 @@ mod tests {
             n_a: a.map(|_| 100),
             n_b: b.map(|_| 100),
             signif,
+            test: None,
+            bootstrap_ci: None,
         }
     }
 
@@ -617,6 +656,11 @@ mod tests {
             run_a: "good".into(),
             run_b: "bad".into(),
             rows,
+            judge_changes: Vec::new(),
+            replay_a: None,
+            replay_b: None,
+            margin: None,
+            non_inferiority: Vec::new(),
         }
     }
 
@@ -630,7 +674,7 @@ mod tests {
         )]);
         let xml = render(&from_compare(&rep, 0.0, true, 0.05, true));
         assert!(xml.contains(
-            "<failure message=\"exact_match: 0.900 -&gt; 0.700 (delta -0.200) is beyond the tolerance 0.000\" type=\"Regression\">run_a=0.900 run_b=0.700 delta=-0.200 n_a=100 n_b=100 p=0.0123 ci=95%[-0.300,-0.100] significant</failure>"
+            "<failure message=\"exact_match: 0.900 -&gt; 0.700 (delta -0.200) is beyond the tolerance 0.000\" type=\"Regression\">run_a=0.900 run_b=0.700 delta=-0.200 n_a=100 n_b=100 p=0.0123 ci=95%[-0.300,-0.100] significant test=welch</failure>"
         ), "{xml}");
         assert!(xml.contains("<property name=\"significance\" value=\"true\"/>"));
         assert_eq!(counts(&xml), (1, 1, 0, 0));

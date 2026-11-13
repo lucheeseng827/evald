@@ -1,9 +1,9 @@
 # evald (`mancube/evald`)
 
-**An OTel-native trace + eval store in one static binary.** Point your OpenInference/OTel exporter at `:4318`, see your traces, run evals from a JSONL dataset, get scores keyed to the exact span — and gate CI on regressions. No database, no Python runtime: a single static musl binary that runs on your laptop, inside a locked-down CI runner, or on an air-gapped host.
+**An OTel-native trace + eval store in one static binary.** Point your OpenInference/OTel exporter at `:4318`, or Claude Code, Codex and Gemini CLI with `evald connect`, see your traces and agent sessions, run evals from a JSONL dataset, get scores keyed to the exact span — and gate CI on regressions. No database, no Python runtime: a single static musl binary that runs on your laptop, inside a locked-down CI runner, or on an air-gapped host.
 
 - **Image:** `mancube/evald` — static musl binary on **distroless/static**, runs as **nonroot** (uid `65532`), no shell, no package manager.
-- **Arch:** `linux/amd64`, `linux/arm64` · **Binary inside:** `/usr/local/bin/evald` (entrypoint) · **Exposes:** `4318` (OTLP/HTTP receiver + query/SQL API + embedded UI)
+- **Arch:** `linux/amd64`, `linux/arm64` · **Binary inside:** `/usr/local/bin/evald` (entrypoint) · **Exposes:** `4318` (OTLP/HTTP traces and logs + query/SQL API + embedded UI) and `4317` (OTLP/gRPC)
 - **Build:** the **default** feature set — pure Rust, zero Python/C/C++. DataFusion/Arrow/Parquet, redb, and the axum stack are all pure-Rust, and the embedded SPA is baked in (no Node).
 - **Source / full docs:** [github.com/lucheeseng827/evald](https://github.com/lucheeseng827/evald) · Apache-2.0
 
@@ -52,6 +52,8 @@ database, no Python.
 | Tag | Notes |
 |---|---|
 | `latest` | newest stable release |
+| `0.5.0` | "your models" and "sovereign by proof": judge endpoints for a team's own vLLM / Ollama / llama.cpp server, `evald judge probe`, online sampled evals (`serve --online-eval`), vLLM request spans, one egress door with a ledger and `--offline`, model provenance, `evald replay` and non-inferiority `eval compare`, multilingual evals, an air-gap bundle, a single-node Helm chart, `judge` built in with `--build-arg FEATURES=judge`, a refreshed price table |
+| `0.4.0` | "plugs in": OTLP logs ingest, Claude Code / Codex / Gemini CLI sessions (`evald connect`, `evald sessions`), tested framework recipes, a read-only MCP server, `serve` as the image default on both ports into `/data`, exit code `2` when evald cannot run, cosign-signed images with SBOM, a price table that prices Claude 5.5 |
 | `0.3.0` | derived `cost_usd` from model + token counts (built-in price table), LLM usage on `/metrics` + `evald latency`, quieter default ingest logging, lower `--max-hot-spans` default, bounded SQL/hot-tier reads that stop over-allocating |
 | `0.2.0` | redesigned console (Vite + React + TypeScript), standalone `mancube/evald-console` frontend image, `docs/INSTRUMENTATION.md`, `GET /v1/meta` |
 | `0.1.0` | first release — OTLP ingest + normalization, durable WAL→Parquet store, scores, offline `eval run`/`eval compare` with CI gating, SQL, embedded UI |

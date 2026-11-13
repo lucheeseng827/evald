@@ -1,0 +1,14 @@
+# The smoke test's override: vLLM replaced by a CPU stand-in that emits vLLM's span and metric
+# shapes (fake_vllm.py), so the rest of the stack runs anywhere. The real vLLM container is not
+# exercised here: that needs a GPU runner.
+services:
+  vllm:
+    image: docker.io/library/python:${PYTHON_VERSION:-3.12.12-slim}
+    command: ["python3", "-u", "/smoke/fake_vllm.py"]
+    entrypoint: []
+    environment:
+      SERVED_NAME: Qwen2.5-7B-Instruct
+    volumes:
+      - ./smoke:/smoke:ro
+    ipc: !reset null
+    deploy: !reset {}

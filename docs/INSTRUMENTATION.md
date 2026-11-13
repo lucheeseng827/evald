@@ -419,6 +419,25 @@ Both dialects are accepted; set **one** family per concern.
   operation is a model call when it carries `gen_ai.request.*`, `gen_ai.response.*` or
   `gen_ai.usage.*` attributes, and a chain (a workflow, a plan, an agent step) when it does not.
 
+### Semantic conventions
+
+The GenAI mapping is written against OpenTelemetry semantic conventions **1.38.0**
+(`GET /v1/meta` → `semconv`). The keys of the releases before it are read as well, so an
+instrumentation on either side of `OTEL_SEMCONV_STABILITY_OPT_IN` lands the same span:
+
+- **unset**, the default shape: `gen_ai.system`, `gen_ai.usage.prompt_tokens` /
+  `completion_tokens`, and the indexed `gen_ai.prompt.{i}.*` / `gen_ai.completion.{i}.*`;
+- **`gen_ai_latest_experimental`**: `gen_ai.provider.name`, `gen_ai.usage.input_tokens` /
+  `output_tokens`, and the structured `gen_ai.input.messages` / `gen_ai.output.messages`
+  (with `parts`).
+
+A span that carries both, as a `…/dup` mode emits, is counted once, and the current key wins.
+A span from a release *newer* than the pin still normalizes. What the mapping knows is read,
+every other attribute is kept as it was sent (and queryable,
+[API.md § Any attribute is queryable](./API.md#any-attribute-is-queryable)), and the scope's
+`schema_url` is kept as `otel.schema_url`. Raising the pin is a reviewed change with its own
+tests ([STABILITY.md](./STABILITY.md)).
+
 ### Agent frameworks
 
 [`examples/recipes/`](../examples/recipes/README.md) has one tested recipe per framework —

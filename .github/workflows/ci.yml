@@ -10,6 +10,8 @@ name: ci
 on:
   push:
     branches: ["main"]
+    # A release tag also runs the reference-stack smoke tests (job `stacks`).
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -49,6 +51,9 @@ jobs:
       # default build, and it makes no network call here.
       - name: Clippy (judge feature)
         run: cargo clippy --all-targets --features judge -- -D warnings
+      # The judge HTTP client and its tests against a loopback server exist only in that build.
+      - name: Test (judge feature)
+        run: cargo test --features judge --lib --test judge_endpoints --test egress --test replay
       # "No outbound call in the default build", checked from the resolved dependency graph and
       # the source rather than stated. The selftest proves the check can fail: the opt-in judge
       # build carries reqwest + rustls and must be flagged.
@@ -175,6 +180,111 @@ jobs:
           python-version: "3.12"
       - name: The README quick start on ubuntu:24.04
         run: python3 scripts/clean-machine.py --evald bin/evald
+
+  # The single-node Helm chart (ops/helm/evald): the render matrix, which asserts what each
+  # configuration renders to and that the ones that would deploy something healthy and wrong are
+  # refused, then an install on kind with the static binary above in the release image: a span is
+  # ingested, read back, and read again after the pod is replaced (the volume holds the store).
+  chart:
+    name: helm chart — render matrix + install on kind
+    needs: musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: evald-musl
+          path: bin
+      - name: helm, kind, kubectl (pinned, checksummed)
+        run: |
+          ops/helm/ci-tools.sh "$RUNNER_TEMP/tools"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+      - name: Render matrix
+        run: ops/helm/validate.sh helm
+      - name: Install on kind
+        run: |
+          ops/stacks/image.sh bin/evald evald:ci
+          kind create cluster --name evald --wait 180s
+          kind load docker-image evald:ci --name evald
+          ops/helm/validate.sh helm --kind evald:ci
+
+  # The air-gap bundle (ROADMAP-0.4-0.6.md S6.4): built from this musl binary with its image and
+  # the chart, signed with a throwaway importer's key, then, with the network gone, verified (an
+  # altered copy refused), a keyless Sigstore bundle verified offline, the binary installed, the
+  # image loaded and run, the chart rendered, and a data-dir written by evald 0.2.0 upgraded.
+  airgap:
+    name: air-gap — install, verify and upgrade with no network
+    needs: musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: evald-musl
+          path: bin
+      - name: helm (pinned, checksummed)
+        run: |
+          ops/helm/ci-tools.sh "$RUNNER_TEMP/tools"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+      - name: The last step with a network
+        run: |
+          chmod +x bin/evald
+          ops/airgap/ci-prepare.sh bin/evald "$RUNNER_TEMP/airgap" --image
+          echo "$RUNNER_TEMP/airgap/tools" >> "$GITHUB_PATH"
+      - name: With the network gone — verify, install, upgrade
+        run: |
+          sudo env "PATH=$PATH" unshare -n \
+            ops/airgap/offline-check.sh "$RUNNER_TEMP/airgap" tests/fixtures/format-v1
+
+  # The reference stacks (ops/stacks), each brought up with one command and smoke-tested, on a
+  # release tag (or by hand). evald is built with the judge backend for them. The vLLM stack runs
+  # with vLLM replaced by a CPU stand-in that emits vLLM's span and metric shapes (no GPU here);
+  # the Ollama stack runs for real, with a small model.
+  stacks:
+    name: reference stacks — vLLM (CPU stand-in) + Ollama
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # A release build of the DataFusion tree, the vLLM stack's images and the Ollama image
+      # (3.4 GB compressed, several times that unpacked) do not fit in the ~21 GB a hosted runner
+      # starts with. The preinstalled Android SDK, .NET, GHC, Swift and CodeQL are ~25 GB that
+      # nothing here uses.
+      - name: Reclaim runner disk (the Ollama image needs it)
+        run: |
+          set -euo pipefail
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell \
+                      /usr/local/share/chromium /opt/hostedtoolcache/CodeQL || true
+          echo "after:"; df -h / | tail -1
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build (static musl, judge backend)
+        run: cross build --release --features judge --bin evald --target x86_64-unknown-linux-musl
+      - name: The image
+        run: ops/stacks/image.sh target/x86_64-unknown-linux-musl/release/evald evald:judge
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: vLLM stack
+        run: python3 ops/stacks/smoke.py vllm-cpu --image evald:judge
+      - name: Ollama stack
+        run: python3 ops/stacks/smoke.py ollama --image evald:judge --model qwen2.5:0.5b
 
   # Each framework recipe (examples/recipes/<name>) run end to end: the framework's real agent
   # loop against the stub provider (no key, no network), its telemetry into a real evald, then

@@ -71,7 +71,8 @@ Every tagged release ships signed + attested artifacts so you can prove what you
 what CI built — the "clean supply chain, no rug-pull" property (contrast the LiteLLM PyPI
 compromise). Alongside the binaries:
 
-- `SHA256SUMS` — checksums, plus `SHA256SUMS.sig` + `SHA256SUMS.pem` (cosign **keyless** signature).
+- `SHA256SUMS` — checksums, plus `SHA256SUMS.sig` + `SHA256SUMS.pem` (cosign **keyless** signature) and, from 0.5, `SHA256SUMS.sigstore.json` (the same signature as a Sigstore bundle, which verifies offline).
+- `evald-airgap-<version>-x86_64-unknown-linux-musl.tar` (from 0.5) — the air-gap bundle: binary, image archive, chart, price table, SBOM, provenance, trusted root and `verify.sh` ([OPERATIONS.md § Air-gapped install and upgrade](docs/OPERATIONS.md#air-gapped-install-and-upgrade)).
 - `evald.sbom.spdx.json` — an SPDX SBOM of the release artifacts.
 - **SLSA build provenance** — a GitHub-native attestation over each archive.
 

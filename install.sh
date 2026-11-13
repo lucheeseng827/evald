@@ -2,7 +2,7 @@
 # Install evald from a GitHub release: download, verify, install. No root needed.
 #
 #   curl -fsSL https://raw.githubusercontent.com/lucheeseng827/evald/main/install.sh | sh
-#   curl -fsSL …/install.sh | sh -s -- --version v0.4.0 --dir /usr/local/bin
+#   curl -fsSL …/install.sh | sh -s -- --version v0.5.0 --dir /usr/local/bin
 #
 # What it does, in order, and stops at the first thing that does not check out:
 #   1. picks the archive for this OS and CPU (Linux → static musl; macOS; Windows users take
@@ -15,7 +15,9 @@
 #
 # Mirrors and air-gapped hosts: EVALD_DOWNLOAD_BASE points it at a directory or URL that
 # holds the same files as a release (evald-<target>.tar.gz, SHA256SUMS, and optionally
-# SHA256SUMS.sig + SHA256SUMS.pem), e.g. an internal artifact store or a file:// path.
+# SHA256SUMS.sigstore.json, or SHA256SUMS.sig + SHA256SUMS.pem), e.g. an internal artifact
+# store or a file:// path. With no network at all, set EVALD_TRUSTED_ROOT to a Sigstore
+# trusted_root.json and the signature bundle is verified offline (the .sig/.pem pair cannot be).
 set -eu
 
 REPO="${EVALD_REPO:-lucheeseng827/evald}"
@@ -98,7 +100,23 @@ actual="$(sha256_of "$tmp/$asset")"
 say "checksum ok"
 
 if command -v cosign >/dev/null 2>&1; then
-  if fetch "$BASE/SHA256SUMS.sig" "$tmp/SHA256SUMS.sig" 2>/dev/null && fetch "$BASE/SHA256SUMS.pem" "$tmp/SHA256SUMS.pem" 2>/dev/null; then
+  if fetch "$BASE/SHA256SUMS.sigstore.json" "$tmp/SHA256SUMS.sigstore.json" 2>/dev/null; then
+    # The Sigstore bundle (0.5 and later) carries its transparency-log proof, so with a trusted
+    # root it needs no network; without one, cosign fetches the root itself.
+    if [ -n "${EVALD_TRUSTED_ROOT:-}" ]; then
+      cosign verify-blob --new-bundle-format --offline --trusted-root "$EVALD_TRUSTED_ROOT" \
+        --bundle "$tmp/SHA256SUMS.sigstore.json" \
+        --certificate-identity-regexp "$IDENTITY" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        "$tmp/SHA256SUMS" >/dev/null 2>&1 || die "SHA256SUMS is not signed by evald's release workflow; refusing to install"
+    else
+      cosign verify-blob --new-bundle-format --bundle "$tmp/SHA256SUMS.sigstore.json" \
+        --certificate-identity-regexp "$IDENTITY" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        "$tmp/SHA256SUMS" >/dev/null 2>&1 || die "SHA256SUMS is not signed by evald's release workflow; refusing to install"
+    fi
+    say "signature ok (signed by evald's release workflow)"
+  elif fetch "$BASE/SHA256SUMS.sig" "$tmp/SHA256SUMS.sig" 2>/dev/null && fetch "$BASE/SHA256SUMS.pem" "$tmp/SHA256SUMS.pem" 2>/dev/null; then
     cosign verify-blob \
       --certificate "$tmp/SHA256SUMS.pem" --signature "$tmp/SHA256SUMS.sig" \
       --certificate-identity-regexp "$IDENTITY" \
@@ -106,7 +124,7 @@ if command -v cosign >/dev/null 2>&1; then
       "$tmp/SHA256SUMS" >/dev/null 2>&1 || die "SHA256SUMS is not signed by evald's release workflow; refusing to install"
     say "signature ok (signed by evald's release workflow)"
   else
-    die "cosign is installed but the release has no SHA256SUMS.sig/.pem to check; refusing to install"
+    die "cosign is installed but the release has no SHA256SUMS.sigstore.json or .sig/.pem to check; refusing to install"
   fi
 else
   say "cosign not installed: checksum verified, signature not checked (docs/OPERATIONS.md § Verify what you pulled)"

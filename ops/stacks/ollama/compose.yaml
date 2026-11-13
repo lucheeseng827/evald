@@ -1,0 +1,53 @@
+# evald + Ollama: a local judge for your evals, and evald to keep the traces and scores.
+#
+#   docker compose up -d --build                              # first build of evald: ~20 min
+#   docker compose exec ollama ollama pull qwen2.5:7b         # the judge model YOU choose
+#   docker compose exec evald evald judge probe --config /stack/judge.yaml
+#   docker compose exec evald evald eval run --config /stack/judge.yaml --data-dir /data/evals
+#
+# evald is built from this checkout with the judge backend (`--features judge`); the published
+# image has none. No model is pulled for you, and none is chosen: judge.yaml names qwen2.5:7b as
+# an example; see docs/JUDGES.md for picking one and checking it on your own labels.
+#
+# Ports are published on 127.0.0.1 only: evald's UI/API and OTLP/HTTP on 4318, OTLP/gRPC on
+# 4317, Ollama on 11434.
+name: evald-ollama
+
+services:
+  ollama:
+    image: docker.io/ollama/ollama:${OLLAMA_VERSION:-0.40.8}
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    # With an NVIDIA GPU and the container toolkit, uncomment to give Ollama the GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  evald:
+    image: ${EVALD_IMAGE:-evald:judge}
+    build:
+      context: ../../..
+      args:
+        FEATURES: judge
+    ports:
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:4317:4317"
+    volumes:
+      - evald-data:/data
+      - ./:/stack:ro
+    environment:
+      EVALD_AUTH_TOKEN: ${EVALD_AUTH_TOKEN:-}
+      # Set to /stack/online.yaml to judge a sample of the live calls evald ingests.
+      EVALD_ONLINE_EVAL: ${EVALD_ONLINE_EVAL:-}
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  ollama-models: {}
+  evald-data: {}

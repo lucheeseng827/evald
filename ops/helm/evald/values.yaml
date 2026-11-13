@@ -1,0 +1,75 @@
+# evald, single node: one pod, one persistent volume. evald is a single writer per store (the
+# store's redb lock is exclusive), so this chart runs exactly one replica and refuses more.
+
+image:
+  repository: docker.io/mancube/evald
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+persistence:
+  size: 20Gi
+  # Empty: the cluster's default StorageClass.
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+
+# Bearer-token gate on every request (OTLP ingest, the API, the UI, /metrics; not the probes).
+# Required before the Service is exposed beyond the cluster (service.type LoadBalancer/NodePort).
+auth:
+  # A Secret you manage, holding one token per line under `key`.
+  existingSecret: ""
+  key: tokens
+  # Or let the chart create one from `token` (16+ printable characters). Prefer existingSecret:
+  # a token in values ends up in the release history.
+  create: false
+  token: ""
+
+service:
+  type: ClusterIP
+  httpPort: 4318
+  grpcPort: 4317
+  # OTLP/gRPC ingest; false serves OTLP/HTTP only.
+  grpc: true
+  annotations: {}
+
+# Automatic retention (`--retention`), e.g. 30d. Empty: evald never deletes data.
+retention: ""
+
+# Extra `serve` flags and environment, e.g. ["--redact", "email,api_key"].
+extraArgs: []
+extraEnv: []
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+# Prometheus Operator scrape of /metrics (needs the ServiceMonitor CRD).
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# The image runs as the distroless nonroot user; fsGroup makes the volume writable to it.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# evald drains on SIGTERM (in-flight requests finish, the WAL is already durable).
+terminationGracePeriodSeconds: 30

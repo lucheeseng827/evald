@@ -23,6 +23,20 @@ use evald::StoreConfig;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Make no outbound connection at all: a judge that would call out fails, naming this flag.
+    /// (The default build has no HTTP client, so it makes none anyway.)
+    #[arg(long, global = true, env = "EVALD_OFFLINE")]
+    offline: bool,
+    /// Only these hosts may be called: a host name, an IP address or a CIDR (repeatable, or
+    /// comma-separated). A host is checked by name or by the addresses it resolves to, and the
+    /// connection is pinned to the address that passed.
+    #[arg(
+        long = "egress-allow",
+        global = true,
+        value_delimiter = ',',
+        env = "EVALD_EGRESS_ALLOW"
+    )]
+    egress_allow: Vec<String>,
 }
 
 // `Serve` carries every server flag and so dwarfs the one-shot variants. Boxing it is the
@@ -187,14 +201,27 @@ enum Cmd {
         /// a connected agent can only read.
         #[arg(long, env = "EVALD_MCP_ALLOW_WRITES")]
         mcp_allow_writes: bool,
+        /// Judge a sample of the model calls this server ingests, from this spec (judges,
+        /// their endpoints, sample rate, daily token cap). Off unless given; needs
+        /// `--features judge`. Ingest never waits on the judge.
+        #[arg(long, value_name = "SPEC", env = "EVALD_ONLINE_EVAL")]
+        online_eval: Option<PathBuf>,
     },
     /// Eval runner subcommands (offline regression loop).
     Eval {
         #[command(subcommand)]
         action: EvalCmd,
     },
+    /// LLM-as-judge endpoints: check one can serve as a judge before an eval relies on it.
+    Judge {
+        #[command(subcommand)]
+        action: JudgeCmd,
+    },
     /// Token-cost attribution report — group the per-span cost + tokens by a dimension.
+    #[command(args_conflicts_with_subcommands = true)]
     Cost {
+        #[command(subcommand)]
+        action: Option<CostCmd>,
         /// Attribution dimension: model | user | session | service | provider.
         #[arg(long, default_value = "model")]
         by: String,
@@ -208,6 +235,61 @@ enum Cmd {
         /// built-in one) instead of showing the costs stored at ingest. Nothing is rewritten.
         #[arg(long = "price-table", env = "EVALD_PRICE_TABLE")]
         price_table: Option<PathBuf>,
+        /// What these model calls would have cost at this hosted model's list price, from their
+        /// own token counts, beside what they cost as stored (the price table's entry for it).
+        #[arg(long, value_name = "MODEL")]
+        reprice_as: Option<String>,
+        /// With --reprice-as: only the calls of this model (repeatable; default every model call).
+        #[arg(long = "model", value_name = "MODEL", requires = "reprice_as")]
+        models: Vec<String>,
+    },
+    /// Send an eval config's dataset prompts to another endpoint and score the answers as a
+    /// run of their own: the candidate run of a migration gate (`eval compare --non-inferior`).
+    /// Each call goes through the egress door. Exits like `eval run`. Needs a `--features
+    /// judge` build.
+    Replay {
+        /// The eval config: its dataset (items need an `id` and an `input`), evaluators, judges
+        /// and thresholds.
+        #[arg(long, default_value = "eval.yaml")]
+        config: PathBuf,
+        /// The endpoint to replay on: a name from the config's `endpoints:`, or openai /
+        /// anthropic.
+        #[arg(
+            long,
+            conflicts_with = "base_url",
+            required_unless_present = "base_url"
+        )]
+        endpoint: Option<String>,
+        /// Or a server given directly, with or without a trailing /v1.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// The API `--base-url` speaks.
+        #[arg(long, default_value = "openai-chat", value_parser = ["openai-chat", "anthropic-messages"])]
+        api: String,
+        /// The variable holding `--base-url`'s key (none: keyless).
+        #[arg(long, requires = "base_url")]
+        api_key_env: Option<String>,
+        /// The model to send the prompts to.
+        #[arg(long)]
+        model: String,
+        /// Directory for durable storage (the candidate run is stored here).
+        #[arg(long, default_value = "evald-data", env = "EVALD_DATA_DIR")]
+        data_dir: PathBuf,
+        /// Also write the candidate dataset (each item with the replay's answer) here, as JSONL.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Judge every candidate item again instead of serving cached judge scores.
+        #[arg(long)]
+        no_cache: bool,
+        /// A price table laid over the built-in one, to price the replay's calls (a self-hosted
+        /// model at its GPU rate: `evald cost gpu-rate` prints the entry).
+        #[arg(long = "price-table", env = "EVALD_PRICE_TABLE")]
+        price_table: Option<PathBuf>,
+    },
+    /// What evald sent over the network: the egress ledger, by destination.
+    Egress {
+        #[command(subcommand)]
+        action: EgressCmd,
     },
     /// Latency percentiles (exact nearest-rank p50/p95/p99) and time-to-first-token over LLM
     /// spans, grouped by a dimension.
@@ -244,6 +326,9 @@ enum Cmd {
         /// The price table `serve` would lay over the built-in one.
         #[arg(long = "price-table", env = "EVALD_PRICE_TABLE")]
         price_table: Option<PathBuf>,
+        /// An eval config whose judge endpoints to probe as well (a `--features judge` build).
+        #[arg(long = "judge-config")]
+        judge_config: Option<PathBuf>,
     },
     /// Print the configuration that points a tool at this evald: `claude-code`, `codex`,
     /// `gemini-cli`, `otel-app` (any OpenTelemetry-instrumented app) or `collector` (an OTel
@@ -370,6 +455,11 @@ enum Cmd {
         /// Report what would change without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// The upgrade preflight: can this evald take over the data-dir (its on-disk format,
+        /// whether a running evald holds it, free space)? Writes nothing; exits 1 when it
+        /// cannot. Run the new binary's `migrate --check` before switching to it.
+        #[arg(long, conflicts_with = "dry_run")]
+        check: bool,
     },
     /// Print the evald version.
     Version,
@@ -457,6 +547,96 @@ enum DatasetCmd {
         /// Output JSONL path (writes to stdout when omitted).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Label each row's `metadata.language` with the language its prompt is in (an
+        /// embedded detector; Malay and Indonesian are both `ms`), so runs report by language.
+        #[arg(long)]
+        detect_language: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum JudgeCmd {
+    /// Probe an endpoint: reachable, the model listed, structured output, three identical judge
+    /// calls (repeatable?), latency, usage reported. Exits 1 when an endpoint cannot judge.
+    /// Needs a `--features judge` build.
+    Probe {
+        /// An eval config: probe each endpoint its judges call, with that judge's model.
+        #[arg(long, conflicts_with = "base_url")]
+        config: Option<PathBuf>,
+        /// Only this endpoint (a name from the config's `endpoints:`, or anthropic / openai).
+        #[arg(long, requires = "config")]
+        endpoint: Option<String>,
+        /// Or probe a server directly, with or without a trailing /v1.
+        #[arg(long, requires = "model")]
+        base_url: Option<String>,
+        /// The API `--base-url` speaks.
+        #[arg(long, default_value = "openai-chat", value_parser = ["openai-chat", "anthropic-messages"])]
+        api: String,
+        /// The model to probe `--base-url` with.
+        #[arg(long)]
+        model: Option<String>,
+        /// The variable holding `--base-url`'s key (none: keyless).
+        #[arg(long)]
+        api_key_env: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EgressCmd {
+    /// Every host evald called (and every call its egress door refused) in a window, with its
+    /// address, the endpoint's jurisdiction label, purpose, calls and bytes each way.
+    Report {
+        /// The window, ending now: `30d`, `24h`, `90m`, or seconds.
+        #[arg(long, default_value = "30d", value_parser = parse_retention)]
+        since: Duration,
+        /// Directory for durable storage (the ledger is part of the store).
+        #[arg(long, default_value = "evald-data", env = "EVALD_DATA_DIR")]
+        data_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum CostCmd {
+    /// A per-token rate for a model you serve yourself: what its GPUs cost over a window, spread
+    /// over the tokens your own traffic used in it (the stored model calls). Prints the
+    /// price-table overlay entry to paste.
+    GpuRate {
+        /// What one GPU costs per hour, in USD (rented, or your amortised figure).
+        #[arg(long)]
+        gpu_hour_usd: f64,
+        /// GPUs serving these models.
+        #[arg(long, default_value_t = 1)]
+        gpus: u32,
+        /// The model(s) those GPUs serve, as the calls name them (repeatable).
+        #[arg(long = "model", value_name = "MODEL", required = true)]
+        models: Vec<String>,
+        /// The window: `7d`, `24h`, `90m`, or seconds.
+        #[arg(long, default_value = "7d", value_parser = parse_retention)]
+        since: Duration,
+        /// How many input tokens' worth of GPU time one output token costs (decode is slower
+        /// than prefill per token). 1 gives one blended rate.
+        #[arg(long, default_value_t = 1.0)]
+        output_ratio: f64,
+        /// Directory for durable storage (the model calls to count).
+        #[arg(long, default_value = "evald-data", env = "EVALD_DATA_DIR")]
+        data_dir: PathBuf,
+    },
+    /// The language tax: tokens per character of model answers, by the language they are in
+    /// and the model, from the stored calls. What each tokenizer charges for Malay, Thai or
+    /// Tamil before you choose a model.
+    LanguageTax {
+        /// The window: `30d`, `24h`, `90m`, or seconds.
+        #[arg(long, default_value = "30d", value_parser = parse_retention)]
+        since: Duration,
+        /// Only these models (repeatable; default every model call).
+        #[arg(long = "model", value_name = "MODEL")]
+        models: Vec<String>,
+        /// The most recent answers to read.
+        #[arg(long, default_value_t = 20_000)]
+        limit: usize,
+        /// Directory for durable storage (the model calls to read).
+        #[arg(long, default_value = "evald-data", env = "EVALD_DATA_DIR")]
+        data_dir: PathBuf,
     },
 }
 
@@ -478,6 +658,15 @@ enum EvalCmd {
         /// threshold fails or the run errors; the exit code is unchanged).
         #[arg(long, value_name = "PATH")]
         junit: Option<PathBuf>,
+        /// Judge every item again instead of serving cached judge scores: a repeat run, for
+        /// `eval calibrate --runs` to measure the judge's stability over.
+        #[arg(long)]
+        no_cache: bool,
+        /// Also write the run as a versioned JSON report here (`evald.report/v1`,
+        /// docs/schemas/report-v1.schema.json), for a pipeline to read. Written even when the
+        /// run fails or errors; the exit code is unchanged.
+        #[arg(long, value_name = "PATH")]
+        report_json: Option<PathBuf>,
     },
     /// Diff two runs' aggregate scores by evaluator (mean delta + regression gate).
     Compare {
@@ -494,7 +683,8 @@ enum EvalCmd {
         /// How far an evaluator may drop (B below A) before it counts as a regression.
         #[arg(long, default_value_t = 0.0, value_parser = parse_tolerance)]
         tolerance: f64,
-        /// Gate only on *statistically significant* regressions (Welch's t): a drop beyond
+        /// Gate only on *statistically significant* regressions (a paired t-test when both runs
+        /// scored the same items, by item id, else Welch's): a drop beyond
         /// `--tolerance` fails the build only when the `(1 - --alpha)` confidence interval
         /// proves it is more than sampling noise. Without this, `--fail-on-regression` gates
         /// on the raw delta. Always prints the p-value + CI when the runs carry stats.
@@ -507,6 +697,24 @@ enum EvalCmd {
         /// exactly when the gate fails; written even then, and the exit code is unchanged).
         #[arg(long, value_name = "PATH")]
         junit: Option<PathBuf>,
+        /// Gate on non-inferiority: exit non-zero unless every shared evaluator is shown, by a
+        /// one-sided paired test at `--alpha`, no worse in run B than in run A by more than
+        /// `--margin`. An inconclusive result fails. Reported per slice too (item metadata).
+        #[arg(long, requires = "margin")]
+        non_inferior: bool,
+        /// The largest drop (B below A, on the evaluator's own scale) you accept as "no worse".
+        /// Required with --non-inferior, never defaulted: it is your decision, not evald's.
+        #[arg(long, requires = "non_inferior", value_parser = parse_margin)]
+        margin: Option<f64>,
+        /// Price both runs' replays at this table's rates (over the built-in one), from their
+        /// recorded tokens: a self-hosted model at its GPU rate.
+        #[arg(long = "price-table", env = "EVALD_PRICE_TABLE")]
+        price_table: Option<PathBuf>,
+        /// Also write the comparison as a versioned JSON report here (`evald.report/v1`):
+        /// every delta, test, verdict and gate. Written even when the gate fails or the
+        /// comparison errors; the exit code is unchanged.
+        #[arg(long, value_name = "PATH")]
+        report_json: Option<PathBuf>,
     },
     /// Calibrate an LLM-as-judge against human annotations on the same spans (bias + agreement).
     Calibrate {
@@ -530,7 +738,24 @@ enum EvalCmd {
         /// Exit non-zero when the judge needs recalibration (CI gate against judge drift).
         #[arg(long)]
         fail_on_divergence: bool,
+        /// The pass/fail line for the agreement (Cohen's kappa) and stability figures: a score
+        /// at or above it passes, for the judge and the human alike.
+        #[arg(long, default_value_t = 0.5, value_parser = parse_unit)]
+        pass_threshold: f64,
+        /// Repeat runs of this judge on the same items (`eval run --no-cache`), comma-separated:
+        /// report how stable its scores and verdicts were across them.
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        runs: Vec<String>,
     },
+}
+
+/// Parse a score in `[0, 1]`.
+fn parse_unit(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("must be between 0 and 1 (got {s:?})"));
+    }
+    Ok(v)
 }
 
 /// Parse `--tolerance`, rejecting negative / non-finite values. A negative tolerance would
@@ -542,6 +767,15 @@ fn parse_tolerance(s: &str) -> Result<f64, String> {
         return Err(format!(
             "--tolerance must be a finite value >= 0.0 (got {s:?})"
         ));
+    }
+    Ok(v)
+}
+
+/// Parse `--margin`, the non-inferiority margin: a positive, finite drop.
+fn parse_margin(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if !v.is_finite() || v <= 0.0 {
+        return Err(format!("--margin must be a finite value > 0 (got {s:?})"));
     }
     Ok(v)
 }
@@ -607,7 +841,9 @@ fn unset_empty_evald_vars() {
 }
 
 async fn run() -> anyhow::Result<()> {
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    evald::egress::configure(evald::egress::Policy::new(cli.offline, &cli.egress_allow)?);
+    match cli.cmd {
         Cmd::Serve {
             otlp_http,
             otlp_grpc,
@@ -637,6 +873,7 @@ async fn run() -> anyhow::Result<()> {
             metrics_model_cap,
             logs,
             mcp_allow_writes,
+            online_eval,
         } => {
             evald::init_tracing();
             // `EVALD_AUTH_TOKEN` is read HERE, not via a clap `env` fallback, so it UNIONS with
@@ -737,7 +974,7 @@ async fn run() -> anyhow::Result<()> {
             let mcp = evald::mcp::Access {
                 writes: mcp_allow_writes,
             };
-            evald::ingest::serve(addr, grpc_addr, data_dir, config, auth, mcp).await?;
+            evald::ingest::serve(addr, grpc_addr, data_dir, config, auth, mcp, online_eval).await?;
         }
         Cmd::Eval { action } => match action {
             EvalCmd::Run {
@@ -745,14 +982,21 @@ async fn run() -> anyhow::Result<()> {
                 data_dir,
                 estimate,
                 junit,
+                no_cache,
+                report_json,
             } => {
                 evald::init_tracing();
                 if estimate {
                     evald::eval::estimate_command(&config, &data_dir)?;
                 } else {
-                    let passed =
-                        evald::eval::run_command_junit(&config, &data_dir, junit.as_deref())
-                            .await?;
+                    let passed = evald::eval::run_command_junit(
+                        &config,
+                        &data_dir,
+                        junit.as_deref(),
+                        report_json.as_deref(),
+                        no_cache,
+                    )
+                    .await?;
                     if !passed {
                         // CI gate: a regressed threshold exits non-zero.
                         std::process::exit(1);
@@ -768,8 +1012,14 @@ async fn run() -> anyhow::Result<()> {
                 significance,
                 alpha,
                 junit,
+                non_inferior,
+                margin,
+                price_table,
+                report_json,
             } => {
                 evald::init_tracing();
+                evald::price::install(price_table.as_deref())
+                    .map_err(|e| anyhow::anyhow!("price table: {e:#}"))?;
                 let passed = evald::eval::compare_command_junit(
                     &run_a,
                     &run_b,
@@ -779,12 +1029,16 @@ async fn run() -> anyhow::Result<()> {
                         tolerance,
                         significance,
                         alpha,
+                        non_inferior_margin: margin.filter(|_| non_inferior),
+                        reprice: price_table.is_some(),
                     },
                     junit.as_deref(),
+                    report_json.as_deref(),
                 )
                 .await?;
                 if !passed {
-                    // CI gate: a regressed evaluator (with --fail-on-regression) exits non-zero.
+                    // CI gate: a regressed evaluator (with --fail-on-regression), or one not
+                    // shown non-inferior (with --non-inferior), exits non-zero.
                     std::process::exit(1);
                 }
             }
@@ -795,6 +1049,8 @@ async fn run() -> anyhow::Result<()> {
                 alpha,
                 threshold,
                 fail_on_divergence,
+                pass_threshold,
+                runs,
             } => {
                 evald::init_tracing();
                 let passed = evald::calibrate::calibrate_command(
@@ -804,6 +1060,8 @@ async fn run() -> anyhow::Result<()> {
                     alpha,
                     threshold,
                     fail_on_divergence,
+                    pass_threshold,
+                    &runs,
                 )?;
                 if !passed {
                     // CI gate: judge has drifted from the human ground truth (--fail-on-divergence).
@@ -811,15 +1069,114 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         },
+        Cmd::Replay {
+            config,
+            endpoint,
+            base_url,
+            api,
+            api_key_env,
+            model,
+            data_dir,
+            out,
+            no_cache,
+            price_table,
+        } => {
+            evald::init_tracing();
+            evald::price::install(price_table.as_deref())
+                .map_err(|e| anyhow::anyhow!("price table: {e:#}"))?;
+            let target = match (endpoint, base_url) {
+                (Some(name), _) => evald::eval::ReplayTarget::Named(name),
+                (None, Some(base_url)) => evald::eval::ReplayTarget::Url {
+                    base_url,
+                    api,
+                    api_key_env,
+                },
+                (None, None) => anyhow::bail!("give --endpoint <name>, or --base-url"),
+            };
+            let passed = evald::eval::replay_command(
+                &config,
+                &target,
+                &model,
+                &data_dir,
+                no_cache,
+                out.as_deref(),
+            )
+            .await?;
+            if !passed {
+                // Like `eval run`: a missed threshold exits non-zero.
+                std::process::exit(1);
+            }
+        }
+        Cmd::Egress {
+            action: EgressCmd::Report { since, data_dir },
+        } => {
+            evald::init_tracing();
+            evald::egress::report_command(&data_dir, since).await?;
+        }
         Cmd::Cost {
+            action:
+                Some(CostCmd::GpuRate {
+                    gpu_hour_usd,
+                    gpus,
+                    models,
+                    since,
+                    output_ratio,
+                    data_dir,
+                }),
+            ..
+        } => {
+            evald::init_tracing();
+            evald::cost::gpu_rate_command(
+                &data_dir,
+                &models,
+                since,
+                gpus,
+                gpu_hour_usd,
+                output_ratio,
+            )
+            .await?;
+        }
+        Cmd::Cost {
+            action:
+                Some(CostCmd::LanguageTax {
+                    since,
+                    models,
+                    limit,
+                    data_dir,
+                }),
+            ..
+        } => {
+            evald::init_tracing();
+            evald::cost::language_tax_command(&data_dir, since, &models, limit).await?;
+        }
+        Cmd::Cost {
+            action: None,
             by,
             data_dir,
             limit,
             price_table,
+            reprice_as,
+            models,
         } => {
             evald::init_tracing();
             let dimension = evald::cost::Dimension::parse(&by)?;
-            evald::cost::cost_command(dimension, &data_dir, limit, price_table.as_deref()).await?;
+            match reprice_as {
+                Some(hosted) => {
+                    evald::cost::reprice_as_command(
+                        dimension,
+                        &data_dir,
+                        limit,
+                        price_table.as_deref(),
+                        &hosted,
+                        &models,
+                    )
+                    .await?
+                }
+                None => {
+                    evald::cost::cost_command(dimension, &data_dir, limit, price_table.as_deref())
+                        .await?
+                }
+            }
         }
         Cmd::Demo { data_dir } => {
             evald::init_tracing();
@@ -842,22 +1199,71 @@ async fn run() -> anyhow::Result<()> {
             otlp_http,
             otlp_grpc,
             price_table,
+            judge_config,
         } => {
             // The same sources `serve` reads its tokens from (the flag is serve's own).
             let auth_configured = std::env::var("EVALD_AUTH_TOKEN")
                 .is_ok_and(|v| !v.trim().is_empty())
                 || std::env::var_os("EVALD_AUTH_TOKEN_FILE").is_some();
-            let checks = evald::doctor::run_checks(&evald::doctor::Setup {
+            let mut checks = evald::doctor::run_checks(&evald::doctor::Setup {
                 data_dir: &data_dir,
                 otlp_http: &otlp_http,
                 otlp_grpc: &otlp_grpc,
                 auth_configured,
                 price_table: price_table.as_deref(),
             });
+            if let Some(cfg) = &judge_config {
+                for (ep, model) in evald::eval::judge_probe_targets(cfg, None)? {
+                    match evald::judge::probe(&ep, &model).await {
+                        Ok(report) => checks.extend(evald::doctor::probe_checks(&report)),
+                        Err(e) => {
+                            checks.push(evald::doctor::judge_unprobed(format!("{e:#}")));
+                            break;
+                        }
+                    }
+                }
+            }
             if !evald::doctor::print(&checks) {
                 std::process::exit(1);
             }
         }
+        Cmd::Judge { action } => match action {
+            JudgeCmd::Probe {
+                config,
+                endpoint,
+                base_url,
+                api,
+                model,
+                api_key_env,
+            } => {
+                let targets = match (config, base_url) {
+                    (Some(cfg), None) => {
+                        evald::eval::judge_probe_targets(&cfg, endpoint.as_deref())?
+                    }
+                    (None, Some(base_url)) => {
+                        let spec: evald::endpoint::EndpointSpec =
+                            serde_json::from_value(serde_json::json!({
+                                "name": "probe",
+                                "api": api,
+                                "base_url": base_url,
+                                "api_key_env": api_key_env,
+                            }))?;
+                        let model = model.unwrap_or_default();
+                        vec![(spec.resolve(std::path::Path::new("."))?, model)]
+                    }
+                    _ => anyhow::bail!("give --config <eval.yaml>, or --base-url with --model"),
+                };
+                let mut usable = true;
+                for (ep, model) in targets {
+                    let report = evald::judge::probe(&ep, &model).await?;
+                    evald::judge::print_probe(&report);
+                    usable &= report.usable();
+                }
+                if !usable {
+                    std::process::exit(1);
+                }
+            }
+        },
         Cmd::Connect {
             tool,
             otlp_http,
@@ -965,6 +1371,7 @@ async fn run() -> anyhow::Result<()> {
                 model,
                 limit,
                 out,
+                detect_language,
             } => {
                 evald::init_tracing();
                 let store = evald::Store::open(
@@ -981,6 +1388,7 @@ async fn run() -> anyhow::Result<()> {
                         trace_id,
                         model,
                         limit,
+                        detect_language,
                     },
                     out.as_deref(),
                 )?;
@@ -1127,7 +1535,46 @@ async fn run() -> anyhow::Result<()> {
                 );
             }
         }
-        Cmd::Migrate { data_dir, dry_run } => {
+        Cmd::Migrate {
+            data_dir,
+            check: true,
+            ..
+        } => {
+            use evald::store::format::{preflight, CheckLevel};
+            let checks = preflight(&data_dir);
+            println!(
+                "evald migrate --check — can evald {} take over {}? (nothing is written)",
+                env!("CARGO_PKG_VERSION"),
+                data_dir.display()
+            );
+            for c in &checks {
+                let tag = match c.level {
+                    CheckLevel::Ok => "ok",
+                    CheckLevel::Warn => "warn",
+                    CheckLevel::Fail => "fail",
+                };
+                println!("  {tag:<5} {:<7} {}", c.name, c.detail);
+            }
+            if checks.iter().any(|c| c.level == CheckLevel::Fail) {
+                println!("not ready: this evald cannot take over the data-dir.");
+                std::process::exit(1);
+            }
+            let held = checks
+                .iter()
+                .any(|c| c.name == "in use" && c.level == CheckLevel::Warn);
+            println!(
+                "ready: evald {} can take over this data-dir{}.",
+                env!("CARGO_PKG_VERSION"),
+                if held {
+                    " once the running evald is stopped"
+                } else {
+                    ""
+                }
+            );
+        }
+        Cmd::Migrate {
+            data_dir, dry_run, ..
+        } => {
             evald::init_tracing();
             use evald::store::format::{self, FormatState};
             match format::inspect(&data_dir)

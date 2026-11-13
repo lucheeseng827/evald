@@ -1,0 +1,16 @@
+# An eval whose judge runs on the stack's Ollama. Change `model:` to the model you pulled.
+name: ollama-judge
+dataset: ./dataset.jsonl
+endpoints:
+  - name: ollama
+    api: openai-chat
+    base_url: http://ollama:11434/v1
+    # Ollama answers one request at a time per model by default; more in flight only queue.
+    max_in_flight: 1
+    timeout_secs: 300
+judges:
+  - rail: qa_correctness
+    endpoint: ollama
+    model: qwen2.5:7b
+thresholds:
+  judge_qa_correctness: 0.7

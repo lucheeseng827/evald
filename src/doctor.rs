@@ -5,8 +5,10 @@
 //! not as intended. The exit code is `1` when any check fails (a gate, like the others),
 //! `0` otherwise.
 //!
-//! Nothing here connects anywhere. A port is checked by binding it, and the data dir by
-//! writing a probe file into it; neither touches a running server or its store.
+//! Nothing here connects anywhere, except `--judge-config`: that probes the judge endpoints an
+//! eval config names (a `--features judge` build; see [`crate::judge::probe`]). A port is checked
+//! by binding it, and the data dir by writing a probe file into it; neither touches a running
+//! server or its store.
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -52,6 +54,50 @@ impl Check {
         self.fix = Some(fix.into());
         self
     }
+}
+
+/// A `judge probe` report as checks, one per finding, the endpoint named in each.
+pub fn probe_checks(r: &crate::judge::ProbeReport) -> Vec<Check> {
+    use crate::judge::ProbeLevel;
+    r.findings()
+        .into_iter()
+        .map(|(level, name, detail)| {
+            let name = match name {
+                "reachable" => "judge reachable",
+                "model" => "judge model",
+                "calls" => "judge calls",
+                "scores" => "judge scores",
+                "structured output" => "judge format",
+                "deterministic" => "judge stable",
+                "latency" => "judge latency",
+                "usage" => "judge usage",
+                _ => "judge",
+            };
+            let level = match level {
+                ProbeLevel::Ok => Level::Ok,
+                ProbeLevel::Warn => Level::Warn,
+                ProbeLevel::Fail => Level::Fail,
+            };
+            let c = check(
+                name,
+                level,
+                format!("{} ({}): {detail}", r.endpoint, r.model),
+            );
+            if level == Level::Fail {
+                c.fix(format!(
+                    "evald judge probe --config <eval.yaml> --endpoint {} shows the whole report",
+                    r.endpoint
+                ))
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// A judge config was given, but its endpoints could not be probed.
+pub fn judge_unprobed(reason: impl Into<String>) -> Check {
+    check("judge", Level::Warn, reason)
 }
 
 /// What `serve` would be started with.
@@ -287,7 +333,11 @@ fn outbound_check() -> Check {
         check(
             "outbound calls",
             Level::Ok,
-            "the judge feature is built in: evald calls a provider only when you run a judge",
+            format!(
+                "the judge feature is built in: evald calls a provider only when you run a \
+                 judge; egress: {}",
+                crate::egress::policy().describe()
+            ),
         )
     } else {
         check(

@@ -8,7 +8,7 @@ JSONL dataset, get scores keyed to the exact span. No database, no Python runtim
 no container required — a single static musl binary that runs on your laptop or
 inside a locked-down CI runner.
 
-> **Status: v0.4.0.** `evald serve` runs an OTLP/HTTP receiver on
+> **Status: v0.5.0.** `evald serve` runs an OTLP/HTTP receiver on
 > `:4318` that accepts `POST /v1/traces` in **both** protobuf (gzip-aware) and
 > **OTLP-JSON**, **normalizes** each span into one model unifying the OpenInference and
 > `gen_ai.*` conventions, and **durably stores** it through a real two-tier engine: a
@@ -30,9 +30,11 @@ inside a locked-down CI runner.
 > persisted aggregates back and **diffs two runs by evaluator** — with `--fail-on-regression
 > [--tolerance]` it's a second CI gate that fails the build when a run gets worse, and with
 > **`--significance`** that gate is **statistically honest**: a drop fails the build only when
-> a dependency-free **Welch's two-sample t-test** shows the `(1 − α)` confidence interval
-> excludes zero — so sampling noise on a small dataset doesn't flag a phantom regression (the
-> aggregate Score carries the per-run n/mean/variance for the test). The MVP pieces are all in:
+> a dependency-free t-test shows the `(1 − α)` confidence interval excludes zero — so sampling
+> noise on a small dataset doesn't flag a phantom regression. When both runs scored the same
+> items (matched by item `id`) the test is **paired** on the per-item differences, which sees a
+> real change that an unpaired test calls noise; otherwise it is Welch's, and the output says
+> which and why. The MVP pieces are all in:
 > **DataFusion SQL over the Parquet blocks** (`POST /v1/sql` + `evald query`, with `spans` ∪
 > `scores` tables so the OTel-native join is one query away), and the **embedded SPA**
 > (rust-embed — trace list → trace tree → scores, plus a SQL console; bundled into the binary,
@@ -104,7 +106,7 @@ docker run -d -p 127.0.0.1:4318:4318 -p 127.0.0.1:4317:4317 -v evald-data:/data 
 ```
 
 - **Windows:** `evald-x86_64-pc-windows-msvc.zip` from the [releases](https://github.com/lucheeseng827/evald/releases).
-- **A pinned version:** `… | sh -s -- --version v0.4.0`, or `--dir /usr/local/bin` for another location.
+- **A pinned version:** `… | sh -s -- --version v0.5.0`, or `--dir /usr/local/bin` for another location.
 - **Air-gapped or behind a mirror:** copy a release's files (`evald-<target>.tar.gz`, `SHA256SUMS`,
   `SHA256SUMS.sig`, `SHA256SUMS.pem`) to an internal store, then
   `EVALD_DOWNLOAD_BASE=<directory or URL> sh install.sh`.
@@ -187,8 +189,9 @@ evald eval compare run_a run_b          # ✅ diff two runs' aggregates by evalu
 evald eval compare run_a run_b --fail-on-regression --tolerance 0.02
 #                                       # ✅ exit-nonzero if a run regressed > tolerance
 evald eval compare run_a run_b --fail-on-regression --significance --alpha 0.05
-#   ✅ statistically honest gate: a drop fails CI only when Welch's t shows it's beyond
+#   ✅ statistically honest gate: a drop fails CI only when a t-test shows it's beyond
 #      sampling noise (the 95% CI on the delta excludes 0) — small-dataset noise won't flag.
+#      Paired (plus a bootstrap CI) when both runs scored the same item ids, else Welch's.
 evald eval run --config eval.yaml --junit report.xml
 #   ✅ --junit (also on `eval compare` and `suite run`) writes a JUnit XML report that CI test tabs
 #      render — written even when the gate fails; the exit code is unchanged (docs/CONFIG.md).
@@ -202,6 +205,11 @@ evald eval run --config examples/eval/judge.yaml --data-dir /tmp/evald          
 #          context_precision · context_recall · toxicity · bias.
 #   --estimate previews token+cost offline (no key, no call). Judge means flow through the same
 #   threshold gate + significance as Tier-1; re-runs are free (cached in judge_cache.redb).
+#   Or judge on your own server (vLLM, Ollama, llama.cpp, TGI): an `endpoints:` entry in the
+#   config, no key. Check it can judge first:
+evald judge probe --base-url http://localhost:11434/v1 --model qwen2.5:7b
+#   Which open-weight judge to try, and how to check it on your own labels: docs/JUDGES.md.
+#   evald beside Ollama or vLLM in one command: ops/stacks/. One node on Kubernetes: ops/helm/evald.
 
 # 5c. calibrate a judge against your own human labels — measure trust (✅ today, OFFLINE, no key)
 evald eval calibrate --judge judge_g_eval --data-dir /tmp/evald
@@ -256,7 +264,7 @@ curl -s localhost:4318/v1/sessions                       # the three sessions, r
 # kill -9 the server and start it again: everything is still there (fsynced before each ACK).
 ```
 
-**Gate CI on it:** `uses: lucheeseng827/evald@v0.4.0` with `config: evals/eval.yaml` installs a pinned
+**Gate CI on it:** `uses: lucheeseng827/evald@v0.5.0` with `config: evals/eval.yaml` installs a pinned
 evald, runs the eval, writes the JUnit report and the job summary, and fails the job when the gate
 does ([`docs/CONFIG.md` § The GitHub Action](./docs/CONFIG.md#the-github-action)).
 

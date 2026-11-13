@@ -15,6 +15,16 @@ use serde_json::Value as Json;
 
 use crate::model::{Dialect, NormalizedSpan, Tokens};
 
+/// The OpenTelemetry semantic-conventions release whose GenAI attributes this mapping is written
+/// against: `gen_ai.provider.name`, `gen_ai.{input,output}.messages`, `gen_ai.usage.*_tokens`.
+/// The keys earlier releases used (`gen_ai.system`, `gen_ai.usage.prompt_tokens`, the indexed
+/// `gen_ai.prompt.{i}.*`) are still read, so an instrumentation on either side of
+/// `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental` lands the same normalized span. A
+/// span from a NEWER release still normalizes: what this mapping knows is read, every other
+/// attribute is kept as sent (and queryable, `attr()`), and its `schema_url` is kept as
+/// `otel.schema_url`. Raising this pin is a reviewed change with its own tests.
+pub const SEMCONV_VERSION: &str = "1.38.0";
+
 /// Flatten an export request (ResourceSpans → ScopeSpans → Span) into normalized
 /// spans, threading resource (`service.name`) and scope (name/version) context down.
 pub fn normalize_request(req: &ExportTraceServiceRequest) -> Vec<NormalizedSpan> {
@@ -205,6 +215,8 @@ pub fn normalize_span(
     // Agent and tool spans: canonical keys, and an in-process agent's aggregate usage set aside
     // so it is not counted (or priced) a second time.
     crate::agent::normalize(&mut normalized);
+    // An inference server's own span of a call the app also traced: its usage is a copy.
+    crate::vllm::normalize(&mut normalized);
     normalized
 }
 
@@ -805,6 +817,108 @@ mod tests {
         assert_eq!(n.model.as_deref(), Some("42"));
         assert_eq!(n.provider.as_deref(), Some("true"));
         assert_eq!(n.session_id.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn the_two_shapes_semconv_stability_opt_in_switches_between_normalize_alike() {
+        // The default shape (`OTEL_SEMCONV_STABILITY_OPT_IN` unset): the deprecated provider key,
+        // legacy token names, the indexed prompt and completion.
+        let default = norm(vec![
+            s("gen_ai.operation.name", "chat"),
+            s("gen_ai.system", "openai"),
+            s("gen_ai.request.model", "gpt-4o-mini"),
+            i("gen_ai.usage.prompt_tokens", 12),
+            i("gen_ai.usage.completion_tokens", 3),
+            s("gen_ai.prompt.0.role", "user"),
+            s("gen_ai.prompt.0.content", "hi there"),
+            s("gen_ai.completion.0.role", "assistant"),
+            s("gen_ai.completion.0.content", "hello back"),
+        ]);
+        // `gen_ai_latest_experimental`: the provider key, token names and structured messages
+        // (with `parts`) of the current conventions.
+        let latest = norm(vec![
+            s("gen_ai.operation.name", "chat"),
+            s("gen_ai.provider.name", "openai"),
+            s("gen_ai.request.model", "gpt-4o-mini"),
+            i("gen_ai.usage.input_tokens", 12),
+            i("gen_ai.usage.output_tokens", 3),
+            s(
+                "gen_ai.input.messages",
+                r#"[{"role":"user","parts":[{"type":"text","content":"hi there"}]}]"#,
+            ),
+            s(
+                "gen_ai.output.messages",
+                r#"[{"role":"assistant","parts":[{"type":"text","content":"hello back"}],"finish_reason":"stop"}]"#,
+            ),
+        ]);
+        for n in [&default, &latest] {
+            assert_eq!(n.provider.as_deref(), Some("openai"));
+            assert_eq!(n.model.as_deref(), Some("gpt-4o-mini"));
+            assert_eq!((n.tokens.prompt, n.tokens.completion), (Some(12), Some(3)));
+            assert_eq!(n.oi_kind.as_deref(), Some("LLM"));
+            assert!(
+                n.input_value.as_deref().unwrap().contains("hi there"),
+                "{n:?}"
+            );
+            assert!(
+                n.output_value.as_deref().unwrap().contains("hello back"),
+                "{n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_span_carrying_both_shapes_counts_once() {
+        // A "dup" emission (old and new keys together, as `http/dup` does for HTTP): one call,
+        // its tokens counted once, the current key preferred, the HTTP keys kept as sent.
+        let n = norm(vec![
+            s("gen_ai.system", "anthropic"),
+            s("gen_ai.provider.name", "anthropic"),
+            i("gen_ai.usage.prompt_tokens", 40),
+            i("gen_ai.usage.input_tokens", 40),
+            i("gen_ai.usage.completion_tokens", 7),
+            i("gen_ai.usage.output_tokens", 7),
+            s("http.method", "POST"),
+            s("http.request.method", "POST"),
+        ]);
+        assert_eq!(n.provider.as_deref(), Some("anthropic"));
+        assert_eq!((n.tokens.prompt, n.tokens.completion), (Some(40), Some(7)));
+        assert_eq!(n.raw_attributes["http.method"], "POST");
+        assert_eq!(n.raw_attributes["http.request.method"], "POST");
+    }
+
+    #[test]
+    fn a_span_from_a_newer_semconv_still_normalizes_and_keeps_what_it_does_not_know() {
+        use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans};
+        let future = "https://opentelemetry.io/schemas/1.99.0";
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![span_with(vec![
+                        s("gen_ai.provider.name", "openai"),
+                        s("gen_ai.request.model", "gpt-9"),
+                        i("gen_ai.usage.input_tokens", 5),
+                        // Keys this mapping has never seen.
+                        i("gen_ai.usage.thinking_tokens", 99),
+                        s("gen_ai.request.reasoning.effort", "high"),
+                    ])],
+                    schema_url: future.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let n = &normalize_request(&req)[0];
+        assert_eq!(n.model.as_deref(), Some("gpt-9"));
+        assert_eq!(n.tokens.prompt, Some(5));
+        assert_eq!(n.raw_attributes["gen_ai.usage.thinking_tokens"], 99);
+        assert_eq!(n.raw_attributes["gen_ai.request.reasoning.effort"], "high");
+        assert_eq!(n.raw_attributes["otel.schema_url"], future);
+        assert!(
+            SEMCONV_VERSION.split('.').count() == 3,
+            "a pinned release, x.y.z"
+        );
     }
 
     #[test]

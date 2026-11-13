@@ -87,6 +87,18 @@ evald serve --data-dir /var/lib/evald            # loopback :4318
 - Container images: see [`docs/DOCKERHUB.md`](./DOCKERHUB.md) and the
   [`Dockerfile`](../Dockerfile)s. From 0.4.0 `docker run mancube/evald` serves on both
   ports into the `/data` volume; the images are cosign-signed (verify below).
+  `docker build --build-arg FEATURES=judge .` builds one with the LLM-as-judge backend.
+- **Kubernetes, one node:** [`ops/helm/evald`](../ops/helm/evald) is a StatefulSet of exactly
+  one pod with its store on a PersistentVolume, probes on `/healthz` and `/readyz` (outside the
+  auth gate), the bearer tokens mounted from a Secret as a file, and an optional ServiceMonitor.
+  It refuses what would come up healthy and wrong: a second replica (the store's lock is
+  exclusive), or a LoadBalancer or NodePort Service with no auth.
+  `helm install evald ops/helm/evald --set auth.existingSecret=evald-tokens`.
+  [`ops/helm/validate.sh`](../ops/helm/validate.sh) asserts every render and every refusal, and
+  CI installs the chart on kind: a span ingested, read back, and read again after the pod is
+  replaced. More than one node is a fleet, which is a different product.
+- **Beside your own model server:** [`ops/stacks`](../ops/stacks) runs evald with Ollama, or
+  with vLLM, an OpenTelemetry Collector, Prometheus and Grafana, one command each.
 
 ### Verify what you pulled
 
@@ -126,8 +138,29 @@ signature, so a valid signature from some other identity fails rather than passe
 An SBOM (SPDX) is published alongside each release if you need to audit the dependency
 set rather than the build.
 
-**Air-gapped?** Keyless verification contacts the transparency log, so do steps 2 and 3
-on a connected host and carry the verified archive across, rather than skipping them.
+**Air-gapped?** The `.sig` + `.pem` pair above cannot be verified offline: the certificate
+expired ten minutes after signing, and only the transparency log says it was valid then. From
+0.5 each release also signs `SHA256SUMS` into a Sigstore bundle, `SHA256SUMS.sigstore.json`,
+which carries that proof, so it verifies with no network given a Sigstore trusted root:
+
+```bash
+# on a connected machine, once: the trusted root, through cosign's own TUF client
+cosign initialize   # then copy trusted_root.json from ~/.sigstore/root/targets/ (cosign 2)
+                    # or ~/.sigstore/root/tuf-repo-cdn.sigstore.dev/targets/ (cosign 3)
+
+# on the air-gapped machine (cosign 2.4 or later)
+cosign verify-blob --offline --new-bundle-format --trusted-root trusted_root.json \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/lucheeseng827/evald/\.github/workflows/release\.yml@.+' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+```
+
+This was measured before it was built on: with no network interface at all, a keyless bundle
+plus the trusted root verifies, and a tampered file is refused; without the trusted root, or
+with the `.sig` + `.pem` pair (even with a TUF cache copied in, even with
+`--insecure-ignore-tlog`), cosign 2.4 and 3.0 both fail trying to reach the network. The
+[air-gap bundle](#air-gapped-install-and-upgrade) packages all of it.
 
 ## Backup & restore
 
@@ -193,6 +226,11 @@ The on-disk format is versioned and frozen at **format 1**, and a release reads
 its own format and the one before it — so an upgrade is a binary swap, never an
 export and re-import. The full policy is [FORMAT.md](./FORMAT.md).
 
+0. With the **new** binary, before anything else: `evald migrate --check --data-dir …`. It
+   writes nothing and says whether this evald reads the store's on-disk format, whether a
+   running evald holds the store, and how much space is free beside it; it exits 1 when this
+   evald cannot take over the data-dir (a store written by a newer evald). Run it while the old
+   one still serves: the `in use` line then says so, and that is expected.
 1. Stop evald (graceful — lets in-flight WAL appends finish).
 2. Back up the data-dir (above).
 3. Swap the binary and start it. Check the startup line
@@ -209,6 +247,50 @@ Two things the new binary may tell you instead:
 - **A data-dir written by a NEWER evald** is refused, naming both versions.
   That is a downgrade, and the fix is to put the newer binary back — restoring
   the backup from step 2 is the only supported way to go backwards.
+
+## Air-gapped install and upgrade
+
+Each release from 0.5 attaches `evald-airgap-<version>-x86_64-unknown-linux-musl.tar`: what an
+install or upgrade needs on a machine with no network, under one `SHA256SUMS` signed keyless
+into a Sigstore bundle.
+
+| File | What it is |
+|---|---|
+| `evald-x86_64-unknown-linux-musl.tar.gz` | The static binary, as released. |
+| `evald-image.tar` | The image, for `docker load -i` or `podman load -i` (tagged `evald:<version>`). |
+| `evald-<version>.tgz` | The single-node Helm chart. |
+| `price-table.json` | The price table compiled into this evald, a starting point for `--price-table`. |
+| `evald.sbom.spdx.json`, `provenance.jsonl` | The release's SBOM and SLSA build provenance. |
+| `release/` | The release's own `SHA256SUMS` and its signatures, as published. |
+| `sigstore-trusted-root.json` | A snapshot of the Sigstore trusted root (prefer one you bring yourself). |
+| `verify.sh`, `README.md` | The offline check, and the steps below. |
+| `SHA256SUMS`, `SHA256SUMS.sigstore.json` | Every file above, and the keyless signature over that list. |
+
+```bash
+tar -xf evald-airgap-0.5.0-x86_64-unknown-linux-musl.tar && cd evald-airgap-0.5.0-x86_64-unknown-linux-musl
+sh verify.sh --trusted-root /media/usb/trusted_root.json   # every file, then the signature, offline
+tar -xzf evald-x86_64-unknown-linux-musl.tar.gz
+./evald migrate --check --data-dir /var/lib/evald           # the upgrade preflight
+```
+
+`verify.sh` (POSIX `sh`, cosign 2.4 or later) refuses a file that is missing, altered or added,
+then checks the signature on `SHA256SUMS`. Bring the trusted root in separately (`cosign
+initialize` on a connected machine): the snapshot in the bundle is only as trustworthy as the
+channel that brought the bundle, so `verify.sh` uses it only when you pass no root, and prints its
+digest for you to compare. An organisation that re-signs what it imports signs `SHA256SUMS` with
+its own key on the import side (`cosign sign-blob --key … --tlog-upload=false`, no network) and
+runs `sh verify.sh --key import.pub`; `--checksums-only` skips the signature and says so.
+
+Then install as for a connected host (above), from the bundle's files: the binary under systemd,
+the image pushed to your own registry, or `helm upgrade --install evald ./evald-<version>.tgz
+--set image.repository=registry.internal/evald`. `install.sh` also works from a mirror of the
+release (`EVALD_DOWNLOAD_BASE=file:///mnt/evald`), and verifies the bundle offline when
+`EVALD_TRUSTED_ROOT` names a trusted root.
+
+CI proves the whole of it with the network gone (`ops/airgap/offline-check.sh`): in a network
+namespace where nothing outside answers, it verifies a bundle and refuses an altered copy,
+verifies a keyless Sigstore bundle, installs the binary, loads and runs the image, renders the
+chart, and upgrades a data-dir written by evald 0.2.0.
 
 ## Retention & disk guardrails
 
@@ -572,8 +654,12 @@ built-in table and wins for every model it names; everything else still comes fr
 }
 ```
 
-The second entry shows a self-hosted model: pick a per-token figure that reflects your amortised GPU cost
-(evald cannot know it), so cost by model stays comparable with hosted models.
+The second entry shows a self-hosted model: a per-token figure that reflects your amortised GPU cost, so
+cost by model stays comparable with hosted models. evald cannot know your utilisation, but it has your
+traffic: `evald cost gpu-rate --gpu-hour-usd <$> --gpus <n> --model <name> --since 7d` divides what the
+GPUs cost over the window by the tokens the model served in it and prints this entry
+([CONFIG.md § `evald cost gpu-rate`](./CONFIG.md#evald-cost-gpu-rate)). `evald cost --reprice-as <hosted
+model>` then shows what the same traffic would have cost on a hosted one.
 
 **Or take the upstream file as it is.** It is accepted unchanged (`sample_spec` and entries without a
 per-token price are skipped), for example
@@ -758,6 +844,12 @@ Use `evald eval run --estimate` first — it needs neither. Re-runs hit
 > never reach any on-disk tier. Redaction is a content control, not a substitute
 > for filesystem permissions or volume encryption; use both.
 
+- **Calls out:** never, in the default build (it has no HTTP client; CI checks the dependency
+  graph and the source). In the `judge` build, only the judge does, to the endpoints you configure,
+  and `--offline` or `--egress-allow <host|IP|CIDR>` limits it at the point the client is built
+  (with an allowlist, `HTTP(S)_PROXY` and `ALL_PROXY` are ignored).
+  `evald egress report` lists every destination, address, jurisdiction label and byte count from
+  the egress ledger ([CONFIG.md § Outbound calls](./CONFIG.md#outbound-calls---offline---egress-allow)).
 - **Listens:** one TCP listener, `127.0.0.1:4318` by default
   (`--otlp-http` / `EVALD_OTLP_HTTP_ADDR`; the OTLP/gRPC `:4317` sibling is the
   same). Loopback-only unless you deliberately bind wider.

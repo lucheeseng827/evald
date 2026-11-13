@@ -8,7 +8,7 @@
 #
 # The ports are published on 127.0.0.1 only, like evald's own default. To expose them on the
 # network, set EVALD_AUTH_TOKEN first (16+ printable characters) and change the bindings.
-# Pin a release with EVALD_VERSION=0.4.0 (the default follows `latest`).
+# Pin a release with EVALD_VERSION=0.5.0 (the default follows `latest`).
 services:
   evald:
     image: docker.io/mancube/evald:${EVALD_VERSION:-latest}

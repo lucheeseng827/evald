@@ -6,6 +6,219 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-13
+
+Two themes ship together: "your
+models" (a team's own inference server is a first-class thing evald observes and a first-class
+judge) and "sovereign by proof" (what evald sends where, which weights answered, and whether a
+model can replace another, each something a reviewer can check). The second was planned as 0.6.0
+(roadmap items 6.1–6.7) and was folded in. 0.4.0 shipped first, cut from its own
+commit.
+
+### Added
+- **Judge endpoints as configuration.** An eval YAML can declare `endpoints:` (name, `api:
+  openai-chat | anthropic-messages`, `base_url`, an optional `api_key_env`, `ca_file`,
+  `client_cert` + `client_key` for mTLS, `timeout_secs`, `max_in_flight`, `headers`) and a judge
+  names one with `endpoint:`. A local vLLM, Ollama or llama.cpp server needs no key and no dummy
+  `OPENAI_API_KEY`. `provider: anthropic | openai` still works: it is the implicit endpoint of
+  that name, configured from `*_BASE_URL` / `*_API_KEY` as before. An endpoint's calls run up to
+  its `max_in_flight` at once (default 1), and the results keep dataset order. The first call
+  that fails ends the run; the items still queued are not called. A `base_url` holding
+  `user:password@` is refused (it is stored and printed in the clear; the key goes in
+  `api_key_env`), and a 3xx is not followed: it fails the call, naming the fix.
+- **Judges that work on small local models.** A judge call asks for `temperature: 0`, a fixed
+  `seed` and, on `openai-chat`, a strict JSON schema for the score (`structured_output: auto`,
+  per endpoint). A server that refuses one of these with a 400/422 naming it gets the call again
+  without it, one at a time (temperature, seed, then the schema down to `json_object`, then
+  none), and what it refused is remembered for that model for the run (another model on the same
+  server keeps its own). A 408, 429, 500/502/503/504 or Anthropic's 529 is retried (`retries:`,
+  default 3), honouring `Retry-After`. A reasoning model's `<think>…</think>` preamble no longer
+  hides the score.
+- **`evald judge probe`.** Lists an endpoint's models, sends the same grading question three
+  times and reports: reachable, the id the model is listed as, whether replies held a score,
+  which structured-output mode the server took, whether identical calls scored the same, latency
+  and reported usage. `--config eval.yaml` probes every endpoint the config's judges call;
+  `--base-url … --model …` probes one server. Exits 1 when the endpoint cannot judge.
+  `evald doctor --judge-config eval.yaml` runs the same probe as doctor checks.
+- **A run records its judges.** Each judge call is written to the store as a span under
+  `service.name = evald.judge` (one trace per run: model, the model that answered, tokens,
+  attempts, structured-output mode; an unparsed reply is an error span), so the judge's own
+  spend shows in `evald cost` (`--by service` separates it), and every run writes
+  a manifest score, `evald.run.manifest`, naming each judge's endpoint, base URL, the model id
+  the server listed, the models that answered and the judge's version.
+- **`eval compare` pairs runs that scored the same items.** Every run now records each scored
+  item's value under its key (`id`, else `span_id`, else `trace_id`) as an `evald.run.items`
+  score on the run. When both runs scored exactly the same items, the significance test is a
+  paired t-test on the per-item differences, with a seeded percentile bootstrap interval beside
+  it; otherwise it is Welch's as before, and the output says which test ran and why the runs
+  could not be paired. On 40 items where five flipped from pass to fail, the paired test finds
+  the drop (p = 0.023) that Welch's calls noise (p = 0.27). The JUnit report and the MCP
+  `compare_runs` tool name the test too.
+- **`eval calibrate` reports pass/fail agreement and repeat stability.** Cohen's kappa for the
+  judge's verdicts against the human's at `--pass-threshold` (default 0.5), and, with
+  `--runs a,b,c`, the same judge's stability over repeat runs: the share of items whose verdict
+  held, Fleiss' kappa over the verdicts, per-item spread and the least stable items.
+  `eval run --no-cache` makes such a repeat run (judge every item again, no cache hits).
+- **Online sampled evals: `evald serve --online-eval spec.yaml`** (`--features judge`). Judges a
+  sample of the live model calls the server ingests, with the eval config's judges and
+  endpoints, and writes ordinary scores on their spans (`config_id = 'online'`). Ingest never
+  waits on the judge: spans are picked at ingest and offered to a bounded queue once durable,
+  and a full queue sheds with a counter. Off by default; each judge must name an explicit
+  endpoint; one call in flight per endpoint by default; a required `daily_token_cap`; every
+  errored call and every call over `always.cost_usd_over` judged, the rest at `sample_rate`
+  (decided by a hash of the span id). When production calls go to the judge's own server
+  evald says so (`evald_online_eval_colocated`), and `pause:` stops judging while their p95 is
+  over a threshold. The judge's calls are stored as `evald.judge` spans. `/metrics` gains the
+  `evald_online_eval_*` series.
+- **vLLM's own request spans, correlated with the app's.** vLLM's `llm_request` span (kind
+  `SERVER`, `--otlp-traces-endpoint`, OTLP/gRPC or OTLP/HTTP) is marked `evald.server = "vllm"`.
+  When the app propagates `traceparent`, it is a child of the app's model-call span: its usage is
+  set aside as a copy (`evald.usage = "copy"`), so the call's tokens count once, and its timings
+  stay. `evald latency` adds where the time went, by the app's model: p50/p95 of vLLM's queue,
+  prefill, decode and end-to-end time, and of the app's duration minus the server's. Without a
+  parent the server span is the call, and its `gen_ai.latency.time_to_first_token` is read as the
+  time to first token. `docs/INFERENCE-SERVERS.md` says what vLLM, TGI, llama.cpp and Ollama
+  emit, read from each one's source, and a Grafana board puts evald's series beside vLLM's.
+- **`evald cost gpu-rate` and `evald cost --reprice-as`.** `gpu-rate --gpu-hour-usd 2.40 --gpus 2
+  --model X --since 7d [--output-ratio 4]` spreads what the GPUs cost over the window across the
+  tokens the model's calls used in it and prints the `--price-table` overlay entry to paste:
+  a self-hosted model's rate from its own traffic rather than a guess. It warns when the calls
+  span under 90 % of the window. `--reprice-as <hosted model> [--model X]` prices each model
+  call's own token counts at the hosted model's list price, beside the cost stored for it.
+- **Reference stacks: `ops/stacks/ollama` and `ops/stacks/vllm`.** One `docker compose up` each:
+  evald with Ollama, or evald with vLLM, an OpenTelemetry Collector, Prometheus and Grafana (the
+  board provisioned). Both build evald with the judge backend so `eval run`, `judge probe` and
+  online evals can judge on the served model; no model is chosen or pulled for you.
+  `ops/stacks/smoke.py` smoke-tests each (the vLLM stack with a CPU stand-in emitting vLLM's
+  span and metric shapes); CI runs both on release tags.
+- **A single-node Helm chart: `ops/helm/evald`.** One pod, its store on a PersistentVolume,
+  probes, the auth tokens from a Secret as a file, an optional ServiceMonitor. It refuses a
+  second replica and an exposed Service without auth. `ops/helm/validate.sh` asserts 18 renders
+  and refusals; CI installs it on kind and checks a span survives the pod being replaced.
+- **`docker build --build-arg FEATURES=judge`** builds an image with the judge backend.
+- **`docs/JUDGES.md`: open-weight judges.** Which models to try (Atla Selene Mini, Prometheus 2,
+  Qwen2.5 and Llama 3.1 Instruct), their licences as their cards state them and their base
+  models' licences, how to serve each on the reference stacks, and how to calibrate one on your
+  own labels before trusting it (agreement, kappa, repeat stability). No weights are shipped
+  and no default judge is chosen. The page's configs are loaded by a test.
+- **One egress door, a ledger, `--offline` and `evald egress report`.** Two global flags limit
+  what the judge build may call: `--offline` (no client is built, nothing is resolved) and
+  `--egress-allow <host|IP|CIDR>` (only these; a host is admitted by name or resolved address and
+  the client pinned to it; no redirects, and `HTTP(S)_PROXY` / `ALL_PROXY` are ignored, since a
+  proxy is a host the list does not name). Every request sent and every one refused is recorded as
+  an `evald.egress` span (endpoint, host, address, bytes each way, status, model, purpose, run,
+  and the endpoint's new `jurisdiction:` label), including the calls of a run that failed.
+  `evald egress report --since 30d` lists them by destination. Tested from outside: a listener on
+  127.0.0.2 counts TCP accepts and sees none under `--egress-allow 127.0.0.1` (and does see them
+  without it), not even when it is named as the proxy in `HTTP_PROXY`; `--offline` reaches
+  neither, and the ledger's count equals the requests served.
+  A cached eval reruns under `--offline` with no connection.
+- **Which weights answered: model provenance.** Each judge's weights are read from its endpoint
+  once per run: vLLM's `root` from `/v1/models`, and on Ollama (whose list only echoes the name)
+  the tag's digest, quantisation and parameter size from `/api/tags`. They are recorded in the run
+  manifest (`provenance`) and on every judge span as `evald.model.id`, `.digest`,
+  `.quantization` and `.parameter_size`, and `judge probe` prints them on its `model` line. The
+  judge cache keys on the digest when there is one, so the same tag pulled over new weights is
+  judged again rather than served the old weights' scores. `eval compare` reads both runs'
+  manifests and warns, judge by judge, when the weights, quantisation, model name, base URL or
+  judge version differ, because judge drift otherwise reads as a regression; MCP `compare_runs`
+  returns the same list as `judge_changes`.
+- **The migration gate: `evald replay` and `eval compare --non-inferior --margin`.** `evald
+  replay --config c.yaml --endpoint B --model M` sends the dataset's prompts to B (temperature 0,
+  a fixed seed, no system message or response format, through the egress door as purpose
+  `replay`) and scores the answers with the config's evaluators and judges as a run of its own.
+  Each call is an `evald.replay` model-call span carrying the prompt and the answer, the run's
+  per-item scores go on those spans, and the manifest records the replay (endpoint, model,
+  provenance, tokens, cost, latency p50/p95). `eval compare --non-inferior --margin δ` gives a
+  one-sided paired non-inferiority verdict per evaluator (`non-inferior`, `inferior`,
+  `inconclusive`; only the first passes) and per slice of item metadata (`slice_by:`, default
+  `language`, `route`, `task`), and sets the two replays' cost and latency side by side;
+  `--price-table` reprices both from their recorded tokens. The margin is required, never
+  defaulted. Known-answer tests on constructed data, including a small dataset the paired
+  t-test calls noise and non-inferiority calls inconclusive. JUnit gets one case per evaluator;
+  MCP `compare_runs` takes a `margin`. Walk-through: `docs/MIGRATING.md`.
+- **Multilingual evaluation.** Two deterministic evaluators: `language_match` (the answer is in
+  the item's `metadata.language`, by an embedded detector, whatlang, MIT, no model files) and
+  `script` (the share of its letters in the expected script; `Jawi` for Malay in Arabic script).
+  `exact_match` and `levenshtein` take `normalize: true` (NFKC and lower-case). Malay and
+  Indonesian are one language (`ms`, the ISO macrolanguage): no detector measured tells them
+  apart (lingua's own report: 28% on Malay sentences), and Latin-script text under 20 letters is
+  not placed, both from measurements in `docs/LANGUAGES.md`. Every run reports each evaluator by
+  language (`slice_by:`), `dataset from-spans --detect-language` labels rows by their prompt's
+  language, and `evald cost language-tax` gives tokens per character of each model's answers by
+  language, with the ratio to the same model's English. A guide to judging in other languages
+  (an English or a translated rubric, calibrated per language) and to building per-language sets
+  from your own traffic: `docs/LANGUAGES.md`.
+- **The air-gap bundle, offline verification and `evald migrate --check`.** Each release attaches
+  `evald-airgap-<version>-<target>.tar`: the binary, the image as a `docker|podman load` archive,
+  the chart, the price table, SBOM and provenance, a Sigstore trusted root, `verify.sh` and a
+  README, under one `SHA256SUMS` signed keyless into a Sigstore bundle. Measured first (§9): a
+  keyless bundle plus a trusted root verifies with no network interface at all, and the
+  detached `.sig` + `.pem` pair cannot (cosign 2.4 and 3.0 both reach for the network), so
+  releases now also publish `SHA256SUMS.sigstore.json`, and `install.sh` prefers it (offline
+  with `EVALD_TRUSTED_ROOT`). `verify.sh` (POSIX `sh`) refuses a missing, altered or added file,
+  then checks the signature, keyless or an importer's own `--key`. `evald migrate --check` is
+  the upgrade preflight: the store's format, whether a running evald holds it (redb's own lock,
+  probed and released), free space; it writes nothing and exits 1 when this evald cannot take
+  over. CI proves it with the network gone (`ops/airgap/offline-check.sh`): verify, refuse an
+  altered copy, verify a keyless bundle, install, load and run the image, render the chart, and
+  upgrade a data-dir written by evald 0.2.0.
+- **1.0 hardening: the surface is frozen and the conventions pinned (D7).** `docs/STABILITY.md`
+  is the freeze review: each surface a script or pipeline depends on, what 1.0 promises about
+  it, and the test that fails when the promise breaks.
+  - *OTLP/HTTP conformance* (`tests/otlp_conformance.rs`): protobuf and JSON, gzip or not, the
+    reply in the request's own Content-Type, every 4xx/5xx a `google.rpc.Status` in that
+    encoding (a bad body 400, auth 401, the disk floor's 503 and a shed 429 keeping
+    `Retry-After`, and `/v1/metrics`, which evald does not serve, a 404 Status rather than a
+    plain-text page).
+  - *Any attribute is queryable*: `attr(raw_attributes_json, 'key')` reads any attribute a span
+    was sent with, by its own key and whatever its type, from the hot tier and from cold
+    Parquet alike (`tests/any_attribute.rs`).
+  - *A pinned semconv*: the GenAI mapping is written against semantic conventions `1.38.0`,
+    reported as `semconv` in `GET /v1/meta`. Tests cover both shapes
+    `OTEL_SEMCONV_STABILITY_OPT_IN` switches between, a span carrying both (counted once), and a
+    span from a newer release (still normalized, unknown keys kept).
+  - *A versioned CI report*: `eval run --report-json` and `eval compare --report-json` write
+    `evald.report/v1`, with its JSON Schema at `docs/schemas/report-v1.schema.json`. A command
+    that could not run still writes one, `{"passed": false, "error": …}`.
+  - *The CLI, HTTP and SQL surface* is recorded under `tests/fixtures/surface/` and checked by
+    `tests/surface.rs`: a command, flag, `EVALD_*` variable, route or column that disappears
+    fails the build, and a new one is recorded on purpose.
+
+### Changed
+- **The judge cache is per server.** Its key names the endpoint (API, base URL and headers, since
+  a gateway's routing header sends one URL to different backends) instead of the provider, and each cached score records the model id the endpoint listed for the model
+  (`GET /v1/models`; vLLM's `root`). A hit is served only while the endpoint still lists the same
+  id, so one server's cache never answers for another, or for other weights behind the same
+  name. The key changed, so the cache starts empty once after upgrading.
+- **An unknown key in an eval config is an error**, at the top level, on a judge and on an
+  endpoint. A `base_url:` written on a judge used to be ignored silently, and the judge then
+  called the default provider.
+- **OTLP error and success bodies follow the spec.** An error on `/v1/traces`, `/v1/logs` or
+  `/v1/metrics` was a plain-text body; it is now a `google.rpc.Status` (protobuf, or its JSON
+  mapping for a JSON request), with the same status code and headers. The JSON success reply is
+  `{}` (was `{"partialSuccess":null}`). Strict exporters (Java, .NET, PHP) decode both.
+- **Ingest throughput is unchanged from 0.4.0** (the bar: within 5 %). Interleaved A/B against
+  0.4.0's commit, 8 rounds, release builds with the shipped profile, 4 CPUs in a musl container
+  on WSL2, data on disk (`bench/ab.sh`, `docs/BENCH-AB-GUIDE.md`): traces at 32 connections ×
+  100 spans/request 32,761 → 32,826 spans/s (+0.2 %, B ≥ A in 2/8 rounds); at 32 × 10,
+  21,504 → 24,190 (+12.5 %, 6/8; that cell ranged 19k–28k on both binaries, so read it as
+  unchanged). Logs (one Claude Code `api_request` event per record): 10,832 → 10,700 records/s
+  at 32 × 10 (−1.2 %, 3/8) and 10,547 → 10,729 at 32 × 100 (+1.7 %, 7/8). These absolute
+  numbers are this machine's and are not comparable with 0.4.0's entry.
+- **Online evals write their results in group commits.** The worker stored each judged span
+  with a write and an fsync of its own, which competed with ingest for the disk whenever
+  results came faster than one write takes (a judge answering from its cache, a fast local
+  model): with `serve --online-eval` at `sample_rate: 0.02`, trace ingest at 32 × 100 was
+  9.9 % slower than with it off (0/8 rounds as fast). Results waiting together are now one
+  write; a lone result is still written at once, and outcomes are counted as before. Same
+  measurement, online eval on: 23,857 → 26,760 spans/s (+12.2 %, 7/8); with the fix, on vs off
+  is −1.8 % (2/8). The ingest-side pick itself costs nothing measurable (`sample_rate: 0` vs
+  off: −0.7 %, 3/8).
+- **The built-in price table is refreshed** to LiteLLM `dc65705e` (2026-11-13): 3,792 models,
+  619 added and 97 repriced since 0.4.0's table. 47 models that upstream dropped are no longer
+  priced, unless an operator's `--price-table` names them.
+
 ## [0.4.0] - 2026-10-28
 
 "Plugs in": evald receives what the AI tools a developer already runs emit (Claude Code, Codex,

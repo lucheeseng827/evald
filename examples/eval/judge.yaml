@@ -8,11 +8,25 @@
 # Preview the cost first (offline — no key, no call, no feature needed):
 #   evald eval run --config examples/eval/judge.yaml --data-dir /tmp/evald --estimate
 #
-# Every score is cached in <data-dir>/judge_cache.redb keyed by (rail, model, input, output, …),
+# Every score is cached in <data-dir>/judge_cache.redb keyed by (endpoint, rail, model, input, …),
 # so re-running an unchanged eval costs ZERO tokens. The judge mean flows through the same
 # threshold gate and `eval compare` significance test as the Tier-1 scorers.
 name: demo-judge
 dataset: ./dataset.jsonl # input / output / expected_output per line
+
+# A judge can also call your own OpenAI-compatible server (vLLM, Ollama, llama.cpp server)
+# instead of a hosted provider. Declare it once and name it on the judge (`endpoint:`):
+#
+# endpoints:
+#   - name: gpu-box
+#     api: openai-chat
+#     base_url: http://localhost:11434/v1    # Ollama; vLLM is usually :8000
+#     max_in_flight: 1                       # keep 1 if the server also serves production
+#
+# judges:
+#   - rail: qa_correctness
+#     endpoint: gpu-box
+#     model: qwen2.5:7b-instruct
 
 judges:
   # Generic criteria grading (G-Eval style): needs `criteria` + the item's output.

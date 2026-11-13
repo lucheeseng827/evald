@@ -1,0 +1,29 @@
+# Online sampled evals: `evald serve --online-eval examples/eval/online.yaml` (build with
+# `--features judge`). Judges a sample of the live model calls evald ingests and writes the
+# scores on their spans. Ingest never waits on the judge. See docs/CONFIG.md § Online sampled
+# evals for every key.
+
+# The judge's own server: preferably not the one that serves production (see `pause:`).
+endpoints:
+  - name: judge-box
+    api: openai-chat
+    base_url: http://judge-box:8000/v1      # vLLM, Ollama, llama.cpp server, TGI
+    max_in_flight: 1                         # judge calls in flight at once (the default)
+
+judges:
+  - rail: answer_relevancy                   # needs the call's input and output
+    endpoint: judge-box                      # required: an online judge has no implicit provider
+    model: Qwen/Qwen2.5-7B-Instruct
+
+sample_rate: 0.02          # 2 % of the eligible model calls...
+always:
+  errors: true             # ...plus every call that errored
+  cost_usd_over: 0.05      # ...and every call that cost at least this
+# only:
+#   services: [checkout-assistant]
+#   models: [gpt-5.4]
+daily_token_cap: 2000000   # judge tokens per UTC day; no new call starts once it is spent
+queue: 256                 # sampled calls waiting for the judge before new ones are shed
+# pause:                   # judge on production's own server? stop while it is slow
+#   p95_ms_over: 4000
+#   window: 200

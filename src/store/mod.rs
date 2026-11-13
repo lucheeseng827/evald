@@ -298,6 +298,9 @@ pub struct Store {
     usage: Option<Arc<crate::usage::UsageMetrics>>,
     /// What the OTLP logs door keeps.
     logs_policy: crate::logs::LogsPolicy,
+    /// Online sampled evals (`serve --online-eval`): picks model calls to judge at ingest.
+    /// Set once, after the store opens; empty (one load per batch) when they are off.
+    online: Arc<std::sync::OnceLock<Arc<crate::online::Online>>>,
     /// Calls recently stored, so a second copy of one (the same call sent on two signals) is
     /// dropped at ingest ([`crate::calls`]).
     calls: Arc<crate::calls::CallLedger>,
@@ -525,7 +528,19 @@ impl Store {
             usage,
             logs_policy: config.logs,
             calls: Arc::new(crate::calls::CallLedger::default()),
+            online: Arc::new(std::sync::OnceLock::new()),
         })
+    }
+
+    /// Turn on online sampled evals for this store (and every clone of it). Once only: a
+    /// second call is ignored.
+    pub fn set_online(&self, online: Arc<crate::online::Online>) {
+        let _ = self.online.set(online);
+    }
+
+    /// The online evaluator, when `--online-eval` is on.
+    pub fn online(&self) -> Option<&Arc<crate::online::Online>> {
+        self.online.get()
     }
 
     /// Spans dropped at ingest as a second copy of a call already stored.
@@ -561,7 +576,13 @@ impl Store {
         let count = spans.len();
         self.reject_if_disk_full(count)?;
         self.prepare_for_storage(&mut spans);
+        // The online judge sees what is stored (redacted, offloaded), and only once it is
+        // durable; the pick is a hash per model call, the offer a `try_send`.
+        let picked = self.online().map(|o| o.pick(&spans));
         self.append(spans).await?;
+        if let (Some(o), Some(picked)) = (self.online(), picked) {
+            o.offer(picked);
+        }
         self.calls.remember(calls);
         if let Err(err) = self.put_scores(scores) {
             tracing::error!(%err, count = scores.len(), "failed to store scores from an ingest request");

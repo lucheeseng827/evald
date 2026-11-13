@@ -1,0 +1,28 @@
+{{- if .Values.serviceMonitor.enabled }}
+{{- $secret := include "evald.authSecret" . -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "evald.fullname" . }}
+  labels:
+    {{- include "evald.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "evald.selector" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      {{- if $secret }}
+      # /metrics is behind the gate once it is armed; the scraper presents a token too.
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ $secret }}
+          key: {{ .Values.auth.key }}
+      {{- end }}
+{{- end }}

@@ -1,6 +1,6 @@
 # evald as a GitHub Action: install a pinned evald, run an eval or a suite, gate the job on it.
 #
-#   - uses: lucheeseng827/evald@v0.4.0
+#   - uses: lucheeseng827/evald@v0.5.0
 #     with:
 #       config: evals/eval.yaml
 #
@@ -24,7 +24,7 @@ inputs:
     description: "`eval` (evald eval run) or `suite` (evald suite run)."
     default: eval
   version:
-    description: The evald release to install, e.g. v0.4.0. `latest` follows the newest release; pin it for a reproducible gate.
+    description: The evald release to install, e.g. v0.5.0. `latest` follows the newest release; pin it for a reproducible gate.
     default: latest
   data-dir:
     description: Where `eval run` keeps the run's scores (ignored by `suite`).

@@ -1,0 +1,4 @@
+{"id": "capital-fr", "input": "What is the capital of France?", "output": "Paris.", "expected_output": "Paris"}
+{"id": "capital-jp", "input": "What is the capital of Japan?", "output": "Kyoto.", "expected_output": "Tokyo"}
+{"id": "boiling", "input": "At what temperature does water boil at sea level, in Celsius?", "output": "100 °C.", "expected_output": "100 °C"}
+{"id": "planets", "input": "How many planets are in the Solar System?", "output": "Nine.", "expected_output": "Eight"}

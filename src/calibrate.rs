@@ -15,6 +15,14 @@
 //! reuses the dependency-free Student's-t machinery in [`crate::stats`] for the bias confidence
 //! interval. With `--fail-on-divergence` it doubles as a CI gate (exit non-zero when the judge
 //! has drifted far enough from the human ground truth to need recalibration).
+//!
+//! Two more figures, because a score is only as good as its agreement and its repeatability:
+//! - **Pass/fail agreement** with the human, chance-corrected ([`Agreement`], Cohen's kappa):
+//!   a judge that says "pass" to everything agrees with a mostly-passing human set most of the
+//!   time and is still useless, and kappa says so.
+//! - **Repeat stability** ([`Stability`]): the same judge on the same items over N runs (made
+//!   with `eval run --no-cache`), matched by item id. How often the verdict held, how far the
+//!   scores moved, and Fleiss' kappa over the verdicts.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -160,6 +168,126 @@ pub fn calibrate(
     })
 }
 
+/// Pass/fail agreement between the judge and the human at one cut (a score ≥ `cut` passes).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Agreement {
+    pub cut: f64,
+    pub n: usize,
+    /// Share of pairs where both said pass, or both said fail.
+    pub observed: f64,
+    /// Cohen's kappa over the verdicts; `None` when it is undefined (one verdict throughout).
+    pub kappa: Option<f64>,
+}
+
+/// [`Agreement`] over paired `(judge, human)` scores. `None` with no pairs.
+pub fn pass_fail_agreement(pairs: &[(f64, f64)], cut: f64) -> Option<Agreement> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let verdicts: Vec<(bool, bool)> = pairs.iter().map(|&(j, h)| (j >= cut, h >= cut)).collect();
+    let agree = verdicts.iter().filter(|(j, h)| j == h).count();
+    Some(Agreement {
+        cut,
+        n: pairs.len(),
+        observed: agree as f64 / pairs.len() as f64,
+        kappa: crate::stats::cohen_kappa(&verdicts),
+    })
+}
+
+/// How one judge's scores held up over repeat runs on the same items.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stability {
+    pub runs: usize,
+    /// Items scored in every run (the ones measured).
+    pub items: usize,
+    /// Items some run did not score, left out.
+    pub left_out: usize,
+    pub cut: f64,
+    /// Share of items whose verdict (score ≥ `cut`) was the same in every run.
+    pub verdict_agreement: f64,
+    /// Mean over items of the standard deviation of that item's scores across runs.
+    pub mean_sd: f64,
+    /// The largest spread (max − min) any item's scores showed.
+    pub max_range: f64,
+    /// Fleiss' kappa over the verdicts, the runs as raters; `None` when undefined.
+    pub fleiss_kappa: Option<f64>,
+    /// Up to five items with the widest spread, with their scores in run order.
+    pub least_stable: Vec<(String, Vec<f64>)>,
+}
+
+/// [`Stability`] over N runs' per-item values of one judge. An error names a run whose items
+/// cannot be matched (no ids, repeated ids); `Ok(None)` when fewer than 2 runs or no item was
+/// scored in all of them.
+pub fn stability(
+    runs: &[(String, crate::eval::ItemValues)],
+    cut: f64,
+) -> anyhow::Result<Option<Stability>> {
+    if runs.len() < 2 {
+        return Ok(None);
+    }
+    let maps = runs
+        .iter()
+        .map(|(id, v)| v.by_key().map_err(|why| anyhow::anyhow!("run {id}: {why}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let all: std::collections::BTreeSet<&str> =
+        maps.iter().flat_map(|m| m.keys().copied()).collect();
+    let mut rows: Vec<(String, Vec<f64>)> = all
+        .iter()
+        .filter_map(|k| {
+            let vals: Option<Vec<f64>> = maps.iter().map(|m| m.get(k).copied()).collect();
+            vals.map(|v| (k.to_string(), v))
+        })
+        .collect();
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let (n, r) = (rows.len(), runs.len() as f64);
+    let mut same = 0usize;
+    let mut sd_sum = 0.0;
+    let mut max_range = 0.0_f64;
+    let mut counts = Vec::with_capacity(n);
+    for (_, vals) in &rows {
+        let passes = vals.iter().filter(|&&v| v >= cut).count() as u64;
+        if passes == 0 || passes == vals.len() as u64 {
+            same += 1;
+        }
+        counts.push(vec![passes, vals.len() as u64 - passes]);
+        let mean = vals.iter().sum::<f64>() / r;
+        sd_sum += (vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (r - 1.0)).sqrt();
+        let (lo, hi) = vals
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        max_range = max_range.max(hi - lo);
+    }
+    let spread = |v: &[f64]| {
+        v.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            - v.iter().copied().fold(f64::INFINITY, f64::min)
+    };
+    rows.sort_by(|a, b| {
+        spread(&b.1)
+            .total_cmp(&spread(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let least_stable = rows
+        .into_iter()
+        .filter(|(_, v)| spread(v) > 0.0)
+        .take(5)
+        .collect();
+    Ok(Some(Stability {
+        runs: runs.len(),
+        items: n,
+        left_out: all.len() - n,
+        cut,
+        verdict_agreement: same as f64 / n as f64,
+        mean_sd: sd_sum / n as f64,
+        max_range,
+        fleiss_kappa: crate::stats::fleiss_kappa(&counts),
+        least_stable,
+    }))
+}
+
 /// Pair a judge's scores with human annotations on the same target, reading from the store.
 ///
 /// For each span/trace target, takes the **newest** judge score (`source = Eval`, `name =
@@ -205,6 +333,9 @@ pub fn collect_pairs(
 /// Returns whether the CI gate passes: always `true` unless `fail_on_divergence` is set and the
 /// judge needs recalibration. Insufficient data (fewer than 2 pairs) is informational, not a
 /// gate failure — there is nothing to have regressed.
+/// `cut` is the pass/fail line for the agreement and stability figures; `runs`, when given (two
+/// or more), are repeat runs of the judge to measure its stability over.
+#[allow(clippy::too_many_arguments)]
 pub fn calibrate_command(
     judge: &str,
     human: Option<&str>,
@@ -212,6 +343,8 @@ pub fn calibrate_command(
     alpha: f64,
     threshold: f64,
     fail_on_divergence: bool,
+    cut: f64,
+    runs: &[String],
 ) -> anyhow::Result<bool> {
     let store = Store::open(
         data_dir,
@@ -224,6 +357,36 @@ pub fn calibrate_command(
 
     let pairs =
         collect_pairs(&store, judge, human).map_err(|e| anyhow::anyhow!("reading scores: {e}"))?;
+
+    if !runs.is_empty() {
+        anyhow::ensure!(
+            runs.len() >= 2,
+            "--runs takes two or more run ids (repeat runs of the same judge on the same items)"
+        );
+        let mut values = Vec::with_capacity(runs.len());
+        for run in runs {
+            let mut items = crate::eval::run_items(&store, run)?;
+            let v = items.remove(judge).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "run {run} has no per-item values for {judge:?}: it did not run that judge, \
+                     or it was written before evald recorded them"
+                )
+            })?;
+            values.push((run.clone(), v));
+        }
+        match stability(&values, cut)? {
+            Some(st) => print_stability(judge, &st),
+            None => println!(
+                "Stability: no item was scored in all {} runs of {judge:?}.",
+                runs.len()
+            ),
+        }
+        if pairs.len() < 2 {
+            // Stability was asked for; a missing human set is not news here.
+            return Ok(true);
+        }
+        println!();
+    }
 
     match calibrate(&pairs, alpha, threshold) {
         None => {
@@ -240,9 +403,55 @@ pub fn calibrate_command(
         }
         Some(c) => {
             print_calibration(judge, human, &c, alpha, threshold);
+            if let Some(a) = pass_fail_agreement(&pairs, cut) {
+                print_agreement(&a);
+            }
             let gate_fails = fail_on_divergence && c.recalibrate;
             Ok(!gate_fails)
         }
+    }
+}
+
+fn kappa_cell(k: Option<f64>) -> String {
+    match k {
+        Some(k) => format!("{k:+.3} ({})", crate::stats::kappa_words(k)),
+        None => "undefined (one verdict throughout)".to_string(),
+    }
+}
+
+fn print_agreement(a: &Agreement) {
+    println!(
+        "  pass/fail agreement : {:.1}% of {} at score \u{2265} {:.2}; Cohen's \u{03ba} {}",
+        a.observed * 100.0,
+        a.n,
+        a.cut,
+        kappa_cell(a.kappa)
+    );
+}
+
+fn print_stability(judge: &str, s: &Stability) {
+    println!("Stability: judge `{judge}` over {} runs", s.runs);
+    println!("  items in every run  : {}", s.items);
+    if s.left_out > 0 {
+        println!(
+            "  left out            : {} (not scored in every run)",
+            s.left_out
+        );
+    }
+    println!(
+        "  same verdict        : {:.1}% of items in every run (score \u{2265} {:.2})",
+        s.verdict_agreement * 100.0,
+        s.cut
+    );
+    println!(
+        "  Fleiss' \u{03ba}           : {}",
+        kappa_cell(s.fleiss_kappa)
+    );
+    println!("  mean per-item SD    : {:.4}", s.mean_sd);
+    println!("  widest spread       : {:.4}", s.max_range);
+    for (key, vals) in &s.least_stable {
+        let vals: Vec<String> = vals.iter().map(|v| format!("{v:.2}")).collect();
+        println!("    {key}: {}", vals.join(" "));
     }
 }
 
@@ -500,5 +709,108 @@ mod tests {
         );
         let any = collect_pairs(&store, "j", None).unwrap();
         assert_eq!(any, vec![(0.8, 0.1)], "unfiltered takes bob (newest)");
+    }
+
+    #[test]
+    fn agreement_is_chance_corrected() {
+        // 50 pairs laid out as the classic table: both pass 20, judge-only 5, human-only 10,
+        // both fail 15. p_o = 0.7, κ = 0.4.
+        let mut pairs = Vec::new();
+        for (j, h, n) in [
+            (0.9, 0.8, 20),
+            (0.7, 0.2, 5),
+            (0.1, 0.6, 10),
+            (0.2, 0.0, 15),
+        ] {
+            pairs.extend(std::iter::repeat_n((j, h), n));
+        }
+        let a = pass_fail_agreement(&pairs, 0.5).unwrap();
+        assert_eq!(a.n, 50);
+        assert!((a.observed - 0.7).abs() < 1e-12);
+        assert!((a.kappa.unwrap() - 0.4).abs() < 1e-12);
+        // A judge that passes everything agrees 90% with a 90%-passing human set, and kappa
+        // calls it what it is: no better than chance.
+        let mut lazy: Vec<(f64, f64)> = vec![(1.0, 1.0); 9];
+        lazy.push((1.0, 0.0));
+        let a = pass_fail_agreement(&lazy, 0.5).unwrap();
+        assert!((a.observed - 0.9).abs() < 1e-12);
+        assert_eq!(a.kappa, Some(0.0));
+        assert!(pass_fail_agreement(&[], 0.5).is_none());
+    }
+
+    fn items(vals: &[(&str, f64)]) -> crate::eval::ItemValues {
+        crate::eval::ItemValues {
+            evaluator: "judge_x".into(),
+            items: vals.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            unkeyed: 0,
+        }
+    }
+
+    #[test]
+    fn stability_over_repeat_runs() {
+        let runs = vec![
+            (
+                "r1".to_string(),
+                items(&[("a", 0.9), ("b", 0.2), ("c", 0.6), ("d", 0.8)]),
+            ),
+            (
+                "r2".to_string(),
+                items(&[("a", 0.9), ("b", 0.2), ("c", 0.4), ("d", 0.8)]),
+            ),
+            (
+                "r3".to_string(),
+                items(&[("a", 0.9), ("b", 0.3), ("c", 0.6)]),
+            ),
+        ];
+        let s = stability(&runs, 0.5).unwrap().unwrap();
+        assert_eq!((s.runs, s.items, s.left_out), (3, 3, 1), "d is not in r3");
+        // a and b keep their verdict; c passes, fails, passes.
+        assert!((s.verdict_agreement - 2.0 / 3.0).abs() < 1e-12);
+        assert!((s.max_range - 0.2).abs() < 1e-12);
+        // Per-item SDs: a 0, b √(1/300), c √(4/300); their mean.
+        let want = ((1.0_f64 / 300.0).sqrt() + (4.0_f64 / 300.0).sqrt()) / 3.0;
+        assert!((s.mean_sd - want).abs() < 1e-12, "{}", s.mean_sd);
+        assert_eq!(s.least_stable[0].0, "c");
+        assert_eq!(s.least_stable[0].1, vec![0.6, 0.4, 0.6]);
+        assert_eq!(s.least_stable.len(), 2, "a never moved");
+        // Fleiss over pass/fail: a [3,0], b [0,3], c [2,1] → P̄ = (1 + 1 + 1/3) / 3, p = (5/9,
+        // 4/9), P̄e = 41/81, κ = (7/9 − 41/81) / (40/81) = 22/40.
+        assert!((s.fleiss_kappa.unwrap() - 0.55).abs() < 1e-12);
+
+        // A perfectly repeatable judge.
+        let same = vec![
+            ("r1".to_string(), items(&[("a", 0.9), ("b", 0.1)])),
+            ("r2".to_string(), items(&[("a", 0.9), ("b", 0.1)])),
+        ];
+        let s = stability(&same, 0.5).unwrap().unwrap();
+        assert_eq!(
+            (s.verdict_agreement, s.mean_sd, s.max_range),
+            (1.0, 0.0, 0.0)
+        );
+        assert_eq!(s.fleiss_kappa, Some(1.0));
+        assert!(s.least_stable.is_empty());
+    }
+
+    #[test]
+    fn stability_needs_matchable_runs() {
+        assert!(stability(&[("r1".into(), items(&[("a", 1.0)]))], 0.5)
+            .unwrap()
+            .is_none());
+        let disjoint = vec![
+            ("r1".to_string(), items(&[("a", 1.0)])),
+            ("r2".to_string(), items(&[("b", 1.0)])),
+        ];
+        assert!(stability(&disjoint, 0.5).unwrap().is_none());
+        let mut unkeyed = items(&[("a", 1.0)]);
+        unkeyed.unkeyed = 2;
+        let err = stability(
+            &[("r1".into(), items(&[("a", 1.0)])), ("r2".into(), unkeyed)],
+            0.5,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").starts_with("run r2: 2 item(s) have no id"),
+            "{err}"
+        );
     }
 }
