@@ -315,7 +315,8 @@ pub async fn server_rows(store: &Store) -> anyhow::Result<Vec<ServerRow>> {
         .collect();
     let sql = format!(
         "SELECT COALESCE(c.model, s.model) AS model, \
-                c.end_unix_nano - c.start_unix_nano AS client_ns, {} \
+                CASE WHEN c.end_unix_nano >= c.start_unix_nano \
+                     THEN c.end_unix_nano - c.start_unix_nano END AS client_ns, {} \
          FROM spans s LEFT JOIN spans c \
            ON c.trace_id = s.trace_id AND c.span_id = s.parent_span_id \
          WHERE strpos(s.raw_attributes_json, '\"{SERVER_KEY}\":\"{VLLM}\"') > 0",
@@ -831,5 +832,19 @@ mod tests {
         assert_eq!((rows[0].model.as_str(), rows[0].parented), ("(unknown)", 0));
         assert_eq!(rows[0].outside_p50_ms, None);
         assert!(server_rows(&open().1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_parent_that_ends_before_it_starts_is_not_a_measurement() {
+        let (_d, store) = open();
+        let mut spans = call_through_vllm(true);
+        let client = spans.iter_mut().find(|s| s.name != "llm_request").unwrap();
+        client.end_unix_nano = client.start_unix_nano - 1;
+        store.ingest_batch(spans, &[]).await.unwrap();
+        // The server's phases still count; the malformed parent gives no client - server figure
+        // (unguarded, its UInt64 duration wraps to ~1.8e19 ns and lands in the percentiles).
+        let rows = server_rows(&store).await.unwrap();
+        assert_eq!((rows[0].calls, rows[0].parented), (1, 0), "{rows:#?}");
+        assert_eq!(rows[0].outside_p50_ms, None);
     }
 }

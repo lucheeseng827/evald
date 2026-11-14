@@ -30,6 +30,8 @@ metadata:
   name: {{ include "evald.fullname" . }}-headless
   labels:
     {{- include "evald.labels" . | nindent 4 }}
+    # Lets the ServiceMonitor leave it out: the same pod behind two Services is two targets.
+    app.kubernetes.io/component: headless
 spec:
   clusterIP: None
   selector:

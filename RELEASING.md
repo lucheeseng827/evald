@@ -38,6 +38,34 @@ promoted to crates.io / brew / `:latest` — use it to smoke-test the pipeline.
 `workflow_dispatch` re-runs the pipeline against an existing tag (input `tag`), with an optional
 `promote` to advance the formula + `:latest`.
 
+## Folding or merging a long-lived branch
+
+A conflicting file is never resolved by taking one side (`git checkout --ours/--theirs`, or
+copying one branch's copy over). Both sides changed it since they parted, and taking one drops
+the other's changes without a trace. 0.5.0's fold of the 0.6 branch did exactly that: it applied
+0.6's copies of files over the review fixes `main` had taken in the meantime (#1644), dropping
+fixes and three tests, and 0.5.0 and 0.5.1 had to put them back.
+
+1. Find what each side changed since the merge base, per conflicting file:
+   ```bash
+   base=$(git merge-base main the-branch)
+   git diff "$base" main -- path/to/file          # what main brought
+   git diff "$base" the-branch -- path/to/file    # what the branch brought
+   ```
+2. Carry both into the result. Where they touch the same lines, write the line that does what
+   both meant, and say so in the commit message.
+3. Before landing, look for what `main` brought and the result lacks, from the repository root
+   (in a subdirectory, `git apply` skips every path outside it and passes without a word):
+   ```bash
+   cd "$(git rev-parse --show-toplevel)"
+   git diff "$base" main | git apply --check -R
+   ```
+   On the merged tree this names each file where a hunk of `main`'s is not there. It stops at a
+   file's first such hunk, and a hunk both sides rewrote counts, so for every file it names, read
+   all of `git diff "$base" main -- that/file` against the result, not only the hunk it reports.
+4. Run every test both sides added. A test deleted in the merge needs a reason in the commit
+   message.
+
 ## Distribution channels
 
 | Channel | Source of truth |

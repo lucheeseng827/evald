@@ -158,6 +158,13 @@ pub const IMPLICIT_OPENAI: &str = "openai";
 /// `http://host:8000/v1/` → `http://host:8000`. Rejects anything that is not an http(s) URL with
 /// a host, because a typo here otherwise surfaces as a confusing connection error mid-run.
 pub fn normalize_base_url(raw: &str) -> anyhow::Result<String> {
+    // An error names the value only when it cannot hold `user:password@`: errors are printed and
+    // logged, and `ftp://user:pass@host` fails the scheme check before the credential one.
+    let named = if raw.contains('@') {
+        String::new()
+    } else {
+        format!(" {raw:?}")
+    };
     let mut url = raw.trim().trim_end_matches('/').to_string();
     if let Some(stripped) = url.strip_suffix("/v1") {
         url = stripped.trim_end_matches('/').to_string();
@@ -165,7 +172,7 @@ pub fn normalize_base_url(raw: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
-        .ok_or_else(|| anyhow::anyhow!("base_url {raw:?} must start with http:// or https://"))?;
+        .ok_or_else(|| anyhow::anyhow!("base_url{named} must start with http:// or https://"))?;
     let host = rest.split('/').next().unwrap_or("");
     // Not echoed: the URL holds the password. A base URL is printed and stored in the clear (the
     // run manifest, every judge span's server.address, `judge probe`, error messages).
@@ -176,7 +183,7 @@ pub fn normalize_base_url(raw: &str) -> anyhow::Result<String> {
     );
     anyhow::ensure!(
         !host.is_empty() && !host.contains(char::is_whitespace),
-        "base_url {raw:?} has no host"
+        "base_url{named} has no host"
     );
     Ok(url)
 }
@@ -379,6 +386,11 @@ mod tests {
             err.contains("credentials") && !err.contains("s3cr3t"),
             "{err}"
         );
+        // Refused for another reason first, and still not repeated.
+        for bad in ["ftp://svc:s3cr3t@gw", "svc:s3cr3t@gw", "http://svc:s3cr3t@"] {
+            let err = normalize_base_url(bad).unwrap_err().to_string();
+            assert!(!err.contains("s3cr3t"), "{bad:?}: {err}");
+        }
     }
 
     #[test]

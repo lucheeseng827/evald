@@ -52,6 +52,7 @@ database, no Python.
 | Tag | Notes |
 |---|---|
 | `latest` | newest stable release |
+| `0.5.1` | fixes: `eval compare` no longer reads rounding noise as a variance, a symmetric bootstrap interval, `evald latency`'s server table, duplicate online-eval judges refused, the Helm ServiceMonitor; price table refreshed |
 | `0.5.0` | "your models" and "sovereign by proof": judge endpoints for a team's own vLLM / Ollama / llama.cpp server, `evald judge probe`, online sampled evals (`serve --online-eval`), vLLM request spans, one egress door with a ledger and `--offline`, model provenance, `evald replay` and non-inferiority `eval compare`, multilingual evals, an air-gap bundle, a single-node Helm chart, `judge` built in with `--build-arg FEATURES=judge`, a refreshed price table |
 | `0.4.0` | "plugs in": OTLP logs ingest, Claude Code / Codex / Gemini CLI sessions (`evald connect`, `evald sessions`), tested framework recipes, a read-only MCP server, `serve` as the image default on both ports into `/data`, exit code `2` when evald cannot run, cosign-signed images with SBOM, a price table that prices Claude 5.5 |
 | `0.3.0` | derived `cost_usd` from model + token counts (built-in price table), LLM usage on `/metrics` + `evald latency`, quieter default ingest logging, lower `--max-hot-spans` default, bounded SQL/hot-tier reads that stop over-allocating |

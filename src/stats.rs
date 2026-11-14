@@ -276,8 +276,13 @@ pub fn paired_t_test(diffs: &[f64], alpha: f64) -> Option<TTest> {
     let var = diffs.iter().map(|d| (d - mean) * (d - mean)).sum::<f64>() / (nf - 1.0);
     let se = (var / nf).sqrt();
     let df = nf - 1.0;
-    if se == 0.0 {
-        return (mean == 0.0).then_some(TTest {
+    // "No spread" up to rounding, not `se == 0.0`: a judge that moves every score by 0.1 gives
+    // differences that agree only to ~1e-17 (`0.8 - 0.7` vs `0.7 - 0.6`), and that noise would
+    // be read as a variance and turned into t ≈ 1e16.
+    let scale = diffs.iter().fold(0.0_f64, |m, d| m.max(d.abs()));
+    let tol = 1e-9 * scale;
+    if diffs.iter().all(|d| (d - mean).abs() <= tol) {
+        return (mean.abs() <= tol).then_some(TTest {
             t: 0.0,
             df,
             p_two_sided: 1.0,
@@ -350,8 +355,13 @@ pub fn non_inferiority(diffs: &[f64], margin: f64, alpha: f64) -> Option<NonInfe
     let var = diffs.iter().map(|d| (d - mean) * (d - mean)).sum::<f64>() / (nf - 1.0);
     let se = (var / nf).sqrt();
     let df = nf - 1.0;
-    let (lower, upper, p) = if se == 0.0 {
-        if mean != 0.0 {
+    // "No spread" up to rounding, as in [`paired_t_test`]: a constant shift on fractional scores
+    // leaves ~1e-17 of noise in the differences, which is not a variance estimate and would turn
+    // into a bound of certainty either way.
+    let scale = diffs.iter().fold(0.0_f64, |m, d| m.max(d.abs()));
+    let tol = 1e-9 * scale;
+    let (lower, upper, p) = if diffs.iter().all(|d| (d - mean).abs() <= tol) {
+        if mean.abs() > tol {
             return None;
         }
         (0.0, 0.0, 0.0)
@@ -418,8 +428,9 @@ pub fn bootstrap_mean_ci(
         .map(|_| (0..n).map(|_| values[rng.below(n)]).sum::<f64>() / n as f64)
         .collect();
     means.sort_by(f64::total_cmp);
-    let at = |q: f64| means[((q * resamples as f64).floor() as usize).min(resamples - 1)];
-    Some((at(alpha / 2.0), at(1.0 - alpha / 2.0)))
+    // The same count of resamples outside each end (`lo` below, `lo` above).
+    let lo = ((alpha / 2.0 * resamples as f64).floor() as usize).min(resamples - 1);
+    Some((means[lo], means[resamples - 1 - lo]))
 }
 
 /// Cohen's kappa: agreement between two raters on the same items, corrected for the agreement
@@ -574,6 +585,16 @@ mod tests {
         assert_eq!(same.verdict, NonInferiorVerdict::NonInferior);
         // Every item moved by the same amount: no variance, no test.
         assert_eq!(non_inferiority(&[-0.5; 10], 0.01, 0.05), None);
+        // The same shift on fractional scores, where the differences carry rounding noise: still
+        // no variance, not an "inferior" (or, with a wide margin, "non-inferior") of certainty.
+        let a = [0.91, 0.81, 0.71, 0.61, 0.51, 0.33, 0.77];
+        let noisy: Vec<f64> = a.iter().map(|x| (x - 0.1) - x).collect();
+        assert!(
+            noisy.iter().any(|d| *d != noisy[0]),
+            "the case needs unequal diffs"
+        );
+        assert_eq!(non_inferiority(&noisy, 0.05, 0.05), None);
+        assert_eq!(non_inferiority(&noisy, 0.2, 0.05), None);
         assert_eq!(non_inferiority(&[0.1], 0.01, 0.05), None, "one pair");
         assert_eq!(
             non_inferiority(&[0.1, 0.2], 0.0, 0.05),
@@ -825,6 +846,18 @@ mod tests {
             paired_t_test(&[-1.0, -1.0, -1.0], 0.05).is_none(),
             "a constant non-zero shift has no variance estimate"
         );
+        // The same shift on fractional scores, where the differences carry rounding noise.
+        let a = [0.91, 0.81, 0.71, 0.61, 0.51, 0.33, 0.77];
+        let diffs: Vec<f64> = a.iter().map(|x| (x - 0.1) - x).collect();
+        assert!(
+            diffs.iter().any(|d| *d != diffs[0]),
+            "the case needs unequal diffs"
+        );
+        assert!(
+            paired_t_test(&diffs, 0.05).is_none(),
+            "rounding noise is not a variance estimate: {:?}",
+            paired_t_test(&diffs, 0.05)
+        );
     }
 
     #[test]
@@ -848,6 +881,15 @@ mod tests {
             Some((0.25, 0.25))
         );
         assert!(bootstrap_mean_ci(&[0.1], 0.05, 100, 1).is_none());
+        // Symmetric: the same draws over negated values give the negated, reversed interval
+        // (as many resamples cut off above as below).
+        let spread: Vec<f64> = (0..30).map(|i| ((i * 7919) % 97) as f64 / 97.0).collect();
+        let negated: Vec<f64> = spread.iter().map(|v| -v).collect();
+        let (lo, hi) = bootstrap_mean_ci(&spread, 0.05, BOOTSTRAP_RESAMPLES, 3).unwrap();
+        assert_eq!(
+            bootstrap_mean_ci(&negated, 0.05, BOOTSTRAP_RESAMPLES, 3),
+            Some((-hi, -lo))
+        );
         // Pass/fail differences: half the items flipped down, half unchanged.
         let flips: Vec<f64> = (0..40)
             .map(|i| if i % 2 == 0 { -1.0 } else { 0.0 })

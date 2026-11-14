@@ -2,7 +2,7 @@
 # Install evald from a GitHub release: download, verify, install. No root needed.
 #
 #   curl -fsSL https://raw.githubusercontent.com/lucheeseng827/evald/main/install.sh | sh
-#   curl -fsSL …/install.sh | sh -s -- --version v0.5.0 --dir /usr/local/bin
+#   curl -fsSL …/install.sh | sh -s -- --version v0.5.1 --dir /usr/local/bin
 #
 # What it does, in order, and stops at the first thing that does not check out:
 #   1. picks the archive for this OS and CPU (Linux → static musl; macOS; Windows users take

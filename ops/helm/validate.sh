@@ -81,6 +81,12 @@ expect_render "retention and extra flags reach serve" \
 expect_render "ServiceMonitor scrapes /metrics, with the token when auth is on" \
   "kind('ServiceMonitor')[0]['spec']['endpoints'][0]['path'] == '/metrics' and kind('ServiceMonitor')[0]['spec']['endpoints'][0]['authorization']['credentials']['name'] == 'mine'" \
   --set serviceMonitor.enabled=true --set auth.existingSecret=mine
+expect_render "ServiceMonitor leaves out the headless Service (one target per pod, not two)" \
+  "{'key': 'app.kubernetes.io/component', 'operator': 'NotIn', 'values': ['headless']} in kind('ServiceMonitor')[0]['spec']['selector']['matchExpressions'] and [s['metadata']['labels'].get('app.kubernetes.io/component') for s in kind('Service')].count('headless') == 1" \
+  --set serviceMonitor.enabled=true
+expect_render "ServiceMonitor reads its one token from serviceMonitor.tokenKey, else auth.key" \
+  "kind('ServiceMonitor')[0]['spec']['endpoints'][0]['authorization']['credentials']['key'] == 'scrape'" \
+  --set serviceMonitor.enabled=true --set auth.existingSecret=mine --set serviceMonitor.tokenKey=scrape
 expect_render "a storage class is passed through" \
   "ss()['spec']['volumeClaimTemplates'][0]['spec']['storageClassName'] == 'fast'" \
   --set persistence.storageClass=fast
@@ -114,6 +120,8 @@ if [ "$MODE" = "--kind" ]; then
     ok "and read back"; else bad "the span did not read back"; fi
   # The store survives the pod: delete it, let the StatefulSet bring it back, read again.
   kubectl delete pod smoke-evald-0 --wait=true >/dev/null
+  # `kubectl wait` on a pod the StatefulSet has not recreated yet fails NotFound; wait for it first.
+  for _ in $(seq 1 60); do kubectl get pod smoke-evald-0 >/dev/null 2>&1 && break; sleep 1; done
   kubectl wait --for=condition=ready pod/smoke-evald-0 --timeout=120s >/dev/null
   kill $pf 2>/dev/null || true
   kubectl port-forward svc/smoke-evald 14318:4318 >/dev/null 2>&1 &

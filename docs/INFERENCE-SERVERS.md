@@ -39,7 +39,8 @@ app's span as the call and **sets the server span's usage aside** as a copy
 (`evald.usage = "copy"`), so the tokens are not counted twice; the server span keeps its timings,
 and its reported usage stays in `raw_attributes`. **Without a parent**, the server span is the
 only record of the call and counts as one, with vLLM's time to first token. It names no model, so
-it is unpriced and reported under `(unknown)`.
+it is unpriced: `(untagged)` in `evald cost` and `evald latency`, `(unknown)` in the server-time
+table below.
 
 Either way the span is marked `evald.server = "vllm"`, and `evald latency` adds where the time
 went, by the app's model:
@@ -55,9 +56,14 @@ Qwen2.5-7B-Instruct               40       40      12.0 / 350.0     245.8 / 384.
 `client - server` is the app's own duration minus vLLM's end-to-end time: network, proxies and
 the client library. A large one with a small `queue` points away from the GPU.
 
-One caveat: an app that traces only the HTTP request, with no model-call span of its own, still
-propagates `traceparent`, so vLLM's span has a parent and is set aside, and the call then has no
-counted usage. Instrument the model call itself.
+Two caveats, both from the same rule (a parent means "the app counted this call"), and in both
+the call then has no counted usage:
+
+- An app that traces only the HTTP request, with no model-call span of its own, still propagates
+  `traceparent`, so vLLM's span has a parent and is set aside. Instrument the model call itself.
+- evald does not check that the parent arrived. An app that propagates `traceparent` but sends
+  its own spans somewhere else (or not at all) leaves vLLM's span set aside with nothing counted
+  in its place. The app's model-call spans must reach the same evald as vLLM's.
 
 **Metrics.** vLLM's `/metrics` and evald's share a Prometheus. The board in
 [`ops/stacks/vllm/grafana/dashboards/evald-vllm.json`](../ops/stacks/vllm/grafana/dashboards/evald-vllm.json)

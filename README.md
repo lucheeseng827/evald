@@ -8,7 +8,7 @@ JSONL dataset, get scores keyed to the exact span. No database, no Python runtim
 no container required — a single static musl binary that runs on your laptop or
 inside a locked-down CI runner.
 
-> **Status: v0.5.0.** `evald serve` runs an OTLP/HTTP receiver on
+> **Status: v0.5.1.** `evald serve` runs an OTLP/HTTP receiver on
 > `:4318` that accepts `POST /v1/traces` in **both** protobuf (gzip-aware) and
 > **OTLP-JSON**, **normalizes** each span into one model unifying the OpenInference and
 > `gen_ai.*` conventions, and **durably stores** it through a real two-tier engine: a
@@ -106,7 +106,7 @@ docker run -d -p 127.0.0.1:4318:4318 -p 127.0.0.1:4317:4317 -v evald-data:/data 
 ```
 
 - **Windows:** `evald-x86_64-pc-windows-msvc.zip` from the [releases](https://github.com/lucheeseng827/evald/releases).
-- **A pinned version:** `… | sh -s -- --version v0.5.0`, or `--dir /usr/local/bin` for another location.
+- **A pinned version:** `… | sh -s -- --version v0.5.1`, or `--dir /usr/local/bin` for another location.
 - **Air-gapped or behind a mirror:** copy a release's files (`evald-<target>.tar.gz`, `SHA256SUMS`,
   `SHA256SUMS.sig`, `SHA256SUMS.pem`) to an internal store, then
   `EVALD_DOWNLOAD_BASE=<directory or URL> sh install.sh`.
@@ -264,7 +264,7 @@ curl -s localhost:4318/v1/sessions                       # the three sessions, r
 # kill -9 the server and start it again: everything is still there (fsynced before each ACK).
 ```
 
-**Gate CI on it:** `uses: lucheeseng827/evald@v0.5.0` with `config: evals/eval.yaml` installs a pinned
+**Gate CI on it:** `uses: lucheeseng827/evald@v0.5.1` with `config: evals/eval.yaml` installs a pinned
 evald, runs the eval, writes the JUnit report and the job summary, and fails the job when the gate
 does ([`docs/CONFIG.md` § The GitHub Action](./docs/CONFIG.md#the-github-action)).
 

@@ -51,6 +51,10 @@ serviceMonitor:
   enabled: false
   interval: 30s
   labels: {}
+  # With auth on, the key of the auth Secret the scraper sends as its bearer token. It must hold
+  # exactly ONE token: the whole value is sent, so a multi-token key is refused with a 401.
+  # Empty: auth.key, which is right for auth.create (one token) or a one-token existingSecret.
+  tokenKey: ""
 
 podAnnotations: {}
 nodeSelector: {}

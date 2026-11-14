@@ -468,11 +468,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: gate
-        uses: lucheeseng827/evald@v0.5.0
+        uses: lucheeseng827/evald@v0.5.1
         with:
           config: evals/eval.yaml   # required
           # command: suite          # `eval` (default) or `suite`
-          # version: v0.5.0         # pin the evald release; `latest` follows the newest
+          # version: v0.5.1         # pin the evald release; `latest` follows the newest
       - if: always()
         uses: actions/upload-artifact@v4
         with: { name: evald-junit, path: "${{ steps.gate.outputs.junit }}" }
@@ -684,8 +684,9 @@ Turns stored model calls into a JSONL dataset `eval run` reads: each span with a
 
 Exact **nearest-rank** p50 / p95 / p99 (and max) of `end − start` over **LLM spans** — the same set the
 usage metrics count — plus time to first token where spans carry it. A time to first token is read only from
-span attributes (`gen_ai.response.time_to_first_chunk` in seconds; `ai.response.msToFirstChunk`,
-`ai.stream.msToFirstChunk`, `time_to_first_token_ms` in milliseconds) and is shown as `unknown`, never
+span attributes (`gen_ai.response.time_to_first_chunk`, and vLLM's `gen_ai.latency.time_to_first_token`,
+in seconds; `ai.response.msToFirstChunk`, `ai.stream.msToFirstChunk`, `time_to_first_token_ms` in
+milliseconds) and is shown as `unknown`, never
 estimated, when absent. The equivalent SQL is in [OPERATIONS.md](./OPERATIONS.md#llm-usage-cost-tokens-latency-quality).
 
 | Flag | Env var | Type | Default | What it does |
@@ -784,7 +785,7 @@ schema stepped down, as a judge run would). `deterministic` warns when three ide
 scored differently: the endpoint is not repeatable at temperature 0, so a single score from it
 is noisier than its value suggests. `usage` warns when the server reports no tokens, which
 leaves its calls unpriced. Exits `1` when the endpoint cannot be used as a judge (unreachable,
-a call fails, or no reply holds a score), `0` otherwise.
+a call fails, or any reply holds no score), `0` otherwise.
 
 | Flag | Type | Default | What it does |
 |---|---|---|---|

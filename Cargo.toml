@@ -9,7 +9,7 @@ panic = "unwind"
 
 [package]
 name = "evald"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "evald — embedded OTel-native trace + eval store for LLM apps (single binary). PoC: OTLP/HTTP receiver."

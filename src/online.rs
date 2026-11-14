@@ -155,9 +155,17 @@ impl OnlineSpec {
             );
         }
         let endpoints = crate::endpoint::resolve_all(&self.endpoints, base_dir)?;
+        // A judge's name is its score's name and part of its score and call-span ids: two judges
+        // under one name would each pay for a call and overwrite the other's result.
+        let mut names = std::collections::BTreeSet::new();
         self.judges
             .iter()
             .map(|j| {
+                anyhow::ensure!(
+                    names.insert(j.name()),
+                    "online-eval: two judges are named {:?}; give one a `name:`",
+                    j.name()
+                );
                 j.validate()?;
                 anyhow::ensure!(
                     j.provider.is_none() && j.endpoint.is_some(),
@@ -586,6 +594,9 @@ async fn judge_span<B: JudgeBackend>(
     };
     for ((spec, ep), provenance) in online.judges.iter().zip(provenances) {
         let identity = provenance.as_ref().and_then(crate::judge::Provenance::key);
+        // The permit first: a wait for it can outlast the budget or a pause starting, so both
+        // are checked when the call would actually go out.
+        let _permit = permits[&ep.name].acquire().await.expect("never closed");
         let day = utc_day();
         if online.budget.used(day) >= online.cap {
             online.count(Outcome::Budget);
@@ -595,7 +606,6 @@ async fn judge_span<B: JudgeBackend>(
             online.count(Outcome::Paused);
             continue;
         }
-        let _permit = permits[&ep.name].acquire().await.expect("never closed");
         let result =
             crate::judge::score_one(spec, ep, &item, backend, cache, identity.as_deref()).await;
         // What went over the network for this call, whatever came of it.
@@ -894,6 +904,15 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(err.contains("sample_rate"), "{err}");
+        let twice = BASE.replace(
+            "judges:\n",
+            "judges:\n  - rail: toxicity\n    endpoint: box\n    model: other\n",
+        );
+        let err = Online::new(&spec(&twice), Path::new("."))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("two judges are named"), "{err}");
     }
 
     #[test]

@@ -6,6 +6,47 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-15
+
+The rest of the review fixes that 0.5.0's fold of the 0.6 work dropped (the judge ones came back
+in 0.5.0), each with its test.
+
+### Changed
+
+- **The built-in price table is refreshed** to LiteLLM `fd6c0020` (2026-11-14): 3,798 models,
+  6 added and 2 repriced since 0.5.0's table. None were dropped upstream.
+
+### Fixed
+- **`eval compare` no longer reads rounding noise as a variance.** A judge that moves every
+  score by the same 0.1 leaves differences that agree only to about 1e-17. The paired t-test read
+  that as a spread and reported t ≈ 1e16. The non-inferiority gate read it as a bound of
+  certainty: inferior, or with a wide margin non-inferior. Differences equal up to a 1e-9
+  relative tolerance now count as no spread. A constant non-zero shift gives no test, as an
+  exact one always did.
+- **The bootstrap interval is symmetric.** It cut one fewer resample off the top than off the
+  bottom.
+- **`evald latency`'s server table.** A parent span that ends before it starts no longer becomes
+  a `client − server` figure of about 1.8e19 ns (its unsigned duration wrapped). The call's server
+  phases still count.
+- **Online eval.** Two judges under one name are refused at start: each would pay for a call and
+  overwrite the other's score. A span waiting for its endpoint's permit now checks the daily
+  budget and a pause when it gets the permit, not before the wait, so a wait no longer carries a
+  call past either.
+- **Helm chart.** The ServiceMonitor no longer selects the headless Service too, which scraped
+  every pod twice. `serviceMonitor.tokenKey` names the auth Secret's key the scraper sends (empty:
+  `auth.key`), for an existing Secret whose `auth.key` holds several tokens. `validate.sh --kind`
+  waits for the StatefulSet to recreate the pod before waiting for it to be ready.
+- **A `base_url` with `user:password@` that fails another check first** (`ftp://user:pass@host`)
+  is no longer quoted in that error. An error names the value only when it holds no `@`.
+- **`ops/stacks/smoke.py`** takes the stack down when `compose up` fails halfway.
+- **`scripts/gen_price_baseline.py --clone`** refuses a shallow clone too shallow to hold the
+  table's last change, instead of dating the table by the clone's boundary commit.
+- **Docs.** `INFERENCE-SERVERS.md` names where an unparented vLLM call is reported (`(untagged)`
+  in `cost` and `latency`, `(unknown)` in the server table). It adds the second caveat of the
+  parent rule: an app that propagates `traceparent` but sends its spans elsewhere leaves vLLM's
+  span set aside with nothing counted. `CONFIG.md` lists vLLM's time-to-first-token attribute and
+  states the probe's exit rule exactly: any reply without a score fails it.
+
 ## [0.5.0] - 2026-11-13
 
 Two themes ship together: "your

@@ -219,8 +219,9 @@ def main():
     else:
         stack = Stack("ollama", ["compose.yaml"], a.image)
     log(f"bringing up the {a.stack} stack")
-    stack.up(build=not a.image)
     try:
+        # Inside the try: an `up` that fails halfway still has its containers taken down.
+        stack.up(build=not a.image)
         if a.stack == "vllm-cpu":
             smoke_vllm_cpu(stack)
         else:

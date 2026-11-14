@@ -76,7 +76,12 @@ def main():
         commit, date = a.commit, a.date
     elif a.clone:
         commit = git(a.clone, "log", "-1", "--format=%H", a.ref, "--", PATH).strip()
-        if not commit:
+        # A shallow clone's boundary commit shows no parents, so git sees it as adding every
+        # file: `log -- PATH` names it when the real last touch is deeper than the clone. The
+        # boundary is listed in the clone's `shallow` file (a real root commit is not).
+        shallow = os.path.join(a.clone, git(a.clone, "rev-parse", "--git-path", "shallow").strip())
+        boundary = open(shallow).read().split() if os.path.exists(shallow) else []
+        if not commit or commit in boundary:
             sys.exit(f"no commit in {a.clone} touches {PATH}: fetch more history")
         date = git(a.clone, "log", "-1", "--date=format-local:%Y-%m-%d", "--format=%cd", commit).strip()
         raw = git(a.clone, "show", f"{commit}:{PATH}")

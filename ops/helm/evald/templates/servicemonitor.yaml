@@ -13,6 +13,11 @@ spec:
   selector:
     matchLabels:
       {{- include "evald.selector" . | nindent 6 }}
+    # The headless Service selects the same pod; scraping it too would store every series twice.
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: [headless]
   endpoints:
     - port: http
       path: /metrics
@@ -23,6 +28,6 @@ spec:
         type: Bearer
         credentials:
           name: {{ $secret }}
-          key: {{ .Values.auth.key }}
+          key: {{ .Values.serviceMonitor.tokenKey | default .Values.auth.key }}
       {{- end }}
 {{- end }}

@@ -264,7 +264,7 @@ build time. `/v1/meta` isn't a gate; it only drives the console's edition badge.
 
 ```bash
 curl -s http://localhost:4318/v1/meta
-# -> {"edition":"oss","fleet":false,"judge":false,"version":"0.5.0","price_table":"dc65705e@2026-11-13","semconv":"1.38.0"}
+# -> {"edition":"oss","fleet":false,"judge":false,"version":"0.5.1","price_table":"fd6c0020@2026-11-14","semconv":"1.38.0"}
 ```
 
 | Field | Meaning |
